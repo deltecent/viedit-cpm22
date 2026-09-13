@@ -28,6 +28,8 @@
         EXTRN   GBINIT, GBLDHW, GBSTHW, BDFLD
         EXTRN   GBPKRT          ; VIBUF -- byte at the cursor (tab cursor render)
         EXTRN   FIOPEN, INFCB, OUTFCB   ; VIFILEIO
+        EXTRN   ABFCB, RSFCB            ; VIFILEIO -- scratch FCBs (VIQUIT cleanup)
+        EXTRN   VMODE, VMALLOW, WINCAP, GAPRSV  ; VIVM -- virtual-buffer config
         EXTRN   WININIT         ; VIWIN -- reset line caches after open
         EXTRN   CURWLN          ; VIWIN -- cursor window line (= CURLN, RAM-only)
         EXTRN   CURDCO          ; VIWIN -- current display column (tab-aware)
@@ -109,6 +111,7 @@ VM_CS:  MOV     A,M
         ; VIEDIT.CFG (lines=/columns=) first, then /Ln /Cn /R switches override.
         CALL    CFGREAD
         CALL    CMDPARSE
+        CALL    VMWCAP           ; apply /W forced window cap (re-inits the buffer)
         CALL    VTSIZE           ; auto-detect rows/cols for any dim not set above
 
         ;--- clear screen before loading ---
@@ -305,6 +308,17 @@ VM_TOOBIG:
 ; (RAM-only: no scratch files to clean up.)
 ;============================================================
 VIQUIT:
+        ; virtual mode: remove the scratch files before leaving
+        LDA     VMODE
+        ORA     A
+        JZ      VIQ_RGN
+        LXI     D,ABFCB
+        MVI     C,BF_FDEL
+        CALL    BDOS
+        LXI     D,RSFCB
+        MVI     C,BF_FDEL
+        CALL    BDOS
+VIQ_RGN:
         LXI     H,RSTRGN        ; reset scroll region to full screen on exit,
         CALL    PRSTR0          ; saving/restoring the cursor (ESC[r homes it)
         JMP     WBOOT
@@ -908,6 +922,8 @@ CMP_SW:
         JZ      CMP_L
         CPI     'C'
         JZ      CMP_C
+        CPI     'W'
+        JZ      CMP_W
         JMP     CMP_LP
 CMP_RO:
         MVI     A,1
@@ -951,6 +967,15 @@ CMP_C:
         POP     B
         POP     H
         JMP     CMP_LP
+CMP_W:
+        ; /W<n> : force a window of <n> bytes and enable virtual buffering
+        ; (a test/debug knob so paging exercises on small files).
+        INX     H               ; consume 'W'
+        DCR     B
+        CALL    CMPNUMW         ; parse <n> -> WINCAP; HL past digits, B updated
+        MVI     A,1
+        STA     VMALLOW         ; virtual mode may now activate
+        JMP     CMP_LP
 CMP_DN:
         JMP     CFGRCAL         ; recompute derived geometry
 
@@ -983,6 +1008,122 @@ CMN_LP:
         JMP     CMN_LP
 CMN_FIN:
         MOV     A,C
+        RET
+
+;------------------------------------------------------------
+; CMPNUMW - parse decimal digits at (HL) into a 16-bit value, up to B chars.
+; Stores the value in WINCAP; on return HL is advanced past the digits and B is
+; decremented, so CMDPARSE keeps scanning cleanly.  (Unlike CMPNUM, /W needs a
+; value up to the window size, which exceeds a byte.)
+;------------------------------------------------------------
+CMPNUMW:
+        SHLD    WVPTR
+        LXI     H,0             ; accumulator
+CNW_LP:
+        MOV     A,B
+        ORA     A
+        JZ      CNW_FIN
+        PUSH    H
+        LHLD    WVPTR
+        MOV     A,M
+        POP     H
+        CPI     '0'
+        JC      CNW_FIN
+        CPI     '9'+1
+        JNC     CNW_FIN
+        SUI     '0'
+        MOV     E,A
+        MVI     D,0             ; DE = digit
+        PUSH    D
+        DAD     H               ; acc*2
+        PUSH    H
+        DAD     H
+        DAD     H               ; acc*8
+        POP     D               ; DE = acc*2
+        DAD     D               ; acc*10
+        POP     D               ; DE = digit
+        DAD     D               ; acc*10 + digit
+        PUSH    H
+        LHLD    WVPTR
+        INX     H
+        SHLD    WVPTR
+        POP     H
+        DCR     B
+        JMP     CNW_LP
+CNW_FIN:
+        SHLD    WINCAP
+        LHLD    WVPTR           ; HL = text past the digits (for CMDPARSE)
+        RET
+
+;============================================================
+; VMWCAP - apply the /W forced window: clamp WINCAP to the real TPA capacity,
+; set GAPRSV (= WINCAP/4, floor 128), and re-init the (still-empty) buffer to
+; that smaller capacity so FIOPEN's size gate trips into virtual mode.  No-op
+; unless /W set VMALLOW.
+;============================================================
+VMWCAP:
+        LDA     VMALLOW
+        ORA     A
+        RZ
+        ; realcap = TPATOP - (BMDEND+SCRPAD) - STKRESV  -> BC
+        LHLD    TPATOP
+        LXI     D,STKRESV
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A             ; HL = TPATOP - STKRESV
+        LXI     D,BMDEND+SCRPAD
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = realcap
+        ; clamp WINCAP down to realcap if it exceeds it
+        LHLD    WINCAP
+        MOV     A,C
+        SUB     L
+        MOV     A,B
+        SBB     H               ; realcap - WINCAP ; CY if realcap < WINCAP
+        JNC     VMW_OK
+        MOV     H,B
+        MOV     L,C
+        SHLD    WINCAP
+VMW_OK:
+        ; GAPRSV = WINCAP >> 2, floored to 128
+        LHLD    WINCAP
+        MOV     A,H
+        ORA     A               ; clear CY for the >>1
+        RAR
+        MOV     H,A
+        MOV     A,L
+        RAR
+        MOV     L,A
+        MOV     A,H
+        ORA     A
+        RAR
+        MOV     H,A
+        MOV     A,L
+        RAR
+        MOV     L,A             ; HL = WINCAP >> 2
+        MOV     A,H
+        ORA     A
+        JNZ     VMW_G
+        MOV     A,L
+        CPI     128
+        JNC     VMW_G
+        LXI     H,128
+VMW_G:
+        SHLD    GAPRSV
+        ; re-init the empty buffer with the smaller capacity
+        LHLD    WINCAP
+        MOV     B,H
+        MOV     C,L             ; BC = WINCAP
+        LXI     H,BDESC0
+        LXI     D,BMDEND+SCRPAD
+        CALL    GBINIT
         RET
 
 ;============================================================
@@ -1142,6 +1283,8 @@ CFGPTR:  DW     0
 CFGDMA:  DW     0
 CFGFCB:  DS     FCB_SIZ
 CFGBUF:  DS     256             ; CFGBSZ
+
+WVPTR:   DW     0               ; CMPNUMW: text pointer while parsing /W<n>
 
 ; --- VT100 DSR size-probe state ---
 GEOSET:  DB     0               ; bit0 = rows set, bit1 = cols set (suppress probe)

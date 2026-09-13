@@ -14,7 +14,8 @@
 ;   VIKEY.MAC    key decoder
 ;   VIBUF.MAC    gap buffer text engine (verbatim CRLF storage)
 ;   VIWIN.MAC    in-RAM line-navigation primitives
-;   VIFILEIO.MAC load (block copy), save (stream + ^Z pad)
+;   VIFILEIO.MAC load (block copy), save (stream + ^Z pad), scratch I/O
+;   VIVM.MAC     virtual buffering: window/disk-deque engine (paging to scratch)
 ;   VICMD.MAC    command dispatch + motions
 ;   VICMDOPS.MAC operators d/c/y, insert/replace handlers
 ;   VICMDEXC.MAC ex command line (:), :r/:w/:e/:stat

@@ -1,0 +1,618 @@
+;============================================================
+; FILE:    VIVM.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  Virtual buffering -- window/disk-deque engine (Phase 1).
+;------------------------------------------------------------
+; VIEDIT normally holds the whole file resident in one gap buffer.  When a file
+; will not fit (or the /W<n> forced-tiny-window test knob is set), VIEDIT runs
+; in VIRTUAL MODE: the gap buffer becomes a sliding WINDOW over the document and
+; the off-window text lives on disk.  The document, in byte order, is:
+;
+;   [ ABOVE ]  [ window R1 | gap | window R2 ]  [ BELOW ]
+;      |                                            |
+;   name.$$$  (records spilled off the TOP,        name.$$B (records spilled off
+;    OUTREC records, doc order)                     the BOTTOM, RIGHTREC records,
+;                                                    LIFO) then the unread
+;                                                    ORIGINAL tail (via IRGETB)
+;
+; Four primitives move 128-byte records between the window edges and disk:
+;   SPILLTOP  R1 top   -> name.$$$   (frees gap; window slides down)
+;   SPILLBOT  R2 bottom-> name.$$B   (frees gap; window slides up)
+;   FILLFWD   below    -> R2 bottom  (brings the next record into the window)
+;   REWIND    above    -> R1 top     (brings the previous record back)
+; The gap is the only free pool and always sits at the cursor; records are the
+; transfer unit only (lines are still found by LF scan -- records != lines).
+;
+; Line accounting (LINABOVE/LINBELOW) and the on-screen SPILLOK guard are
+; refined in later phases; Phase 1 tracks byte/record counters and provides the
+; mechanics + the /W partial-load path.  All of this is gated by VMODE: when
+; VMODE=0 the RAM-only fast paths run untouched (zero regression).
+;------------------------------------------------------------
+; EXPORTS:
+;   VMODE     DB   0=RAM-only, 1=virtual
+;   VMALLOW   DB   1 => virtual mode may activate (set by the /W switch)
+;   WINCAP    DW   forced window capacity (0 = use full TPA); set by /W
+;   GAPRSV    DW   gap kept free in the window (load stop + spill threshold)
+;   BYTABOVE BYTBELOW LINABOVE LINBELOW  DS 3   (24-bit document counters)
+;   OUTREC RIGHTREC                      DW     (scratch record counts)
+;   VMRSET    reset VMODE + counters to RAM-only
+;   VMZERO    zero the six counters
+;   VMLDIN    DE=file records -> HL=records to load; sets VMODE=1 + counters
+;   SPILLTOP SPILLBOT FILLFWD REWIND SPILLOK
+;============================================================
+        INCLUDE VI.INC
+
+        EXTRN   BDESC0          ; the (single) buffer descriptor (VI.MAC)
+        EXTRN   GBLDHW          ; VIBUF: A=BD_xxx -> HL=field value
+        EXTRN   SCRWR, SCRRD    ; VIFILEIO: random write/read PGBUF <-> FCB[rec]
+        EXTRN   PGBUF           ; VIFILEIO: 128-byte page-transfer buffer
+        EXTRN   ABFCB, RSFCB    ; VIFILEIO: the .$$$ / .$$B scratch FCBs
+        EXTRN   IRGETB          ; VIFILEIO: buffered original-tail byte reader
+
+        PUBLIC  VMODE, VMALLOW, WINCAP, GAPRSV
+        PUBLIC  BYTABOVE, BYTBELOW, LINABOVE, LINBELOW, OUTREC, RIGHTREC
+        PUBLIC  VMRSET, VMZERO, VMLDIN
+        PUBLIC  SPILLTOP, SPILLBOT, FILLFWD, REWIND, SPILLOK
+
+        CSEG
+
+;============================================================
+; VMRSET - return to RAM-only: VMODE=0 and all counters cleared.  Called at a
+; fresh open (before FIOPEN decides the mode).  Leaves WINCAP/GAPRSV/VMALLOW
+; (the /W configuration) alone.
+;============================================================
+VMRSET:
+        XRA     A
+        STA     VMODE
+        ; fall through to VMZERO
+
+;============================================================
+; VMZERO - zero the six document counters (16 bytes, contiguous).
+;============================================================
+VMZERO:
+        LXI     H,BYTABOVE
+        MVI     B,16            ; 4*DS3 + 2*DW = 16 bytes (BYTABOVE..VMCEND)
+        XRA     A
+VMZ_L:
+        MOV     M,A
+        INX     H
+        DCR     B
+        JNZ     VMZ_L
+        RET
+
+;============================================================
+; VMLDIN - initialise virtual-mode counters for a fresh partial load.
+; Entry: DE = total file size in 128-byte records.
+; Exit:  HL = number of records to load into the window (caprec);
+;        VMODE=1; counters zeroed except BYTBELOW = (records-caprec)*128.
+; Clobbers A,BC,DE,HL.
+;============================================================
+VMLDIN:
+        MVI     A,1
+        STA     VMODE
+        PUSH    D               ; save file records
+        CALL    VMZERO
+        ; caprec = (BSIZE - GAPRSV) >> 7
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW          ; HL = BSIZE
+        LDA     GAPRSV
+        MOV     C,A
+        LDA     GAPRSV+1
+        MOV     B,A             ; BC = GAPRSV
+        MOV     A,L
+        SUB     C
+        MOV     L,A
+        MOV     A,H
+        SBB     B
+        MOV     H,A             ; HL = BSIZE - GAPRSV
+        MVI     B,7
+VLD_SHR:
+        XRA     A               ; clear CY for the >>1
+        MOV     A,H
+        RAR
+        MOV     H,A
+        MOV     A,L
+        RAR
+        MOV     L,A
+        DCR     B
+        JNZ     VLD_SHR         ; HL = caprec
+        POP     D               ; DE = file records
+        ; belowrec = records - caprec -> BC
+        MOV     A,E
+        SUB     L
+        MOV     C,A
+        MOV     A,D
+        SBB     H
+        MOV     B,A             ; BC = belowrec
+        PUSH    H               ; save caprec
+        ; BYTBELOW = belowrec << 7
+        MOV     A,C
+        STA     BYTBELOW
+        MOV     A,B
+        STA     BYTBELOW+1
+        XRA     A
+        STA     BYTBELOW+2
+        MVI     B,7
+VLD_SL:
+        XRA     A               ; clear CY (LDA below does not disturb it)
+        LDA     BYTBELOW
+        RAL
+        STA     BYTBELOW
+        LDA     BYTBELOW+1
+        RAL
+        STA     BYTBELOW+1
+        LDA     BYTBELOW+2
+        RAL
+        STA     BYTBELOW+2
+        DCR     B
+        JNZ     VLD_SL
+        POP     H               ; HL = caprec
+        RET
+
+;============================================================
+; GAPLEN - HL = gap length = GAPEN - GAPBG.  Clobbers A,DE.
+;============================================================
+GAPLEN:
+        LHLD    BDESC0+BD_GAPEN
+        XCHG
+        LHLD    BDESC0+BD_GAPBG
+        MOV     A,E
+        SUB     L
+        MOV     L,A
+        MOV     A,D
+        SBB     H
+        MOV     H,A
+        RET
+
+;============================================================
+; GETR2L - HL = R2 length = BSIZE - GAPEN.  Clobbers A,DE.
+;============================================================
+GETR2L:
+        LHLD    BDESC0+BD_BSIZE
+        XCHG
+        LHLD    BDESC0+BD_GAPEN
+        MOV     A,E
+        SUB     L
+        MOV     L,A
+        MOV     A,D
+        SBB     H
+        MOV     H,A
+        RET
+
+;============================================================
+; ADD24 / SUB24 - add / subtract 16-bit DE to/from the 24-bit counter at (HL).
+; Clobbers A; leaves HL at the counter's high byte.
+;============================================================
+ADD24:
+        MOV     A,M
+        ADD     E
+        MOV     M,A
+        INX     H
+        MOV     A,M
+        ADC     D
+        MOV     M,A
+        INX     H
+        MOV     A,M
+        ACI     0
+        MOV     M,A
+        RET
+SUB24:
+        MOV     A,M
+        SUB     E
+        MOV     M,A
+        INX     H
+        MOV     A,M
+        SBB     D
+        MOV     M,A
+        INX     H
+        MOV     A,M
+        SBI     0
+        MOV     M,A
+        RET
+
+;============================================================
+; MOVDN - copy BC bytes ascending: src=(HL), dst=(DE).  For dst < src.
+; MOVUP - copy BC bytes descending: src=(HL)=high end, dst=(DE)=high end.
+;============================================================
+MOVDN:
+        MOV     A,B
+        ORA     C
+        RZ
+MDN_L:
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCX     B
+        MOV     A,B
+        ORA     C
+        JNZ     MDN_L
+        RET
+MOVUP:
+        MOV     A,B
+        ORA     C
+        RZ
+MUP_L:
+        MOV     A,M
+        STAX    D
+        DCX     H
+        DCX     D
+        DCX     B
+        MOV     A,B
+        ORA     C
+        JNZ     MUP_L
+        RET
+
+;============================================================
+; SPILLTOP - evict the top 128-byte record of R1 to name.$$$, sliding R1 down
+; and growing the gap.  Exit: CY clear on success; CY set if R1 < 128 (nothing
+; safe to spill).
+;============================================================
+SPILLTOP:
+        LHLD    BDESC0+BD_GAPBG ; R1 length = GAPBG
+        MOV     A,H
+        ORA     A
+        JNZ     ST_OK
+        MOV     A,L
+        CPI     128
+        JC      ST_NO
+ST_OK:
+        ; PGBUF <- base[0..128)
+        LHLD    BDESC0+BD_BSTAR
+        LXI     D,PGBUF
+        MVI     B,128
+ST_CP:
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     ST_CP
+        ; write PGBUF -> ABFCB at record OUTREC
+        LHLD    OUTREC
+        LXI     D,ABFCB
+        CALL    SCRWR
+        ; slide R1 down: base[128..GAPBG) -> base[0..GAPBG-128)  (ascending)
+        LHLD    BDESC0+BD_BSTAR
+        SHLD    VMT0            ; dst = base
+        LXI     D,128
+        DAD     D               ; HL = base+128 (src)
+        SHLD    VMT1
+        LHLD    BDESC0+BD_GAPBG
+        LXI     D,0-128
+        DAD     D               ; HL = GAPBG-128 = count
+        MOV     B,H
+        MOV     C,L
+        LHLD    VMT1            ; HL = src
+        XCHG                    ; DE = src
+        LHLD    VMT0            ; HL = dst
+        XCHG                    ; HL=src, DE=dst
+        CALL    MOVDN
+        ; GAPBG -= 128 ; CSOFF = GAPBG ; TXEND -= 128
+        LHLD    BDESC0+BD_GAPBG
+        LXI     D,0-128
+        DAD     D
+        SHLD    BDESC0+BD_GAPBG
+        SHLD    BDESC0+BD_CSOFF
+        LHLD    BDESC0+BD_TXEND
+        LXI     D,0-128
+        DAD     D
+        SHLD    BDESC0+BD_TXEND
+        ; OUTREC++ ; BYTABOVE += 128
+        LHLD    OUTREC
+        INX     H
+        SHLD    OUTREC
+        LXI     H,BYTABOVE
+        LXI     D,128
+        CALL    ADD24
+        ORA     A               ; CY clear = success
+        RET
+ST_NO:
+        STC
+        RET
+
+;============================================================
+; SPILLBOT - evict the bottom 128-byte record of R2 to name.$$B, sliding R2 up
+; and growing the gap.  Exit: CY clear on success; CY set if R2 < 128.
+;============================================================
+SPILLBOT:
+        CALL    GETR2L          ; HL = R2 length
+        SHLD    VMT0
+        MOV     A,H
+        ORA     A
+        JNZ     SB_OK
+        MOV     A,L
+        CPI     128
+        JC      SB_NO
+SB_OK:
+        ; PGBUF <- base[BSIZE-128..BSIZE)
+        LHLD    BDESC0+BD_BSTAR
+        XCHG
+        LHLD    BDESC0+BD_BSIZE
+        DAD     D               ; HL = base+BSIZE
+        LXI     D,0-128
+        DAD     D               ; HL = base+BSIZE-128 (src)
+        LXI     D,PGBUF
+        MVI     B,128
+SB_CP:
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     SB_CP
+        ; write PGBUF -> RSFCB at record RIGHTREC
+        LHLD    RIGHTREC
+        LXI     D,RSFCB
+        CALL    SCRWR
+        ; slide R2 up by 128 (descending): move base[GAPEN..BSIZE-128) to
+        ; base[GAPEN+128..BSIZE).  count = R2len-128.
+        LHLD    VMT0
+        LXI     D,0-128
+        DAD     D
+        MOV     B,H
+        MOV     C,L             ; BC = R2len-128
+        ; dst end = base+BSIZE-1
+        LHLD    BDESC0+BD_BSTAR
+        XCHG
+        LHLD    BDESC0+BD_BSIZE
+        DAD     D
+        DCX     H               ; HL = base+BSIZE-1
+        SHLD    VMT1            ; dst end
+        LXI     D,0-128
+        DAD     D               ; HL = base+BSIZE-1-128 (src end)
+        XCHG                    ; DE = src end
+        LHLD    VMT1            ; HL = dst end
+        XCHG                    ; HL = src end, DE = dst end
+        CALL    MOVUP
+        ; GAPEN += 128 ; TXEND -= 128
+        LHLD    BDESC0+BD_GAPEN
+        LXI     D,128
+        DAD     D
+        SHLD    BDESC0+BD_GAPEN
+        LHLD    BDESC0+BD_TXEND
+        LXI     D,0-128
+        DAD     D
+        SHLD    BDESC0+BD_TXEND
+        ; RIGHTREC++ ; BYTBELOW += 128
+        LHLD    RIGHTREC
+        INX     H
+        SHLD    RIGHTREC
+        LXI     H,BYTBELOW
+        LXI     D,128
+        CALL    ADD24
+        ORA     A
+        RET
+SB_NO:
+        STC
+        RET
+
+;============================================================
+; FILLFWD - bring one below-record into the window bottom.  Source is the top
+; of name.$$B (LIFO) if RIGHTREC>0, else the unread original tail (IRGETB,
+; which may return a short final record at ^Z/EOF).  Frees gap via SPILLTOP
+; first if needed.  Exit: CY clear on success; CY set if nothing is below.
+;============================================================
+FILLFWD:
+        CALL    GAPLEN
+        MOV     A,H
+        ORA     A
+        JNZ     FF_GAP
+        MOV     A,L
+        CPI     128
+        JNC     FF_GAP
+        CALL    SPILLTOP        ; need gap; free some from the top
+        JC      FF_NO           ; cannot -> give up
+FF_GAP:
+        LHLD    RIGHTREC
+        MOV     A,H
+        ORA     L
+        JZ      FF_TAIL
+        ; from name.$$B: record RIGHTREC-1
+        DCX     H
+        SHLD    RIGHTREC
+        LXI     D,RSFCB
+        CALL    SCRRD
+        MVI     A,128
+        STA     VMK
+        LXI     H,BYTBELOW
+        LXI     D,128
+        CALL    SUB24
+        JMP     FF_PLACE
+FF_TAIL:
+        ; from the original tail: up to 128 bytes, stopping at ^Z / EOF
+        LXI     H,PGBUF
+        MVI     B,0             ; B = bytes read (K)
+FF_RD:
+        MOV     A,B
+        CPI     128
+        JZ      FF_RDN
+        PUSH    B
+        PUSH    H
+        CALL    IRGETB
+        POP     H
+        POP     B
+        JC      FF_RDN          ; EOF
+        CPI     CPMEOF
+        JZ      FF_RDN          ; ^Z end-of-text
+        MOV     M,A
+        INX     H
+        INR     B
+        JMP     FF_RD
+FF_RDN:
+        MOV     A,B
+        STA     VMK
+        ORA     A
+        JZ      FF_NO           ; nothing below
+        MOV     E,A
+        MVI     D,0
+        LXI     H,BYTBELOW
+        CALL    SUB24
+FF_PLACE:
+        ; shift R2 down by K, then drop PGBUF[0..K) at base[BSIZE-K..BSIZE)
+        CALL    GETR2L          ; HL = R2 length
+        MOV     B,H
+        MOV     C,L             ; BC = R2 length
+        LHLD    BDESC0+BD_BSTAR
+        XCHG
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D               ; HL = base+GAPEN (src)
+        SHLD    VMT0
+        LDA     VMK
+        MOV     E,A
+        MVI     D,0
+        LHLD    VMT0
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBI     0
+        MOV     H,A             ; HL = base+GAPEN-K (dst)
+        XCHG                    ; DE = dst
+        LHLD    VMT0            ; HL = src
+        CALL    MOVDN
+        ; PGBUF[0..K) -> base[BSIZE-K..BSIZE)
+        LDA     VMK
+        MOV     C,A
+        MVI     B,0             ; BC = K
+        LHLD    BDESC0+BD_BSTAR
+        XCHG
+        LHLD    BDESC0+BD_BSIZE
+        DAD     D               ; HL = base+BSIZE
+        LDA     VMK
+        MOV     E,A
+        MVI     D,0
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBI     0
+        MOV     H,A             ; HL = base+BSIZE-K (dst)
+        XCHG                    ; DE = dst
+        LXI     H,PGBUF         ; src
+        CALL    MOVDN
+        ; GAPEN -= K ; TXEND += K
+        LDA     VMK
+        MOV     E,A
+        MVI     D,0
+        LHLD    BDESC0+BD_GAPEN
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBI     0
+        MOV     H,A
+        SHLD    BDESC0+BD_GAPEN
+        LDA     VMK
+        MOV     E,A
+        MVI     D,0
+        LHLD    BDESC0+BD_TXEND
+        DAD     D
+        SHLD    BDESC0+BD_TXEND
+        ORA     A               ; CY clear
+        RET
+FF_NO:
+        STC
+        RET
+
+;============================================================
+; REWIND - bring one above-record (top of name.$$$) back into the window top.
+; Frees gap via SPILLBOT first if needed.  Above records are always full 128.
+; Exit: CY clear on success; CY set if nothing is above.
+;============================================================
+REWIND:
+        CALL    GAPLEN
+        MOV     A,H
+        ORA     A
+        JNZ     RW_GAP
+        MOV     A,L
+        CPI     128
+        JNC     RW_GAP
+        CALL    SPILLBOT
+        JC      RW_NO
+RW_GAP:
+        LHLD    OUTREC
+        MOV     A,H
+        ORA     L
+        JZ      RW_NO
+        DCX     H
+        SHLD    OUTREC
+        LXI     D,ABFCB
+        CALL    SCRRD           ; PGBUF <- ABFCB[OUTREC]
+        LXI     H,BYTABOVE
+        LXI     D,128
+        CALL    SUB24
+        ; shift R1 up by 128 (descending): base[0..GAPBG) -> base[128..GAPBG+128)
+        LHLD    BDESC0+BD_GAPBG
+        MOV     B,H
+        MOV     C,L             ; BC = count = GAPBG
+        LHLD    BDESC0+BD_BSTAR
+        XCHG
+        LHLD    BDESC0+BD_GAPBG
+        DAD     D
+        DCX     H               ; HL = base+GAPBG-1 (src end)
+        SHLD    VMT0
+        LXI     D,128
+        DAD     D               ; HL = base+GAPBG-1+128 (dst end)
+        XCHG                    ; DE = dst end
+        LHLD    VMT0            ; HL = src end
+        CALL    MOVUP
+        ; PGBUF[0..128) -> base[0..128)
+        LXI     B,128
+        LHLD    BDESC0+BD_BSTAR
+        XCHG                    ; DE = base (dst)
+        LXI     H,PGBUF
+        CALL    MOVDN
+        ; GAPBG += 128 ; CSOFF = GAPBG ; TXEND += 128
+        LHLD    BDESC0+BD_GAPBG
+        LXI     D,128
+        DAD     D
+        SHLD    BDESC0+BD_GAPBG
+        SHLD    BDESC0+BD_CSOFF
+        LHLD    BDESC0+BD_TXEND
+        LXI     D,128
+        DAD     D
+        SHLD    BDESC0+BD_TXEND
+        ORA     A
+        RET
+RW_NO:
+        STC
+        RET
+
+;============================================================
+; SPILLOK - how many bytes are safe to spill from an edge.
+;   A = 0 -> query TOP    -> HL = R1 length  (= GAPBG)
+;   A = 1 -> query BOTTOM -> HL = R2 length
+; Phase 1 returns the whole edge region; a later phase subtracts the on-screen
+; span so visible text and the gap are never spilled.
+;============================================================
+SPILLOK:
+        ORA     A
+        JNZ     SOK_BOT
+        LHLD    BDESC0+BD_GAPBG
+        RET
+SOK_BOT:
+        JMP     GETR2L
+
+        CSEG
+;--- virtual-buffer configuration (persist across :e) ---
+VMODE:   DB     0               ; 0 = RAM-only, 1 = virtual
+VMALLOW: DB     0               ; 1 = virtual mode may activate (set by /W)
+WINCAP:  DW     0               ; forced window capacity (0 = full TPA)
+GAPRSV:  DW     MINGAP          ; gap kept free (load stop + spill threshold)
+
+;--- 24-bit document counters (contiguous; zeroed by VMZERO) ---
+BYTABOVE: DS    3               ; bytes above the window (in name.$$$)
+BYTBELOW: DS    3               ; bytes below the window ($$B + original tail)
+LINABOVE: DS    3               ; lines above the window (Phase 3)
+LINBELOW: DS    3               ; lines below the window (Phase 3)
+OUTREC:   DW    0               ; records written to name.$$$
+RIGHTREC: DW    0               ; records held in name.$$B
+VMCEND:                         ; (end marker for VMZERO)
+
+;--- primitive scratch temps ---
+VMT0:    DW     0
+VMT1:    DW     0
+VMK:     DB     0               ; FILLFWD: bytes brought in this fill (<=128)
+
+        END

@@ -40,7 +40,7 @@ TARGETS = {
     "SCRTST": ["SCRTST", "VISCREEN", "VIBUF", "VIFILEIO", "VIWIN", "VIEND"],
     "KEYTST": ["KEYTST", "VIKEY", "VIEND"],
     "VIEDIT": ["VI", "VISCREEN", "VIKEY", "VIBUF", "VIWIN", "VIFILEIO",
-               "VICMD", "VICMDOPS", "VICMDEXC", "VICMDSCH", "VICMDUND",
+               "VIVM", "VICMD", "VICMDOPS", "VICMDEXC", "VICMDSCH", "VICMDUND",
                "VICMDSUB", "VICMDDAT", "VIEND"],
 }
 

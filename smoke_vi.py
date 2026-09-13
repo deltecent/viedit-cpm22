@@ -918,6 +918,46 @@ def main():
     row0 = e.screen(rows=24, cols=132).render().split('\n')[0]
     check('/C132 shows wide line past col 80', len(row0) >= 120)
 
+    # --- batch: virtual buffering, forced-tiny window (/W<n>) ---
+    # /W<n> caps the gap buffer to <n> bytes so paging engages on small files.
+    # Phase 1: verify the mode gate + partial load; the RAM-only path (no /W, or
+    # a file that fits the window) is untouched.  mem() stops the editor, so each
+    # reader runs just before close().
+    def _u16(ed, a):
+        b = ed.s.mem(a, 2); return b[0] | (b[1] << 8)
+    def _u24(ed, a):
+        b = ed.s.mem(a, 3); return b[0] | (b[1] << 8) | (b[2] << 16)
+    BDVM = SYM['BDESC0']
+    vlines = [('%04d hello world' % i).encode() for i in range(200)]
+    vcontent = b'\r\n'.join(vlines) + b'\r\n'          # ~3600 bytes
+
+    e = Editor(vcontent, args=' /W2048')
+    check('/W: partial-load head renders like RAM-only', rows(e)[0] == '0000 hello world')
+    _vmode = e.s.mem(SYM['VMODE'], 1)[0]
+    _bsize = _u16(e, BDVM + 2)                          # BD_BSIZE
+    _txend = _u16(e, BDVM + 8)                          # BD_TXEND (bytes resident)
+    _above = _u24(e, SYM['BYTABO'])
+    _below = _u24(e, SYM['BYTBEL'])
+    check('/W enables virtual mode', _vmode == 1)
+    check('/W caps the window (BD_BSIZE == 2048)', _bsize == 2048)
+    check('/W loads only a partial window', 0 < _txend <= 2048 and _txend < len(vcontent))
+    check('/W accounts the unread tail below, nothing above yet',
+          _below > 0 and _above == 0)
+    e.close()
+
+    # a file that fits inside the /W window stays fully resident (RAM-only)
+    e = Editor(b'one\r\ntwo\r\n', args=' /W2048')
+    check('/W: a file that fits stays RAM-only', e.s.mem(SYM['VMODE'], 1)[0] == 0)
+    e.close()
+
+    # without /W, virtual mode never engages (same 3600-byte file loads whole)
+    e = Editor(vcontent)
+    _vm = e.s.mem(SYM['VMODE'], 1)[0]
+    _tx = _u16(e, BDVM + 8)
+    check('no /W: RAM-only, whole file resident',
+          _vm == 0 and _tx == len(vcontent))
+    e.close()
+
     # --- bugs.txt: word motions w/b/e vs W/B/E (punctuation boundaries) ---
     cp = b'foo.bar baz\r\nsecond line\r\n'   # f0 o1 o2 .3 b4 a5 r6 _7 b8 a9 z10
     e = Editor(cp); e.key('w')

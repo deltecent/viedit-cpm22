@@ -24,8 +24,10 @@
         INCLUDE VI.INC
 
         EXTRN   BDFLD, GBLDHW, GBSTHW, GBMVTOP
+        EXTRN   VMODE, VMALLOW, GAPRSV, VMLDIN   ; VIVM: virtual-buffer engine
 
         PUBLIC  FIOPEN, FISAVE, INFCB, OUTFCB, IRGETB, INRDLN, IRINIT
+        PUBLIC  SCRWR, SCRRD, PGBUF, ABFCB, RSFCB   ; scratch I/O for VIVM
 
         CSEG
 
@@ -152,11 +154,20 @@ FIOPEN:
         MOV     D,A
         LDA     INFCB+FCB_R0
         MOV     E,A             ; DE = file size in records
-        ; cap (records) = (BSIZE - MINGAP) >> 7
+        ; cap (records) = (BSIZE - GAPRSV) >> 7.  GAPRSV is the gap kept free
+        ; (= MINGAP normally; a smaller value under the /W forced-tiny window).
         MVI     A,BD_BSIZE
-        CALL    GBLDHW
-        LXI     B,0-MINGAP
-        DAD     B               ; HL = BSIZE - MINGAP = usable bytes
+        CALL    GBLDHW          ; HL = BSIZE  (BDFLD preserves DE = file records)
+        LDA     GAPRSV
+        MOV     C,A
+        LDA     GAPRSV+1
+        MOV     B,A             ; BC = GAPRSV
+        MOV     A,L
+        SUB     C
+        MOV     L,A
+        MOV     A,H
+        SBB     B
+        MOV     H,A             ; HL = BSIZE - GAPRSV = usable bytes
         MVI     B,7             ; HL >>= 7  -> usable records
 FIO_SHR:
         XRA     A               ; clear carry
@@ -173,9 +184,10 @@ FIO_SHR:
         SUB     E
         MOV     A,H
         SBB     D
-        JC      FIO_BIG
-        ;--- fits: load it fully resident -------------------------------------
+        JC      FIO_TOOBIG      ; does not fit -> refuse, or go virtual under /W
+        ;--- fits: load it fully resident (RAM-only, exactly as before) -------
         XRA     A
+        STA     VMODE           ; RAM-only
         STA     INFCB+FCB_CR    ; FSIZE may have touched random fields; reset CR
         CALL    IRINIT
         MVI     A,BD_BSTAR
@@ -229,12 +241,161 @@ FIO_NEW:
         XRA     A               ; A = 0: new/empty file is OK
         RET
 
+;------------------------------------------------------------
+; FIO_TOOBIG - the file does not fit resident.  Refuse (A=1, as before) unless
+; virtual mode is permitted (the /W switch set VMALLOW), in which case load a
+; partial window and page the rest to disk.
+; Entry: DE = file size in 128-byte records (from the size gate).
+;------------------------------------------------------------
+FIO_TOOBIG:
+        LDA     VMALLOW
+        ORA     A
+        JZ      FIO_BIG          ; virtual not permitted -> refuse
+FIO_VLOAD:
+        CALL    VMLDIN           ; VMODE=1 + counters; HL = records to load
+        MVI     B,7
+FVL_SL2:
+        DAD     H
+        DCR     B
+        JNZ     FVL_SL2          ; HL = caprec << 7 = bytes to load
+        SHLD    FVREM
+        XRA     A
+        STA     INFCB+FCB_CR     ; FSIZE touched random fields; reset CR
+        CALL    IRINIT
+        CALL    MKSCR            ; create the .$$$ / .$$B scratch files
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        SHLD    FWPTR            ; write ptr = base
+FVL_RD:
+        LHLD    FVREM
+        MOV     A,H
+        ORA     L
+        JZ      FIO_EOF          ; loaded the window -> finalize like a full load
+        CALL    IRGETB
+        JC      FIO_EOF          ; short file (declared bigger than it read)
+        PUSH    PSW
+        LHLD    FWPTR
+        POP     PSW
+        MOV     M,A
+        INX     H
+        SHLD    FWPTR
+        LHLD    FVREM
+        DCX     H
+        SHLD    FVREM
+        JMP     FVL_RD
+
+;------------------------------------------------------------
+; MKSCR - build the scratch FCBs (name.$$$ and name.$$B on the edited file's
+; drive) from BD_FNAME, delete any stale copies, and create fresh empty files
+; so random writes have a directory slot.
+;------------------------------------------------------------
+MKSCR:
+        LXI     D,ABFCB
+        LXI     H,SCRXAB
+        CALL    MKSCR1
+        LXI     D,RSFCB
+        LXI     H,SCRXRS
+        CALL    MKSCR1
+        RET
+MKSCR1:                          ; DE = dst FCB, HL = &ext(3)
+        XCHG                     ; HL = FCB, DE = ext ptr
+        SHLD    MKFCB
+        PUSH    D                ; save ext ptr
+        MVI     B,FCB_SIZ
+        XRA     A
+MKS_Z:
+        MOV     M,A
+        INX     H
+        DCR     B
+        JNZ     MKS_Z
+        ; copy drive + name8 (9 bytes) from BD_FNAME
+        MVI     A,BD_FNAME
+        CALL    BDFLD            ; HL = &BD_FNAME (src)
+        XCHG                     ; DE = src
+        LHLD    MKFCB            ; HL = dst FCB
+        MVI     B,9
+MKS_CP:
+        LDAX    D
+        MOV     M,A
+        INX     D
+        INX     H
+        DCR     B
+        JNZ     MKS_CP
+        ; HL now = FCB+9 (the ext slot); copy the 3-char ext
+        POP     D                ; DE = ext ptr
+        MVI     B,3
+MKS_EX:
+        LDAX    D
+        MOV     M,A
+        INX     D
+        INX     H
+        DCR     B
+        JNZ     MKS_EX
+        ; delete stale, then make fresh
+        LHLD    MKFCB
+        XCHG
+        MVI     C,BF_FDEL
+        CALL    BDOS
+        LHLD    MKFCB
+        XCHG
+        MVI     C,BF_FMAKE
+        CALL    BDOS
+        ; zero CR + random record fields
+        LHLD    MKFCB
+        PUSH    H
+        LXI     B,FCB_CR
+        DAD     B
+        MVI     M,0
+        POP     H
+        LXI     B,FCB_R0
+        DAD     B
+        MVI     M,0
+        INX     H
+        MVI     M,0
+        INX     H
+        MVI     M,0
+        RET
+
+;------------------------------------------------------------
+; SCRWR / SCRRD - random-write / random-read a 128-byte record between PGBUF
+; and an FCB.  Entry: DE = FCB, HL = record number (0-based).  Clobbers A,BC,DE,HL.
+;------------------------------------------------------------
+SCRWR:
+        MVI     C,BF_WRITRN
+        JMP     SCRIO
+SCRRD:
+        MVI     C,BF_READRN
+SCRIO:
+        PUSH    B                ; save the BDOS function code (in C)
+        SHLD    SCRREC           ; save record number
+        XCHG                     ; HL = FCB
+        SHLD    SCRFCB
+        LXI     B,FCB_R0
+        DAD     B                ; HL = &FCB.R0
+        LDA     SCRREC
+        MOV     M,A
+        INX     H
+        LDA     SCRREC+1
+        MOV     M,A
+        INX     H
+        MVI     M,0              ; r2 = 0
+        LXI     D,PGBUF
+        MVI     C,BF_SETDMA
+        CALL    BDOS
+        LHLD    SCRFCB
+        XCHG                     ; DE = FCB
+        POP     B                ; C = read/write function code
+        CALL    BDOS
+        RET
+
 ;============================================================
 ; FISAVE - straight buffer write.  The whole file is resident (RAM-only), so
 ; the save is simply: window R1 ++ window R2 -> OUTFCB, then ^Z-pad the final
 ; partial record and close.
 ;============================================================
 FISAVE:
+        LXI     H,OUTFCB
+        SHLD    OCHAN            ; sequential writes go to OUTFCB (default channel)
         XRA     A
         STA     OUTFCB+FCB_CR
         STA     OPOS
@@ -344,7 +505,8 @@ OFLUSH:
         LXI     D,OBUF
         MVI     C,BF_SETDMA
         CALL    BDOS
-        LXI     D,OUTFCB
+        LHLD    OCHAN            ; output channel FCB (OUTFCB, or a scratch file)
+        XCHG
         MVI     C,BF_FWRITE
         CALL    BDOS
         XRA     A
@@ -359,9 +521,19 @@ OPOS:   DB      0
 IRPOS:  DB      RECSIZ
 IREOF:  DB      0
 FWPTR:  DW      0
+OCHAN:  DW      OUTFCB          ; sequential-write channel FCB (PUTB/OFLUSH)
+FVREM:  DW      0               ; FIO_VLOAD: bytes left to load into the window
+MKFCB:  DW      0               ; MKSCR: FCB being built
+SCRREC: DW      0               ; SCRWR/SCRRD: record number
+SCRFCB: DW      0               ; SCRWR/SCRRD: FCB address
+SCRXAB: DB      '$$$'           ; ABFCB extension (records spilled above)
+SCRXRS: DB      '$$B'           ; RSFCB extension (records spilled below/right)
 INFCB:  DS      FCB_SIZ
 OUTFCB: DS      FCB_SIZ
+ABFCB:  DS      FCB_SIZ         ; name.$$$  (ABOVE / output scratch)
+RSFCB:  DS      FCB_SIZ         ; name.$$B  (RIGHT / below scratch)
 IRBUF:  DS      RECSIZ
 OBUF:   DS      RECSIZ
+PGBUF:  DS      RECSIZ          ; page-transfer buffer (spill/fill DMA)
 
         END
