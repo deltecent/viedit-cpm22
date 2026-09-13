@@ -17,6 +17,8 @@
         EXTRN   GBPKRT, GBPKLT, GBMVRT, GBMVLT, GBLDHW
         EXTRN   GBSTHW, GBMVTOP
         EXTRN   GBMLNS, GBMLNE
+        EXTRN   VMODE           ; VIVM: 0 = RAM-only, 1 = virtual (paging)
+        EXTRN   FILLFWD         ; VIVM: bring the next record from below into R2
 
         PUBLIC  WININIT
         PUBLIC  GBMVDN, GBMVUP, CURLN, CURWLN, CURCOL, CURDCO
@@ -50,7 +52,16 @@ GBMVDN:
         CALL    GBMVRT          ; cross CR,LF (or bare LF) atomically
         CALL    GBPKRT
         CPI     0FFH
-        JZ      GBMVDN_E        ; crossed the final terminator -> at EOB, no next
+        JNZ     GBMVDN_OK       ; a real next line is resident
+        ; R2 empty after crossing.  RAM-only: that was the file's final
+        ; terminator, so there is no next line.  Virtual: the next line may just
+        ; be below the window bottom -- pull its first record in and continue.
+        LDA     VMODE
+        ORA     A
+        JZ      GBMVDN_E
+        CALL    FILLFWD
+        JC      GBMVDN_E        ; nothing below -> the terminator was final
+GBMVDN_OK:
         XRA     A               ; landed on a real next line
         RET
 GBMVDN_E:
@@ -131,6 +142,11 @@ NR_RT:
 ; invalidates the cache (CLNVAL=0).
 ;============================================================
 CURLN:
+        LDA     VMODE
+        ORA     A
+        JNZ     CLNFULL         ; virtual: a window slide rewrites the buffer, so
+                                ; the incremental (gapbg-delta) cache cannot be
+                                ; trusted -- always full-scan R1 for the window line
         LDA     CLNVAL
         ORA     A
         JZ      CLNFULL         ; cache cold

@@ -48,11 +48,13 @@
         EXTRN   PGBUF           ; VIFILEIO: 128-byte page-transfer buffer
         EXTRN   ABFCB, RSFCB    ; VIFILEIO: the .$$$ / .$$B scratch FCBs
         EXTRN   IRGETB          ; VIFILEIO: buffered original-tail byte reader
+        EXTRN   NEDIT           ; VISCREEN: edit-area row count (VMFILL depth)
 
         PUBLIC  VMODE, VMALLOW, WINCAP, GAPRSV
         PUBLIC  BYTABOVE, BYTBELOW, LINABOVE, LINBELOW, OUTREC, RIGHTREC
         PUBLIC  VMRSET, VMZERO, VMLDIN
         PUBLIC  SPILLTOP, SPILLBOT, FILLFWD, REWIND, SPILLOK
+        PUBLIC  FLBRK, RWBRK, VMFILL
 
         CSEG
 
@@ -244,6 +246,27 @@ MUP_L:
         RET
 
 ;============================================================
+; CNTLF128 - count LF bytes in PGBUF[0..128).  Exit: C = count (0..128).
+; Used by SPILLTOP/REWIND to slide BD_TOPLN by the lines a record carries off
+; or back onto the window top, keeping the window-relative TOPLN (and thus
+; VADJ's scroll delta) consistent as the window slides.  Clobbers A,B,C,H,L.
+;============================================================
+CNTLF128:
+        LXI     H,PGBUF
+        MVI     B,128
+        MVI     C,0
+CLF_LP:
+        MOV     A,M
+        CPI     LF
+        JNZ     CLF_NX
+        INR     C
+CLF_NX:
+        INX     H
+        DCR     B
+        JNZ     CLF_LP
+        RET
+
+;============================================================
 ; SPILLTOP - evict the top 128-byte record of R1 to name.$$$, sliding R1 down
 ; and growing the gap.  Exit: CY clear on success; CY set if R1 < 128 (nothing
 ; safe to spill).
@@ -305,6 +328,25 @@ ST_CP:
         LXI     H,BYTABOVE
         LXI     D,128
         CALL    ADD24
+        ; slide TOPLN down by the LFs carried off the window top (PGBUF still
+        ; holds the spilled record).  Floors at 0 if the spill reached into the
+        ; visible region (a Phase-1 SPILLOK will forbid that; here we clamp).
+        CALL    CNTLF128         ; C = LFs in the spilled record
+        MOV     A,C
+        ORA     A
+        JZ      ST_DONE
+        LHLD    BDESC0+BD_TOPLN
+        MOV     A,L
+        SUB     C
+        MOV     L,A
+        MOV     A,H
+        SBI     0
+        MOV     H,A
+        JNC     ST_STT
+        LXI     H,0              ; clamp
+ST_STT:
+        SHLD    BDESC0+BD_TOPLN
+ST_DONE:
         ORA     A               ; CY clear = success
         RET
 ST_NO:
@@ -573,6 +615,18 @@ RW_GAP:
         LXI     D,128
         DAD     D
         SHLD    BDESC0+BD_TXEND
+        ; slide TOPLN up by the LFs brought back onto the window top (PGBUF
+        ; still holds the rewound record).
+        CALL    CNTLF128         ; C = LFs in the rewound record
+        MOV     A,C
+        ORA     A
+        JZ      RW_DONE
+        LHLD    BDESC0+BD_TOPLN
+        MOV     E,C
+        MVI     D,0
+        DAD     D
+        SHLD    BDESC0+BD_TOPLN
+RW_DONE:
         ORA     A
         RET
 RW_NO:
@@ -593,6 +647,112 @@ SPILLOK:
         RET
 SOK_BOT:
         JMP     GETR2L
+
+;============================================================
+; FLBRK - ensure the current line's END is resident before a forward line scan
+; (GBMLNE and friends).  R2 = base[GAPEN,BSIZE) must contain an LF (the line
+; terminator); if not, FILLFWD more of the document below until it does, or
+; until BELOW is exhausted (the line then runs to true EOF).  The cursor stays
+; logically fixed (FILLFWD preserves it).  Callers gate on VMODE.
+; Clobbers A,BC,DE,HL.  Flags on return are not meaningful to callers.
+;============================================================
+FLBRK:
+        CALL    GETR2L          ; HL = R2 length
+        MOV     B,H
+        MOV     C,L             ; BC = bytes to scan
+        LHLD    BDESC0+BD_BSTAR
+        XCHG
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D               ; HL = base+GAPEN = R2 head
+FLB_SC:
+        MOV     A,B
+        ORA     C
+        JZ      FLB_FILL        ; scanned all of R2, no LF -> need more below
+        MOV     A,M
+        CPI     LF
+        RZ                      ; LF resident -> line end is in the window
+        INX     H
+        DCX     B
+        JMP     FLB_SC
+FLB_FILL:
+        CALL    FILLFWD
+        RC                      ; nothing below -> line runs to true EOF
+        JMP     FLBRK
+
+;============================================================
+; RWBRK - ensure the current line's START is resident before a backward line
+; scan (GBMLNS and friends).  R1 = base[0,GAPBG) must contain an LF (the
+; previous line's terminator); if not, REWIND records from ABOVE until it does,
+; or until ABOVE is exhausted (the window top is then BOB = the line start).
+; Scans R1 backward from the cursor so a normal short line finds its start fast.
+; Cursor preserved.  Callers gate on VMODE.  Clobbers A,BC,DE,HL.
+;============================================================
+RWBRK:
+        LHLD    BDESC0+BD_GAPBG
+        MOV     B,H
+        MOV     C,L             ; BC = R1 length (bytes to scan)
+        LHLD    BDESC0+BD_BSTAR
+        XCHG
+        LHLD    BDESC0+BD_GAPBG
+        DAD     D               ; HL = base+GAPBG = one past R1 end
+RWB_SC:
+        MOV     A,B
+        ORA     C
+        JZ      RWB_RW          ; no LF in R1 -> rewind more from above
+        DCX     H               ; step back onto an R1 byte
+        MOV     A,M
+        CPI     LF
+        RZ                      ; found the previous terminator -> start resident
+        DCX     B
+        JMP     RWB_SC
+RWB_RW:
+        CALL    REWIND
+        RC                      ; nothing above -> window top is the line start
+        JMP     RWBRK
+
+;============================================================
+; VMFILL - viewport pre-fill.  Ensure at least NEDIT lines (LFs) are resident
+; BELOW the cursor in R2, so SCRDRAW / the scroll rollers (which read the
+; resident buffer through the virtual reader) can paint a full screen without
+; the reader hitting the window bottom.  FILLFWD until NEDIT LFs are present or
+; BELOW is exhausted.  (Above-cursor screen lines are always resident -- they
+; live in R1.)  RAM-only: no-op.  Called at the top of VADJ.  Clobbers A,BC,DE,HL.
+;============================================================
+VMFILL:
+        LDA     VMODE
+        ORA     A
+        RZ
+VMF_LP:
+        CALL    GETR2L          ; HL = R2 length
+        MOV     B,H
+        MOV     C,L             ; BC = bytes to scan
+        LHLD    BDESC0+BD_BSTAR
+        XCHG
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D               ; HL = base+GAPEN = R2 head
+        MVI     E,0             ; E = LF count so far (<= NEDIT, fits a byte)
+VMF_SC:
+        MOV     A,B
+        ORA     C
+        JZ      VMF_NEED        ; scanned all of R2 -> E LFs found
+        MOV     A,M
+        CPI     LF
+        JNZ     VMF_SN
+        INR     E
+        LDA     NEDIT
+        CMP     E               ; NEDIT - E : done once E >= NEDIT
+        JC      VMF_OK
+        JZ      VMF_OK
+VMF_SN:
+        INX     H
+        DCX     B
+        JMP     VMF_SC
+VMF_NEED:
+        CALL    FILLFWD
+        RC                      ; nothing left below -> all of BELOW is resident
+        JMP     VMF_LP
+VMF_OK:
+        RET
 
         CSEG
 ;--- virtual-buffer configuration (persist across :e) ---

@@ -35,6 +35,10 @@
         EXTRN   NLNVAL          ; VIWIN: total-line-count cache valid flag
         EXTRN   BDESC0          ; the (single) buffer descriptor, fixed link addr.
         EXTRN   MKINS, MKDEL    ; VICMD: shift marks on insert/delete
+        EXTRN   VMODE           ; VIVM: 0 = RAM-only, 1 = virtual (paging)
+        EXTRN   FILLFWD, REWIND ; VIVM: bring a record into R2 / R1 at an edge
+        EXTRN   SPILLTOP, SPILLBOT ; VIVM: evict a record to free gap on insert
+        EXTRN   FLBRK, RWBRK    ; VIVM: page so a line end/start is resident
                                 ; CURBDP always == BDESC0, so the hot per-byte
                                 ; primitives address its fields directly as
                                 ; link-time constants (BDESC0+BD_xxx) instead of
@@ -220,6 +224,21 @@ GBINSRT:
         XRA     A               ; A = 0 (ok)
         RET
 GBINS_FULL:
+        ; gap exhausted.  Virtual mode: free a record to disk and retry the
+        ; insert; only report full if neither edge can spill.  SPILLTOP is
+        ; preferred (evicts above the cursor); SPILLBOT is the fallback when the
+        ; cursor sits near the window top (R1 < 128).
+        LDA     VMODE
+        ORA     A
+        JZ      GBINS_FF        ; RAM-only: the buffer really is full
+        CALL    SPILLTOP
+        JNC     GBINS_RTY
+        CALL    SPILLBOT
+        JC      GBINS_FF        ; neither edge had a full record to evict
+GBINS_RTY:
+        POP     PSW             ; recover the byte (still on the stack)
+        JMP     GBINSRT         ; retry with a freed gap
+GBINS_FF:
         POP     PSW
         MVI     A,0FFH
         RET
@@ -312,7 +331,7 @@ MV1LT:
 ;------------------------------------------------------------
 GBMVRT:
         CALL    R2HEAD
-        RZ                      ; at end of text
+        JZ      GMRT_EDG        ; R2 empty: window bottom (virtual) or end of text
         MOV     A,M             ; A = byte about to cross
         PUSH    PSW             ; save it (MV1RT clobbers A)
         CALL    MV1RT
@@ -321,10 +340,33 @@ GBMVRT:
         RNZ                     ; not CR -> done (one byte)
         ; was CR: cross the LF too if R2 now starts with LF
         CALL    R2HEAD
-        RZ                      ; CR was at end -> done
+        JZ      GMRT_EDG2       ; CR at the window bottom: the LF may straddle
         MOV     A,M
         CPI     LF
         RNZ                     ; lone CR -> done
+        JMP     MV1RT           ; cross the LF
+;--- GBMVRT edge: R2 exhausted before crossing.  Virtual mode brings the next
+;    record from below and retries; RAM-only is genuinely at end of text. ---
+GMRT_EDG:
+        LDA     VMODE
+        ORA     A
+        RZ                      ; RAM-only: at end of text
+        CALL    FILLFWD         ; pull one record from below into R2
+        RC                      ; nothing below -> truly at end
+        JMP     GBMVRT          ; retry with R2 now non-empty
+;--- GBMVRT edge2: the CR crossed, its LF is below the window bottom.  Fill and
+;    cross the LF so the cursor never rests between CR and LF. ---
+GMRT_EDG2:
+        LDA     VMODE
+        ORA     A
+        RZ                      ; RAM-only: lone CR at end -> done
+        CALL    FILLFWD
+        RC                      ; nothing below -> lone CR at true EOF -> done
+        CALL    R2HEAD
+        RZ                      ; (defensive) still empty -> done
+        MOV     A,M
+        CPI     LF
+        RNZ                     ; the below byte was not an LF -> lone CR -> done
         JMP     MV1RT           ; cross the LF
 
 ;------------------------------------------------------------
@@ -334,7 +376,7 @@ GBMVRT:
 ;------------------------------------------------------------
 GBMVLT:
         CALL    R1TAIL
-        RZ                      ; at start of text
+        JZ      GMLT_EDG        ; R1 empty: window top (virtual) or start of text
         MOV     A,M             ; A = byte about to cross
         PUSH    PSW             ; save it (MV1LT clobbers A)
         CALL    MV1LT
@@ -343,10 +385,33 @@ GBMVLT:
         RNZ                     ; not LF -> done
         ; was LF: cross the CR too if R1 now ends with CR
         CALL    R1TAIL
-        RZ                      ; LF was at start -> done
+        JZ      GMLT_EDG2       ; LF at the window top: the CR may straddle
         MOV     A,M
         CPI     CR
         RNZ                     ; bare LF -> done
+        JMP     MV1LT           ; cross the CR
+;--- GBMVLT edge: R1 exhausted before crossing.  Virtual mode brings the
+;    previous record back from above and retries; RAM-only is at start of text.
+GMLT_EDG:
+        LDA     VMODE
+        ORA     A
+        RZ                      ; RAM-only: at start of text
+        CALL    REWIND          ; pull one record from above into R1
+        RC                      ; nothing above -> truly at start
+        JMP     GBMVLT          ; retry with R1 now non-empty
+;--- GBMVLT edge2: the LF crossed, its CR is above the window top.  Rewind and
+;    cross the CR so the cursor never rests between CR and LF. ---
+GMLT_EDG2:
+        LDA     VMODE
+        ORA     A
+        RZ                      ; RAM-only: bare LF at start -> done
+        CALL    REWIND
+        RC                      ; nothing above -> bare LF at true BOB -> done
+        CALL    R1TAIL
+        RZ                      ; (defensive) still empty -> done
+        MOV     A,M
+        CPI     CR
+        RNZ                     ; the byte above was not a CR -> bare LF -> done
         JMP     MV1LT           ; cross the CR
 
 ;------------------------------------------------------------
@@ -543,6 +608,9 @@ GBAKN_L:
 ; Scans R1 backward for the bound, then moves left in ONE block (GBBAKN).
 ;------------------------------------------------------------
 GBMLNS:
+        LDA     VMODE
+        ORA     A
+        CNZ     RWBRK           ; virtual: page so the line start is resident
         LHLD    BDESC0+BD_BSTAR
         XCHG                    ; DE = base (lower bound)
         LHLD    BDESC0+BD_GAPBG
@@ -572,6 +640,9 @@ MLNS_DN:
 ; Scans R2 forward for the break, then moves right in ONE block (GBADVN).
 ;------------------------------------------------------------
 GBMLNE:
+        LDA     VMODE
+        ORA     A
+        CNZ     FLBRK           ; virtual: page so the line end is resident
         LHLD    BDESC0+BD_BSTAR
         XCHG                    ; DE = base
         LHLD    BDESC0+BD_BSIZE

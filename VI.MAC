@@ -30,6 +30,7 @@
         EXTRN   FIOPEN, INFCB, OUTFCB   ; VIFILEIO
         EXTRN   ABFCB, RSFCB            ; VIFILEIO -- scratch FCBs (VIQUIT cleanup)
         EXTRN   VMODE, VMALLOW, WINCAP, GAPRSV  ; VIVM -- virtual-buffer config
+        EXTRN   VMFILL          ; VIVM -- pre-fill the window below the cursor
         EXTRN   WININIT         ; VIWIN -- reset line caches after open
         EXTRN   CURWLN          ; VIWIN -- cursor window line (= CURLN, RAM-only)
         EXTRN   CURDCO          ; VIWIN -- current display column (tab-aware)
@@ -330,6 +331,12 @@ RSTRGN:  DB     ESC,'7',ESC,'[','r',ESC,'8',NUL
 ; set BD_CSROW; raise DIRTY if BD_TOPLN changed.
 ;============================================================
 VADJ:
+        ; Virtual mode: before measuring the cursor line / viewport, make sure a
+        ; full screen of text below the cursor is resident so SCRDRAW and the
+        ; scroll rollers (which read only RAM via the virtual reader) can paint
+        ; every edit row.  No-op in RAM-only mode.  Any SPILLTOP it triggers has
+        ; already slid BD_TOPLN, so the TOPLN read below stays consistent.
+        CALL    VMFILL
         ; BD_CSCOL = display column (CURDCO: tab-aware, so the hardware cursor
         ; and HSCROL track the on-screen position, not the raw byte index).
         ; CURDCO returns the column where the cursor's char BEGINS; when that
