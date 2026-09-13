@@ -1141,6 +1141,60 @@ def main():
     check('virtual save: name.$$$ scratch gone after quit', ('TEST', '$$$') not in names)
     check('virtual save: name.$$B scratch gone after quit', ('TEST', '$$B') not in names)
 
+    # --- Phase 5 acceptance: goto (:N) and search (/ ? n N) across the window ---
+    # In virtual mode the resident window is only ~BSIZE around the cursor, so a
+    # goto or search to a far target must WALK the cursor through the file, paging
+    # (FILLFWD/REWIND) as it moves, and still land at the exact document position a
+    # RAM-only editor reaches.  Oracle: _gstat (absolute ^G line/col) of a /W2048
+    # editor must equal a RAM-only editor fed the same keys.  (:N goto is newly
+    # implemented in BOTH modes -- it previously errored -- so this also covers RAM.)
+
+    # :N goto to a line far below the initial window (forces FILLFWD paging down).
+    gv, gr = _gpair([':150\r'], idle=6000)
+    check('/W vs RAM: :150 goto lands on the same line', gv[0] == gr[0] == 150)
+    check('/W vs RAM: :150 goto lands on the same col', gv[1] == gr[1])
+
+    # goto deep, then goto back up (forces REWIND paging above content back in).
+    gv, gr = _gpair([':190\r', ':5\r'], idle=6000)
+    check('/W vs RAM: :190 then :5 lands on line 5', gv[0] == gr[0] == 5)
+
+    # forward search to a far, unique prefix below the window (paged forward).
+    gv, gr = _gpair(['/0180\r'], idle=8000)
+    check('/W vs RAM: /0180 (paged forward) lands on line 181', gv[0] == gr[0] == 181)
+    check('/W vs RAM: /0180 col matches', gv[1] == gr[1])
+
+    # n on a UNIQUE match wraps the whole document and returns to the same line
+    # (exercises a full forward sweep + wrap across every window boundary).
+    gv, gr = _gpair(['/0180\r', 'n'], idle=8000)
+    check('/W vs RAM: n on a unique match wraps back to line 181',
+          gv[0] == gr[0] == 181)
+
+    # backward search from the last line up to a far-up target (paged backward).
+    gv, gr = _gpair(['G', '?0010\r'], idle=8000)
+    check('/W vs RAM: ?0010 from bottom (paged backward) lands on line 11',
+          gv[0] == gr[0] == 11)
+
+    # N reverses direction: after a forward /, N searches backward and (unique
+    # match) wraps back to the same line.
+    gv, gr = _gpair(['/0180\r', 'N'], idle=8000)
+    check('/W vs RAM: N after / wraps back to line 181', gv[0] == gr[0] == 181)
+
+    # a search miss must sweep the whole document, find nothing, and restore the
+    # cursor to where it started (VS_MISS: back to the saved origin line + col).
+    em = Editor(vcontent, args=' /W2048')
+    try:
+        em.key(':100\r', idle=6000)
+        before = _gstat(em)                    # line 100
+        em.key('/zzzz\r', idle=8000)
+        msg = em.screen().render()             # capture before _gstat overwrites row 23
+        after = _gstat(em)
+    finally:
+        em.close()
+    check('/W search miss reports "Pattern not found"', 'Pattern not found' in msg)
+    check('/W search miss restores the cursor to the origin line',
+          after[0] == before[0] == 100)
+    check('/W search miss restores the cursor to the origin col', after[1] == before[1])
+
     # --- bugs.txt: word motions w/b/e vs W/B/E (punctuation boundaries) ---
     cp = b'foo.bar baz\r\nsecond line\r\n'   # f0 o1 o2 .3 b4 a5 r6 _7 b8 a9 z10
     e = Editor(cp); e.key('w')

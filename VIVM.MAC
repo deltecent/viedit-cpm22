@@ -49,6 +49,7 @@
         EXTRN   ABFCB, RSFCB    ; VIFILEIO: the .$$$ / .$$B scratch FCBs
         EXTRN   IRGETB          ; VIFILEIO: buffered original-tail byte reader
         EXTRN   NEDIT           ; VISCREEN: edit-area row count (VMFILL depth)
+        EXTRN   CURWLN          ; VIWIN: window-relative line of the cursor
 
         PUBLIC  VMODE, VMALLOW, WINCAP, GAPRSV
         PUBLIC  BYTABOVE, BYTBELOW, LINABOVE, LINBELOW, OUTREC, RIGHTREC
@@ -679,19 +680,113 @@ RW_NO:
         RET
 
 ;============================================================
-; SPILLOK - how many bytes are safe to spill from an edge.
-;   A = 0 -> query TOP    -> HL = R1 length  (= GAPBG)
-;   A = 1 -> query BOTTOM -> HL = R2 length
-; Phase 1 returns the whole edge region; a later phase subtracts the on-screen
-; span so visible text and the gap are never spilled.
+; SPILLOK - how many bytes are safe to spill from an edge WITHOUT evicting text
+; that is currently on screen.  SPILLTOP/SPILLBOT only ever touch the R1 head /
+; R2 tail (never the cursor byte or the gap, both at the window centre), so the
+; only thing to protect is VISIBLE text.  The viewport is window-relative lines
+; BD_TOPLN .. BD_TOPLN+NEDIT-1.
+;   A = 0 -> TOP    -> HL = bytes of R1 strictly ABOVE the top visible line
+;                      (= the offset of window line BD_TOPLN's start).
+;   A = 1 -> BOTTOM -> HL = bytes of R2 strictly BELOW the bottom visible line.
+; GBINSRT consults this so an interactive insert prefers an off-screen edge and
+; never writes visible text to disk on a stationary screen.  FILLFWD/REWIND do
+; NOT use it -- their opposite-edge spill discipline must stay loose (the screen
+; repaints after a page move anyway), or paging could stall.
 ;============================================================
 SPILLOK:
         ORA     A
         JNZ     SOK_BOT
+;--- TOP: offset of the start of window line BD_TOPLN within R1 ---
+        LHLD    BDESC0+BD_TOPLN
+        MOV     A,H
+        ORA     L
+        RZ                      ; TOPLN==0 -> viewport starts at offset 0 (HL=0)
+        XCHG                    ; DE = TOPLN (line boundaries to pass)
+        LHLD    BDESC0+BD_BSTAR
+        SHLD    VMT0            ; base = offset origin
         LHLD    BDESC0+BD_GAPBG
+        MOV     B,H
+        MOV     C,L             ; BC = R1 length (scan bound)
+        LHLD    VMT0            ; HL = base = scan ptr
+SOK_TL:
+        MOV     A,B
+        ORA     C
+        JZ      SOK_T0          ; ran out of R1 before line TOPLN (cannot happen)
+        MOV     A,M
+        INX     H
+        DCX     B
+        CPI     LF
+        JNZ     SOK_TL
+        DCX     D               ; passed one line boundary
+        MOV     A,D
+        ORA     E
+        JNZ     SOK_TL
+        ; HL just past the TOPLN-th LF = start of the top visible line
+        XCHG                    ; DE = ptr
+        LHLD    VMT0            ; HL = base
+        MOV     A,E
+        SUB     L
+        MOV     L,A
+        MOV     A,D
+        SBB     H
+        MOV     H,A             ; HL = ptr - base = safe head bytes
         RET
+SOK_T0:
+        LXI     H,0
+        RET
+;--- BOTTOM: R2 bytes below the bottom visible line ---
+; nskip = TOPLN + NEDIT - CURWLN : LFs from the cursor's line down through the
+; last visible line.  <= 0 means the cursor is at/below the viewport bottom, so
+; all of R2 is off-screen (safe).  Else skip nskip LFs; the rest of R2 is safe.
 SOK_BOT:
-        JMP     GETR2L
+        CALL    CURWLN          ; HL = window line of the cursor
+        XCHG                    ; DE = CURWLN
+        LHLD    BDESC0+BD_TOPLN
+        LDA     NEDIT
+        MOV     C,A
+        MVI     B,0
+        DAD     B               ; HL = TOPLN + NEDIT
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A             ; HL = nskip (signed)
+        MOV     A,H
+        ORA     A
+        JM      SOK_BALL        ; nskip < 0 -> all R2 off-screen
+        ORA     L
+        JZ      SOK_BALL        ; nskip == 0 -> all R2 off-screen
+        MOV     A,L
+        STA     VMK2            ; nskip (1..NEDIT, fits a byte)
+        CALL    GETR2L          ; HL = R2 length
+        MOV     B,H
+        MOV     C,L             ; BC = R2 bytes remaining
+        LHLD    BDESC0+BD_BSTAR
+        XCHG
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D               ; HL = base+GAPEN = R2 head
+        LDA     VMK2
+        MOV     E,A             ; E = LFs to skip
+SOK_BL:
+        MOV     A,B
+        ORA     C
+        JZ      SOK_B0          ; R2 exhausted before the viewport bottom -> none
+        MOV     A,M
+        INX     H
+        DCX     B
+        CPI     LF
+        JNZ     SOK_BL
+        DCR     E
+        JNZ     SOK_BL
+        MOV     H,B             ; BC = bytes after the last skipped LF = safe
+        MOV     L,C
+        RET
+SOK_B0:
+        LXI     H,0
+        RET
+SOK_BALL:
+        JMP     GETR2L          ; whole R2 is below the viewport -> all safe
 
 ;============================================================
 ; FLBRK - ensure the current line's END is resident before a forward line scan
@@ -819,6 +914,7 @@ VMCEND:                         ; (end marker for VMZERO)
 VMT0:    DW     0
 VMT1:    DW     0
 VMK:     DB     0               ; FILLFWD: bytes brought in this fill (<=128)
+VMK2:    DB     0               ; SPILLOK: LFs to skip for the bottom-visible line
 TAILEOF: DB     0               ; 1 once FILLFWD has read the original tail to
                                 ; EOF/^Z (no unread text remains below except
                                 ; whatever has since been spilled into $$B)

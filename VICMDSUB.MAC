@@ -8,8 +8,8 @@
         INCLUDE VI.INC
         PUBLIC  EX_S, EX_SUB, ISRNGC
         EXTRN   AUTOSCR, CURLN, CURWLN, EBADCMD, ELINE, EMKUNS, ESUBPAT
-        EXTRN   ESUBRNG, EXBUF, EXKW, EXMSG, EX_FIN, EX_STAT
-        EXTRN   GBCSOF, GBDELRT, GBGOTOL, GBINSRT, GBLDHW, GBNLNS
+        EXTRN   ESUBRNG, EXBUF, EXKW, EXMSG, EX_FIN, EX_STAT, FNBLNK
+        EXTRN   GBCSOF, GBDELRT, GBGOTOL, GBGOAB, GBINSRT, GBLDHW, GBNLNS
         EXTRN   GBPKRT, GOTOPOS, KWSTAT, MKIDXA, MKTMP, MKTMP2
         EXTRN   MV1RT, NEWLEN, OLDLEN, OUTN16, OUTSTR, PKRTF
         EXTRN   RNGERR, SCRDRAW, SLINE, SNOTFND, SRCBUF, SRCDIR
@@ -83,6 +83,8 @@ EX_SUB:
         ORA     A
         JNZ     EXS_MERR        ; bad mark in the range
         MOV     A,M
+        ORA     A
+        JZ      EX_GOTO         ; bare :N (or :M,N) with no command -> line goto
         CPI     's'
         JNZ     EXS_BAD
         INX     H               ; HL -> substitution body
@@ -104,6 +106,22 @@ EXS_RERR:
 EXS_MERR:
         LXI     D,EMKUNS
         JMP     EXMSG
+
+;--- EX_GOTO - ':N' (or ':M,N') with no command: move to the last line of the
+;    range (ELINE, 1-based, absolute).  Pages the window in virtual mode via
+;    GBGOAB; VADJ then repaints if the jump scrolled.  vi lands on first
+;    non-blank.  A typed number is absolute; '$' resolves via GBNLNS, so an
+;    over-EOF target clamps to the last line inside GBGOAB.
+EX_GOTO:
+        LHLD    ELINE
+        MOV     A,H
+        ORA     L
+        JZ      EXG_GO          ; :0 -> line 0 (clamp to first line)
+        DCX     H               ; 1-based -> 0-based absolute line
+EXG_GO:
+        CALL    GBGOAB
+        CALL    FNBLNK          ; first non-blank on the target line
+        JMP     EX_FIN
 
 ;--- PRANGE - parse a line range at [HL] into SLINE/ELINE (1-based).
 ;    Forms: %  |  addr  |  addr,addr.  Exit: HL at the command char.

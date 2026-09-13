@@ -184,6 +184,7 @@ words. A *WORD* (capital) is any run of non-blank characters.
 | `gg`  | the first line of the file                            |
 | `G`   | the last line of the file                             |
 | `nG`  | line number `n` (e.g. `42G` goes to line 42)         |
+| `:N`  | line number `N` from the ex prompt (e.g. `:42` Return — same as `42G`) |
 | `%`   | the bracket matching the one under the cursor (`()`, `[]`, `{}`) |
 
 ### 4.5 Jump within the screen
@@ -466,6 +467,7 @@ then a command, then Return.
 | `:e! file`    | edit a different file, discarding unsaved changes       |
 | `:e`          | show the current file's status (name, lines, bytes)     |
 | `:s/old/new/` | search and replace — see §11                            |
+| `:N`          | go to line `N` (e.g. `:42` Return) — same as `42G`      |
 | `:h` / `:help`| show the help screen                                    |
 | `:stat`       | show buffer/memory diagnostics                          |
 

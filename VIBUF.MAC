@@ -38,6 +38,7 @@
         EXTRN   VMODE           ; VIVM: 0 = RAM-only, 1 = virtual (paging)
         EXTRN   FILLFWD, REWIND ; VIVM: bring a record into R2 / R1 at an edge
         EXTRN   SPILLTOP, SPILLBOT ; VIVM: evict a record to free gap on insert
+        EXTRN   SPILLOK         ; VIVM: bytes safe to spill from an edge (off-screen)
         EXTRN   FLBRK, RWBRK    ; VIVM: page so a line end/start is resident
                                 ; CURBDP always == BDESC0, so the hot per-byte
                                 ; primitives address its fields directly as
@@ -225,22 +226,41 @@ GBINSRT:
         RET
 GBINS_FULL:
         ; gap exhausted.  Virtual mode: free a record to disk and retry the
-        ; insert; only report full if neither edge can spill.  SPILLTOP is
-        ; preferred (evicts above the cursor); SPILLBOT is the fallback when the
-        ; cursor sits near the window top (R1 < 128).
+        ; insert.  Prefer to evict an OFF-SCREEN record so a stationary insert
+        ; never writes visible text to disk: SPILLOK reports how many bytes at an
+        ; edge lie outside the viewport, and we spill an edge only when a whole
+        ; 128-byte record fits there.  TOP first (evicts above the cursor), then
+        ; BOTTOM.  Report full only if neither edge has an off-screen record.
         LDA     VMODE
         ORA     A
         JZ      GBINS_FF        ; RAM-only: the buffer really is full
+        XRA     A
+        CALL    SPILLOK         ; HL = off-screen bytes above the viewport
+        CALL    GE128
+        JC      GBINS_TRYB      ; < 128 safe on top -> skip to the bottom
         CALL    SPILLTOP
         JNC     GBINS_RTY
+GBINS_TRYB:
+        MVI     A,1
+        CALL    SPILLOK         ; HL = off-screen bytes below the viewport
+        CALL    GE128
+        JC      GBINS_FF        ; < 128 safe on either edge -> genuinely full
         CALL    SPILLBOT
-        JC      GBINS_FF        ; neither edge had a full record to evict
+        JC      GBINS_FF
 GBINS_RTY:
         POP     PSW             ; recover the byte (still on the stack)
         JMP     GBINSRT         ; retry with a freed gap
 GBINS_FF:
         POP     PSW
         MVI     A,0FFH
+        RET
+;--- GE128 - CY clear if HL >= 128, CY set if HL < 128.  Preserves HL. ---
+GE128:
+        MOV     A,H
+        ORA     A
+        RNZ                     ; HL >= 256 -> >= 128 (ORA cleared CY)
+        MOV     A,L
+        CPI     128             ; CY set iff L < 128
         RET
 
 ;------------------------------------------------------------

@@ -17,6 +17,7 @@
         EXTRN   SETDRTY, SHITBOT, SHITTOP, SNOTPFX, SRCBUF, SRCDIR
         EXTRN   SRCH0, SRCLEN, STARLEN, STARSAV, STARWP, STATBUF
         EXTRN   STATCLR, STATHOME, STATMSG, SWRAPF, WSTART
+        EXTRN   VMODE, REWIND, FILLFWD, BYTABOVE, GBGOAB, CURLN, CURCOL
         CSEG
 ;============================================================
 ; f{c} F{c} t{c} T{c} ; , - find a char on the current line.
@@ -177,6 +178,9 @@ DOSRCH:
         XRA     A
         STA     SWRAPF          ; assume no wrap until a scan crosses the boundary
         CALL    SHOWPAT         ; echo "/pattern" / "?pattern" on the status row
+        LDA     VMODE
+        ORA     A
+        JNZ     VSRCH           ; virtual: cross-boundary cursor-walk search
         LDA     SRCDIR
         CPI     1
         JZ      SRCHFW
@@ -630,6 +634,8 @@ SRCH_HIT:
         ; landed and does the cheapest update -- a same-page match is just a
         ; CURPOS, one line off-screen scrolls one row, and only a far jump
         ; raises DIRTY for a full repaint.
+SRCH_HM:                        ; virtual search re-entry: cursor is already on the
+                                ; match (VSEEK/WFIND positioned it); just message
         LDA     SWRAPF
         ORA     A
         JZ      SH_NOWRAP       ; no wrap -> leave the "/pattern" echo on the row
@@ -866,5 +872,332 @@ PSC_DEC:
 PSC_FAIL:
         MVI     A,BEL
         JMP     OUTCHR
+
+;============================================================
+; Virtual-mode search (cross the window boundary).  The resident window is a
+; sliding slice anchored at the cursor, so a whole-document search must WALK the
+; cursor through the file, scanning each resident window with the same fast
+; literal scanner used in RAM mode (SRCHSET/FSCANL/PMATCH).  WSTEP advances the
+; cursor toward the window bottom (keeping SRCLEN-1 bytes of overlap so a match
+; straddling the bottom is caught after the next fill) and pages one record in.
+;
+;   forward (/ , n): WFIND from just after the cursor to EOD -> first match, the
+;     cursor lands on it; on miss wrap to the top (GBGOAB 0) and WFIND again.
+;   backward (? , N): WCOLL from the top over the whole file, tracking the last
+;     match before the origin (PREV) and the last match overall (MAX); target =
+;     PREV else MAX (wrap); then WFIND (target mode) from the top lands on it.
+;   miss: restore the cursor to the saved origin line+column, "not found".
+; Cost is O(document) disk I/O (documented); RAM-only keeps the in-memory scan.
+;============================================================
+VSRCH:
+        ; origin absolute offset ABSCUR = BYTABOVE + CSOFF (cursor byte)
+        MVI     A,BD_CSOFF
+        CALL    GBLDHW          ; HL = CSOFF (= GAPBG)
+        XCHG                    ; DE = CSOFF
+        LHLD    BYTABOVE
+        DAD     D
+        SHLD    ABSCUR
+        LDA     BYTABOVE+2
+        ACI     0
+        STA     ABSCUR+2
+        ; save origin line+column for restore-on-miss
+        CALL    CURLN
+        SHLD    SRSVLN
+        CALL    CURCOL
+        MOV     A,L
+        STA     SRSVCO
+        ; overlap = SRCLEN - 1 (guards a match straddling the window bottom)
+        LDA     SRCLEN
+        DCR     A
+        STA     WOVL
+        LDA     SRCDIR
+        CPI     1
+        JNZ     VS_BACK
+;--- forward (/ , n): search AFTER the cursor, then wrap ---
+        CALL    GBMVRT          ; start after the cursor (vi finds the NEXT match)
+        XRA     A
+        STA     WTGSET          ; find-first mode
+        CALL    WFIND
+        JNC     VS_FHIT         ; hit -> cursor is on it, no wrap
+        LXI     H,0
+        CALL    GBGOAB          ; wrap: cursor to the document top
+        XRA     A
+        STA     WTGSET
+        CALL    WFIND
+        JC      VS_MISS
+        MVI     A,1             ; wrapped
+        STA     SWRAPF
+        JMP     SRCH_HM
+VS_FHIT:
+        XRA     A
+        STA     SWRAPF
+        JMP     SRCH_HM
+;--- backward (? , N): collect PREV/MAX over the whole file, then land ---
+VS_BACK:
+        XRA     A
+        STA     TRKPRVV
+        STA     TRKMAXV
+        LXI     H,0
+        CALL    GBGOAB          ; cursor to the document top
+        CALL    WCOLL
+        LDA     TRKPRVV
+        ORA     A
+        JZ      VS_BWRAP
+        LXI     H,TRKPRV        ; previous match before the origin
+        LXI     D,WTARGET
+        CALL    CPY24
+        XRA     A
+        STA     SWRAPF
+        JMP     VS_BLAND
+VS_BWRAP:
+        LDA     TRKMAXV
+        ORA     A
+        JZ      VS_MISS         ; no match anywhere
+        LXI     H,TRKMAX        ; wrap to the last match in the file
+        LXI     D,WTARGET
+        CALL    CPY24
+        MVI     A,1
+        STA     SWRAPF
+VS_BLAND:
+        LXI     H,0
+        CALL    GBGOAB          ; from the top, walk to the target match
+        MVI     A,1
+        STA     WTGSET          ; find-at-target mode
+        CALL    WFIND
+        JMP     SRCH_HM
+VS_MISS:
+        ; restore the cursor to the origin (line, then column) and report
+        LHLD    SRSVLN
+        CALL    GBGOAB
+        LDA     SRSVCO
+        ORA     A
+        JZ      VS_MISS2
+        MOV     B,A
+VS_MR:  CALL    GBMVRT
+        DCR     B
+        JNZ     VS_MR
+VS_MISS2:
+        JMP     SRCH_MISS
+
+;--- WFIND - walk the cursor from its current position toward EOD; stop on the
+;    first match (WTGSET=0), or on the match whose absolute offset == WTARGET
+;    (WTGSET=1), leaving the cursor on it (CY clear).  CY set = reached EOD with
+;    no (matching) hit.
+WFIND:
+WF_LP:
+        CALL    SRCHSET
+        MVI     A,BD_CSOFF
+        CALL    GBLDHW          ; HL = CSOFF
+        CALL    FSCANL          ; HL = hit logical offset, or CY = none in window
+        JC      WF_STEP
+        SHLD    WHIT            ; save the hit's logical offset (HL preserved)
+        CALL    ABSADD          ; ABSVAL = BYTABOVE + hit
+        LDA     WTGSET
+        ORA     A
+        JZ      WF_HIT          ; find-first -> accept
+        LXI     H,ABSVAL
+        LXI     D,WTARGET
+        CALL    CMP24           ; ABSVAL vs WTARGET
+        JZ      WF_HIT          ; the target match -> land
+        ; an earlier match: step past it and keep walking
+        LHLD    WHIT
+        INX     H
+        CALL    GOTOPOS
+        JMP     WF_LP
+WF_HIT:
+        LHLD    WHIT
+        CALL    GOTOPOS         ; cursor onto the match
+        ORA     A               ; clear CY
+        RET
+WF_STEP:
+        CALL    WSTEP
+        JNC     WF_LP           ; paged more below -> rescan
+        STC                     ; EOD, nothing left to scan
+        RET
+
+;--- WCOLL - walk the cursor from its current position (the caller placed it at
+;    the top) to EOD, enumerating EVERY match in increasing order, updating
+;    TRKMAX (last match overall) and TRKPRV (last match before ABSCUR).
+WCOLL:
+WC_LP:
+        CALL    SRCHSET
+        MVI     A,BD_CSOFF
+        CALL    GBLDHW
+        CALL    FSCANL
+        JC      WC_STEP
+        SHLD    WHIT
+        CALL    ABSADD          ; ABSVAL = BYTABOVE + hit
+        LXI     H,ABSVAL        ; TRKMAX = ABSVAL (increasing order -> last = max)
+        LXI     D,TRKMAX
+        CALL    CPY24
+        MVI     A,1
+        STA     TRKMAXV
+        LXI     H,ABSVAL
+        LXI     D,ABSCUR
+        CALL    CMP24           ; ABSVAL vs ABSCUR
+        JNC     WC_NEXT         ; ABSVAL >= origin -> not a "before-origin" match
+        LXI     H,ABSVAL
+        LXI     D,TRKPRV
+        CALL    CPY24
+        MVI     A,1
+        STA     TRKPRVV
+WC_NEXT:
+        LHLD    WHIT
+        INX     H
+        CALL    GOTOPOS         ; advance past this match
+        JMP     WC_LP
+WC_STEP:
+        CALL    WSTEP
+        JNC     WC_LP
+        RET                     ; EOD -> sweep complete
+
+;--- WSTEP - advance the cursor toward the window bottom (to TXEND-WOVL, keeping
+;    the straddle overlap) then page one record in from below.  CY set = nothing
+;    more below (EOD).  Clobbers A,BC,DE,HL.
+WSTEP:
+        MVI     A,BD_TXEND
+        CALL    GBLDHW          ; HL = TXEND
+        LDA     WOVL
+        MOV     E,A
+        MVI     D,0
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBI     0
+        MOV     H,A             ; HL = TXEND - WOVL = t
+        SHLD    WTMP
+        MVI     A,BD_CSOFF
+        CALL    GBLDHW          ; HL = CSOFF
+        XCHG                    ; DE = CSOFF
+        LHLD    WTMP            ; HL = t
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D               ; t - CSOFF : CY if t < CSOFF
+        JC      WS_FILL         ; cursor already within WOVL of the bottom
+        JZ      WS_FILL
+        LHLD    WTMP
+        CALL    GOTOPOS         ; move the cursor forward to t
+WS_FILL:
+        JMP     FILLFWD         ; CY propagates when nothing is below
+
+;--- FSCANL - first match at/after logical offset HL, scanning to TXEND (no
+;    wrap), using the SRCHSET-cached pointers.  Exit: CY clear + HL = match
+;    logical offset; CY set = no match in [HL, TXEND).
+FSCANL:
+        XCHG                    ; DE = logstart
+        LHLD    SCTXE           ; HL = TXEND (logical)
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = TXEND - logstart
+        JC      FSC_NO          ; logstart > TXEND
+        MOV     A,B
+        ORA     C
+        JZ      FSC_NO          ; nothing to scan
+        CALL    LOG2PH          ; HL = physical P (DE=logstart consumed; BC kept)
+        MOV     D,B
+        MOV     E,C             ; DE = count of start positions
+FSC_LP:
+        MOV     A,D
+        ORA     E
+        JZ      FSC_NO
+        DCX     D
+        LDA     SRCBUF
+        CMP     M               ; first-byte gate
+        JNZ     FSC_NX
+        PUSH    D
+        PUSH    H
+        CALL    PMATCH
+        POP     H
+        POP     D
+        JNC     FSC_HIT
+FSC_NX:
+        INX     H
+        LDA     SCR1E
+        CMP     L
+        JNZ     FSC_LP
+        LDA     SCR1E+1
+        CMP     H
+        JNZ     FSC_LP
+        LHLD    SCR2S           ; gap jump R1 end -> R2 start
+        JMP     FSC_LP
+FSC_HIT:
+        CALL    PH2LOG          ; HL = logical offset of the match
+        ORA     A               ; clear CY
+        RET
+FSC_NO:
+        STC
+        RET
+
+;--- ABSADD - ABSVAL(3) = BYTABOVE + HL (logical).  Clobbers A,DE,HL.
+ABSADD:
+        XCHG                    ; DE = logical
+        LHLD    BYTABOVE
+        DAD     D               ; low16 + logical
+        SHLD    ABSVAL
+        LDA     BYTABOVE+2
+        ACI     0
+        STA     ABSVAL+2
+        RET
+
+;--- CMP24 - compare 24-bit [HL] vs [DE].  CY set if [HL] < [DE]; Z set if equal;
+;    NC & NZ if greater.  Clobbers A,B and advances HL/DE.
+CMP24:
+        INX     H
+        INX     H               ; -> byte 2 (MSB)
+        INX     D
+        INX     D
+        LDAX    D
+        MOV     B,A             ; B = b2
+        MOV     A,M
+        CMP     B               ; a2 - b2
+        RNZ
+        DCX     H
+        DCX     D               ; -> byte 1
+        LDAX    D
+        MOV     B,A
+        MOV     A,M
+        CMP     B
+        RNZ
+        DCX     H
+        DCX     D               ; -> byte 0 (LSB)
+        LDAX    D
+        MOV     B,A
+        MOV     A,M
+        CMP     B
+        RET
+
+;--- CPY24 - copy 3 bytes [HL] -> [DE].  Clobbers A,HL,DE.
+CPY24:
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        MOV     A,M
+        STAX    D
+        RET
+
+        CSEG
+ABSCUR:  DS     3               ; origin absolute cursor offset (search start)
+ABSVAL:  DS     3               ; scratch: BYTABOVE + a match's logical offset
+WTARGET: DS     3               ; WFIND target offset (find-at-target mode)
+WTMP:    DW     0               ; WSTEP: cursor advance target (logical)
+WHIT:    DW     0               ; a match's logical offset within the window
+WOVL:    DB     0               ; SRCLEN-1: straddle overlap kept across a fill
+WTGSET:  DB     0               ; WFIND: 0 = find first, 1 = find abs==WTARGET
+SRSVLN:  DW     0               ; saved origin line for restore-on-miss
+SRSVCO:  DB     0               ; saved origin column for restore-on-miss
+TRKPRV:  DS     3               ; last match with offset < ABSCUR (backward)
+TRKPRVV: DB     0
+TRKMAX:  DS     3               ; last match overall (backward wrap)
+TRKMAXV: DB     0
 
         END

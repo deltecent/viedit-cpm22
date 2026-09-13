@@ -27,7 +27,7 @@
 
         PUBLIC  WININIT
         PUBLIC  GBMVDN, GBMVUP, CURLN, CURWLN, CURCOL, CURDCO
-        PUBLIC  GBPGDN, GBPGUP, GBGOTOL
+        PUBLIC  GBPGDN, GBPGUP, GBGOTOL, GBGOAB
         PUBLIC  GBNLNS, NLNVAL
 
         CSEG
@@ -587,6 +587,71 @@ GPU_END:
         RET
 
 ;============================================================
+; GBGOAB - move the cursor to ABSOLUTE document line HL (0-based), paging the
+; window in virtual mode.  RAM-only the absolute line IS the window line, so it
+; is exactly GBGOTOL.  Virtual: walk the paging-aware line movers from the
+; current absolute line (CURLN) to the target -- GBMVDN/GBMVUP page records in
+; and out at the window edges as the cursor crosses them, so the whole document
+; is reachable; clamps at the file ends.  Lands the cursor at column 0.
+;
+; Used by the user-facing absolute-line commands (gg, G, nG, :N).  The
+; window-relative callers (^F/^B, H/M/L, :s ranges) keep calling GBGOTOL, whose
+; RAM fast path also works within the resident window in virtual mode.
+;============================================================
+GBGOAB:
+        LDA     VMODE
+        ORA     A
+        JZ      GBGOTOL         ; RAM-only: absolute line == window line
+        SHLD    GOATGT          ; virtual: remember the target absolute line
+        CALL    CURLN           ; HL = current absolute line
+        XCHG                    ; DE = current
+        LHLD    GOATGT          ; HL = target
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = target - current (signed 16-bit)
+        ORA     C
+        JZ      GOA_AT          ; already on the target line
+        MOV     A,B
+        ORA     A
+        JM      GOA_UP          ; target < current -> move up
+;--- move down BC lines (BC > 0) ---
+GOA_DL:
+        PUSH    B
+        CALL    GBMVDN
+        POP     B
+        ORA     A
+        JNZ     GOA_AT          ; hit the last line -> clamp
+        DCX     B
+        MOV     A,B
+        ORA     C
+        JNZ     GOA_DL
+        JMP     GOA_AT
+;--- move up |BC| lines (BC < 0): count = -(BC) = current - target ---
+GOA_UP:
+        MOV     A,B
+        CMA
+        MOV     B,A
+        MOV     A,C
+        CMA
+        MOV     C,A
+        INX     B               ; BC = current - target (positive)
+GOA_UL:
+        PUSH    B
+        CALL    GBMVUP
+        POP     B
+        ORA     A
+        JNZ     GOA_AT          ; hit the first line -> clamp
+        DCX     B
+        MOV     A,B
+        ORA     C
+        JNZ     GOA_UL
+GOA_AT:
+        JMP     GBMLNS          ; land at column 0 of the target line
+
+;============================================================
 ; GBGOTOL - move the cursor to absolute line HL (0-based), repositioning the
 ; window as needed.  Clamps at the top / last line of the file.
 ;============================================================
@@ -718,6 +783,7 @@ NLNVAL:  DB     0               ; GBNLNS cache: 1 = NLNCNT valid (cleared by SET
 NLNCNT:  DW     0               ; GBNLNS cache: total line count
 NAVSAV:  DW     0               ; saved cursor offset for no-move restore
 GOLTGT:  DW     0               ; GBGOTOL target line
+GOATGT:  DW     0               ; GBGOAB target absolute line (virtual walk)
 GOLSRC:  DW     0               ; GBGOTOL fast path: R2 start (base+GAPEN)
 GOLEND:  DW     0               ; GBGOTOL fast path: R2 end (base+BSIZE)
 GOLREM:  DW     0               ; GBGOTOL fast path: bytes to move the gap

@@ -24,7 +24,8 @@
         EXTRN   CURBDP, EDMODE, GOALCOL, CMDCNT, PENDOP
         EXTRN   BDFLD
         EXTRN   GBMVLT, GBMVRT, GBMLNS, GBMLNE, GBPKRT, GBPKLT, PKRT2, MV1RT
-        EXTRN   GBMVDN, GBMVUP, GBPGDN, GBPGUP, GBGOTOL, CURCOL, CURLN, CURWLN
+        EXTRN   GBMVDN, GBMVUP, GBPGDN, GBPGUP, GBGOTOL, GBGOAB
+        EXTRN   CURCOL, CURLN, CURWLN
         EXTRN   GBNLNS          ; total line count (lazy, cached)
         EXTRN   CURDCO          ; VIWIN -- current display column (tab-aware)
         EXTRN   GBINSRT, GBDELRT, GBDLFT, GBLDHW, GBSTHW, GBGETLN
@@ -841,7 +842,7 @@ VC_GG_TOP:
         STA     GPEND
         LXI     H,0
         SHLD    CMDCNT          ; gg ignores any typed count
-        CALL    GBGOTOL
+        CALL    GBGOAB         ; absolute line 0 (document top; pages in virtual)
         JMP     FNBLNK          ; vi: first non-blank; VADJ redraws only on scroll
 VC_GG:                          ; 'G' -> line RCNT (1-based), or last line if none
         LHLD    RCNT
@@ -849,11 +850,11 @@ VC_GG:                          ; 'G' -> line RCNT (1-based), or last line if no
         ORA     L
         JZ      VGG_LAST
         DCX     H               ; 1-based -> 0-based target
-        CALL    GBGOTOL
+        CALL    GBGOAB         ; absolute line (pages in virtual mode)
         JMP     FNBLNK          ; vi: first non-blank; VADJ redraws only on scroll
 VGG_LAST:
         LXI     H,0FFFFH        ; no count -> last line (huge target clamps)
-        CALL    GBGOTOL
+        CALL    GBGOAB         ; absolute last line (pages to document end)
         JMP     FNBLNK          ; vi: first non-blank; VADJ redraws only on scroll
 
 ;------------------------------------------------------------
