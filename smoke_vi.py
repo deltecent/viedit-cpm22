@@ -958,6 +958,71 @@ def main():
           _vm == 0 and _tx == len(vcontent))
     e.close()
 
+    # --- Phase 2 acceptance: paging matches RAM-only rendering across motions ---
+    # SCRDRAW paints purely from BD_CSROW + the resident buffer, so if the paging
+    # hooks (GBMVDN/GBMVUP/GBMVRT/GBMVLT/GBINSRT + VMFILL) keep the correct slice
+    # resident as the window slides, a /W2048 (virtual) editor must render the same
+    # edit area AND land the cursor on the same (row,col) as a no-/W (RAM-only)
+    # editor fed the SAME keys.  The status row (index 23) is excluded: it shows a
+    # window-relative line number in virtual mode (absolute ^G is phase 3), so it
+    # legitimately differs.  These editors are never saved (virtual save is phase 4).
+    def _pair(keys, idle=2500):
+        """Feed identical keys to a virtual and a RAM-only editor; return
+        (virtual_rows, virtual_cursor, ram_rows, ram_cursor)."""
+        ev = Editor(vcontent, args=' /W2048')
+        er = Editor(vcontent)
+        try:
+            for k in keys:
+                ev.key(k, idle=idle); er.key(k, idle=idle)
+            vv, vr = ev.screen(), er.screen()
+            return (vv.render().split('\n'), (vv.row, vv.col),
+                    vr.render().split('\n'), (vr.row, vr.col))
+        finally:
+            ev.close(); er.close()
+
+    # j well past the screen bottom, still inside the initial resident window.
+    gv, cv, gr, cr = _pair(['j' * 30])
+    check('/W vs RAM: 30x j edit area matches', gv[:23] == gr[:23])
+    check('/W vs RAM: 30x j cursor matches', cv == cr)
+
+    # deep descent: forces FILLFWD of below-content and SPILLTOP of the top edge.
+    # Read BYTABOVE off the virtual editor (mem() stops it) to prove text actually
+    # spilled above the window rather than the whole file happening to stay resident.
+    ev = Editor(vcontent, args=' /W2048')
+    er = Editor(vcontent)
+    ev.key('j' * 150, idle=3500); er.key('j' * 150, idle=3500)
+    vs = ev.screen(); rs = er.screen()
+    check('/W vs RAM: 150x j (paged) edit area matches',
+          vs.render().split('\n')[:23] == rs.render().split('\n')[:23])
+    check('/W vs RAM: 150x j cursor matches', (vs.row, vs.col) == (rs.row, rs.col))
+    check('/W: deep j spilled text above the window',
+          _u24(ev, SYM['BYTABO']) > 0)             # mem() stops ev -- read last
+    er.close(); ev.close()
+
+    # round trip: descend deep, then k all the way back up (REWIND pages above
+    # content back in).  Must return to the exact top-of-file view.
+    gv, cv, gr, cr = _pair(['j' * 150, 'k' * 150], idle=3500)
+    check('/W vs RAM: j*150 then k*150 edit area matches', gv[:23] == gr[:23])
+    check('/W vs RAM: j*150 then k*150 cursor matches', cv == cr)
+    check('/W: k back to top restores line 0000 at the top row',
+          gv[0] == '0000 hello world' and cv == (0, 0))
+
+    # ^F page down x4 (each cursor->top, window +NEDIT-2), then ^B page up x4.
+    gv, cv, gr, cr = _pair(['\x06' * 4], idle=3000)
+    check('/W vs RAM: 4x ^F edit area matches', gv[:23] == gr[:23])
+    check('/W vs RAM: 4x ^F cursor matches', cv == cr)
+    gv, cv, gr, cr = _pair(['\x06' * 4, '\x02' * 4], idle=3000)
+    check('/W vs RAM: 4x ^F then 4x ^B edit area matches', gv[:23] == gr[:23])
+    check('/W vs RAM: 4x ^F then 4x ^B cursor matches', cv == cr)
+
+    # insert deep in the document (o opens a line below; may force GBINSRT SPILLTOP
+    # as the gap fills).  The buffer edit is identical in both, so the rendered
+    # screens must still match.  Not saved (virtual save is phase 4).
+    gv, cv, gr, cr = _pair(['j' * 80, 'oPHASE2 INSERT LINE\x1b'], idle=3000)
+    check('/W vs RAM: deep o-insert edit area matches', gv[:23] == gr[:23])
+    check('/W vs RAM: deep o-insert cursor matches', cv == cr)
+    check('/W: inserted text is on screen', any('PHASE2 INSERT LINE' in r for r in gv))
+
     # --- bugs.txt: word motions w/b/e vs W/B/E (punctuation boundaries) ---
     cp = b'foo.bar baz\r\nsecond line\r\n'   # f0 o1 o2 .3 b4 a5 r6 _7 b8 a9 z10
     e = Editor(cp); e.key('w')
