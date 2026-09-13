@@ -25,9 +25,11 @@
 
         EXTRN   BDFLD, GBLDHW, GBSTHW, GBMVTOP
         EXTRN   VMODE, VMALLOW, GAPRSV, VMLDIN   ; VIVM: virtual-buffer engine
+        EXTRN   OUTREC, RIGHTREC                 ; VIVM: scratch record counts
 
         PUBLIC  FIOPEN, FISAVE, INFCB, OUTFCB, IRGETB, INRDLN, IRINIT
         PUBLIC  SCRWR, SCRRD, PGBUF, ABFCB, RSFCB   ; scratch I/O for VIVM
+        PUBLIC  BAKSW                            ; /B .BAK-on-save switch
 
         CSEG
 
@@ -389,11 +391,26 @@ SCRIO:
         RET
 
 ;============================================================
-; FISAVE - straight buffer write.  The whole file is resident (RAM-only), so
-; the save is simply: window R1 ++ window R2 -> OUTFCB, then ^Z-pad the final
-; partial record and close.
+; FISAVE - write the document to disk.  Three paths:
+;   * RAM-only, no /B (default): straight overwrite -- window R1 ++ window R2
+;     -> OUTFCB, ^Z-pad, close.  Byte-identical to the original save (unchanged).
+;   * RAM-only + /B: rename-based backup save (write a fresh name.$$$, keep the
+;     old file as name.BAK, promote $$$ -> the real file).
+;   * virtual (VMODE=1): rename-based safe-save -- append the resident window,
+;     the $$B back-scroll records, and the unread original tail to name.$$$
+;     (which already holds the ABOVE records), then promote $$$ and (with /B)
+;     keep the old file as .BAK.  This consumes the scratch, so a virtual save
+;     is a TERMINAL operation (save then quit).
+; Exit: A = 0 (saved OK).
 ;============================================================
 FISAVE:
+        LDA     VMODE
+        ORA     A
+        JNZ     FSV_REN         ; virtual -> rename-based safe-save
+        LDA     BAKSW
+        ORA     A
+        JNZ     FSV_RAMB        ; RAM-only + /B -> rename-based backup save
+FSV_PLAIN:
         LXI     H,OUTFCB
         SHLD    OCHAN            ; sequential writes go to OUTFCB (default channel)
         XRA     A
@@ -452,6 +469,350 @@ FSV_CL:
         LXI     D,INFCB
         MVI     C,BF_FCLOSE
         CALL    BDOS
+        RET
+
+;============================================================
+; FSV_REN - virtual-mode save (rename-based, terminal).  name.$$$ already holds
+; the ABOVE records (0..OUTREC-1, document order); append the resident window,
+; the $$B back-scroll records (RIGHTREC-1..0 -> document order), and the unread
+; original tail, then promote $$$ to the real file.
+;============================================================
+FSV_REN:
+        CALL    CAPEXT          ; REALEXT = the real file's extension
+        LHLD    OUTREC
+        SHLD    APPREC          ; append after the ABOVE records in $$$
+        XRA     A
+        STA     APPPOS
+        CALL    APPWIN          ; append window R1 ++ R2
+        ; append $$B records RIGHTREC-1 .. 0 (LIFO on disk -> document order)
+FSR_BLP:
+        LHLD    RIGHTREC
+        MOV     A,H
+        ORA     L
+        JZ      FSR_TAIL
+        DCX     H
+        SHLD    RIGHTREC        ; consume the top $$B record (save is terminal)
+        LXI     D,RSFCB
+        CALL    SCRRD           ; PGBUF <- $$B[RIGHTREC]
+        LXI     H,PGBUF
+        MVI     B,128
+FSR_BF:
+        MOV     A,M
+        PUSH    B
+        PUSH    H
+        CALL    APPB
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     FSR_BF
+        JMP     FSR_BLP
+FSR_TAIL:
+        ; append the unread original tail via IRGETB (stops at ^Z / EOF)
+        CALL    IRGETB
+        JC      FSV_FIN
+        CPI     CPMEOF
+        JZ      FSV_FIN
+        CALL    APPB
+        JMP     FSR_TAIL
+FSV_FIN:
+        ; ^Z-pad the final partial record, then close $$$ and INFCB
+        LDA     APPPOS
+        ORA     A
+        JZ      FSV_CLS
+FSV_PL:
+        MVI     A,CPMEOF
+        CALL    APPB
+        LDA     APPPOS
+        ORA     A
+        JNZ     FSV_PL
+FSV_CLS:
+        LXI     D,ABFCB
+        MVI     C,BF_FCLOSE
+        CALL    BDOS
+        LXI     D,INFCB
+        MVI     C,BF_FCLOSE
+        CALL    BDOS
+        CALL    FSVREN          ; the promote / .BAK rename dance
+        XRA     A               ; A = 0: saved OK
+        RET
+
+;------------------------------------------------------------
+; FSV_RAMB - RAM-only backup save (/B set): build a fresh empty name.$$$, write
+; the resident buffer to it, then promote it (old file -> name.BAK).  The whole
+; document is resident, so there is no $$B / tail to append.
+;------------------------------------------------------------
+FSV_RAMB:
+        CALL    CAPEXT
+        LXI     D,ABFCB
+        LXI     H,SCRXAB
+        CALL    MKNAM           ; ABFCB = name.$$$
+        LXI     D,ABFCB
+        MVI     C,BF_FDEL
+        CALL    BDOS            ; delete a stale $$$
+        LXI     D,ABFCB
+        MVI     C,BF_FMAKE
+        CALL    BDOS            ; create a fresh $$$
+        LXI     H,0
+        SHLD    APPREC
+        XRA     A
+        STA     APPPOS
+        CALL    APPWIN          ; append window R1 ++ R2 (the whole document)
+        JMP     FSV_FIN         ; ^Z-pad, close, promote (VMODE=0 -> no $$B step)
+
+;------------------------------------------------------------
+; APPWIN - append the resident window (R1 then R2) to name.$$$ via APPB.
+;------------------------------------------------------------
+APPWIN:
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        XCHG                    ; DE = base (R1 src)
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = GAPBG = R1 length
+        CALL    APPSEG
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG                    ; DE = GAPEN
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        DAD     D               ; HL = base+GAPEN = R2 src
+        PUSH    H
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW
+        XCHG                    ; DE = BSIZE
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW          ; HL = GAPEN
+        MOV     A,E
+        SUB     L
+        MOV     C,A
+        MOV     A,D
+        SBB     H
+        MOV     B,A             ; BC = BSIZE - GAPEN = R2 length
+        POP     D               ; DE = R2 src
+        MOV     H,B
+        MOV     L,C             ; HL = R2 length
+        CALL    APPSEG
+        RET
+
+;------------------------------------------------------------
+; APPSEG - append HL bytes from DE to name.$$$ via APPB.
+;------------------------------------------------------------
+APPSEG:
+        MOV     A,H
+        ORA     L
+        RZ
+        LDAX    D
+        PUSH    H
+        PUSH    D
+        CALL    APPB
+        POP     D
+        POP     H
+        INX     D
+        DCX     H
+        JMP     APPSEG
+
+;------------------------------------------------------------
+; APPB - append byte A to name.$$$: buffer into OBUF, flush a full record via a
+; random write at record APPREC.  APPFL - flush OBUF (128 bytes) as record
+; APPREC and advance.  Uses OBUF as the DMA buffer so PGBUF (SCRRD source in the
+; $$B loop) is never disturbed.
+;------------------------------------------------------------
+APPB:
+        PUSH    B
+        PUSH    H
+        MOV     C,A
+        LDA     APPPOS
+        MOV     E,A
+        MVI     D,0
+        LXI     H,OBUF
+        DAD     D
+        MOV     M,C
+        LDA     APPPOS
+        INR     A
+        STA     APPPOS
+        CPI     RECSIZ
+        JNZ     APB_D
+        CALL    APPFL
+APB_D:
+        POP     H
+        POP     B
+        RET
+APPFL:
+        PUSH    B
+        PUSH    D
+        PUSH    H
+        LXI     D,OBUF
+        MVI     C,BF_SETDMA
+        CALL    BDOS
+        LXI     H,ABFCB+FCB_R0
+        LDA     APPREC
+        MOV     M,A
+        INX     H
+        LDA     APPREC+1
+        MOV     M,A
+        INX     H
+        MVI     M,0             ; r2 = 0
+        LXI     D,ABFCB
+        MVI     C,BF_WRITRN
+        CALL    BDOS
+        LHLD    APPREC
+        INX     H
+        SHLD    APPREC
+        XRA     A
+        STA     APPPOS
+        POP     H
+        POP     D
+        POP     B
+        RET
+
+;------------------------------------------------------------
+; CAPEXT - capture the real file's 3-char extension into REALEXT (the rename
+; dance needs it as a stable pointer, and BD_FNAME is left untouched).
+;------------------------------------------------------------
+CAPEXT:
+        MVI     A,BD_FNAME
+        CALL    BDFLD
+        LXI     D,9
+        DAD     D               ; HL = &BD_FNAME ext
+        XCHG                    ; DE = src
+        LXI     H,REALEXT
+        MVI     B,3
+CE_L:
+        LDAX    D
+        MOV     M,A
+        INX     D
+        INX     H
+        DCR     B
+        JNZ     CE_L
+        RET
+
+;------------------------------------------------------------
+; MKNAM - build a clean FCB at DE named <BD_FNAME drive+name8>.<ext at HL>.
+; Zeroes the whole FCB (incl. CR + random fields); no file operations.
+;------------------------------------------------------------
+MKNAM:
+        SHLD    MKNEXT
+        XCHG                    ; HL = dst FCB
+        SHLD    MKNFCB
+        MVI     B,FCB_SIZ
+        XRA     A
+MN_Z:
+        MOV     M,A
+        INX     H
+        DCR     B
+        JNZ     MN_Z
+        MVI     A,BD_FNAME
+        CALL    BDFLD
+        XCHG                    ; DE = &BD_FNAME
+        LHLD    MKNFCB
+        MVI     B,9             ; drive + name8
+MN_CN:
+        LDAX    D
+        MOV     M,A
+        INX     D
+        INX     H
+        DCR     B
+        JNZ     MN_CN
+        LHLD    MKNEXT
+        XCHG                    ; DE = &ext
+        LHLD    MKNFCB
+        LXI     B,9
+        DAD     B               ; HL = dst FCB + 9 (ext slot)
+        MVI     B,3
+MN_CX:
+        LDAX    D
+        MOV     M,A
+        INX     D
+        INX     H
+        DCR     B
+        JNZ     MN_CX
+        RET
+
+;------------------------------------------------------------
+; MKREN - rename <BD_FNAME name>.<old ext at HL> to <BD_FNAME name>.<new ext at
+; DE>.  Builds a CP/M rename FCB (old name 0..15, new name 16..31) and calls
+; BDOS fn 23.  Only the extension differs between the two names.
+;------------------------------------------------------------
+MKREN:
+        SHLD    MKR_OE
+        XCHG
+        SHLD    MKR_NE          ; MKR_NE = new-ext ptr
+        LXI     D,RENFCB
+        LHLD    MKR_OE
+        CALL    MKNAM           ; RENFCB[0..11] = name.oldext, rest zero
+        MVI     A,BD_FNAME
+        CALL    BDFLD
+        MOV     A,M
+        STA     RENFCB+16       ; new-name drive = old drive
+        MVI     A,BD_FNAME
+        CALL    BDFLD
+        INX     H               ; HL = &BD_FNAME name8
+        XCHG                    ; DE = src
+        LXI     H,RENFCB+17
+        MVI     B,8
+MR_NN:
+        LDAX    D
+        MOV     M,A
+        INX     D
+        INX     H
+        DCR     B
+        JNZ     MR_NN
+        LHLD    MKR_NE
+        XCHG                    ; DE = &new ext
+        LXI     H,RENFCB+25
+        MVI     B,3
+MR_NX:
+        LDAX    D
+        MOV     M,A
+        INX     D
+        INX     H
+        DCR     B
+        JNZ     MR_NX
+        LXI     D,RENFCB
+        MVI     C,BF_RENAME
+        CALL    BDOS
+        RET
+
+;------------------------------------------------------------
+; FSVREN - the promote / backup dance (shared by both rename-based saves):
+;   1. delete a stale name.BAK
+;   2. /B set  -> rename the old real file to name.BAK
+;      /B clear -> delete the old real file
+;   3. rename name.$$$ -> the real file
+;   4. virtual mode -> delete name.$$B (RAM-only has none)
+; REALEXT must already hold the real extension (CAPEXT).
+;------------------------------------------------------------
+FSVREN:
+        LXI     D,BAKFCB
+        LXI     H,SCRXBK
+        CALL    MKNAM           ; BAKFCB = name.BAK
+        LXI     D,BAKFCB
+        MVI     C,BF_FDEL
+        CALL    BDOS            ; delete stale .BAK
+        LDA     BAKSW
+        ORA     A
+        JZ      FSR_DELO
+        LXI     H,REALEXT
+        LXI     D,SCRXBK
+        CALL    MKREN           ; name.typ -> name.BAK
+        JMP     FSR_PROM
+FSR_DELO:
+        LXI     D,BAKFCB
+        LXI     H,REALEXT
+        CALL    MKNAM           ; BAKFCB = name.typ
+        LXI     D,BAKFCB
+        MVI     C,BF_FDEL
+        CALL    BDOS            ; delete the old real file
+FSR_PROM:
+        LXI     H,SCRXAB
+        LXI     D,REALEXT
+        CALL    MKREN           ; name.$$$ -> the real file
+        LDA     VMODE
+        ORA     A
+        RZ                      ; RAM-only: no $$B to remove
+        LXI     D,RSFCB
+        MVI     C,BF_FDEL
+        CALL    BDOS            ; remove the back-scroll scratch
         RET
 
 ;------------------------------------------------------------
@@ -520,18 +881,29 @@ OFLUSH:
 OPOS:   DB      0
 IRPOS:  DB      RECSIZ
 IREOF:  DB      0
+BAKSW:  DB      0               ; 1 = /B: keep the old file as name.BAK on save
 FWPTR:  DW      0
 OCHAN:  DW      OUTFCB          ; sequential-write channel FCB (PUTB/OFLUSH)
 FVREM:  DW      0               ; FIO_VLOAD: bytes left to load into the window
 MKFCB:  DW      0               ; MKSCR: FCB being built
 SCRREC: DW      0               ; SCRWR/SCRRD: record number
 SCRFCB: DW      0               ; SCRWR/SCRRD: FCB address
+APPREC: DW      0               ; APPB/APPFL: next record to append to name.$$$
+APPPOS: DB      0               ; APPB: bytes buffered in OBUF (0..127)
+MKNFCB: DW      0               ; MKNAM: FCB being built
+MKNEXT: DW      0               ; MKNAM: extension pointer
+MKR_OE: DW      0               ; MKREN: old-extension pointer
+MKR_NE: DW      0               ; MKREN: new-extension pointer
 SCRXAB: DB      '$$$'           ; ABFCB extension (records spilled above)
 SCRXRS: DB      '$$B'           ; RSFCB extension (records spilled below/right)
+SCRXBK: DB      'BAK'           ; backup extension (rename-based save)
+REALEXT: DS     3               ; CAPEXT: the real file's extension (rename src)
 INFCB:  DS      FCB_SIZ
 OUTFCB: DS      FCB_SIZ
 ABFCB:  DS      FCB_SIZ         ; name.$$$  (ABOVE / output scratch)
 RSFCB:  DS      FCB_SIZ         ; name.$$B  (RIGHT / below scratch)
+RENFCB: DS      FCB_SIZ         ; rename FCB pair (old 0..15, new 16..31)
+BAKFCB: DS      FCB_SIZ         ; name.BAK / name.typ (delete-target builder)
 IRBUF:  DS      RECSIZ
 OBUF:   DS      RECSIZ
 PGBUF:  DS      RECSIZ          ; page-transfer buffer (spill/fill DMA)

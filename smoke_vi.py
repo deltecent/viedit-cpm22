@@ -1074,6 +1074,73 @@ def main():
     check('/W at last line: total firms up to exact 200 (no >=)', gv[2] == '200')
     check('RAM at last line: total 200', gr[2] == '200')
 
+    # --- Phase 4 acceptance: virtual-mode save (rename-based, terminal) ---
+    # A virtual :wq must reconstruct the WHOLE document byte-exact from the four
+    # regions -- name.$$$ (ABOVE) ++ window ++ name.$$B (back-scroll, LIFO) ++ the
+    # unread original tail -- and promote $$$ to the real file (with /B keeping the
+    # old file as name.BAK, else deleting it).  Oracle: the saved bytes equal the
+    # original (no edits) or a RAM-only editor's save (identical edits).  A virtual
+    # save consumes the scratch, so it is terminal (save then quit).
+    def _vsave(keys):
+        ed = Editor(vcontent, args=' /W2048')
+        try:
+            for k in keys:
+                ed.key(k, idle=3000)
+            ed.key(':wq\r', idle=4000)
+            return bytes(ed.diskfile('TEST', 'TXT')).rstrip(b'\x1a')
+        finally:
+            ed.close()
+
+    # (a) immediate save: window ++ tail (no ABOVE/$$B yet) == the whole document
+    check('/W save: immediate :wq round-trips byte-exact', _vsave([]) == vcontent)
+    # (b) deep descent spilled text ABOVE (name.$$$): $$$ ++ window ++ tail
+    check('/W save: after j*150 (text spilled above) round-trips byte-exact',
+          _vsave(['j' * 150]) == vcontent)
+    # (c) descend then climb: exercises all four regions incl. $$B back-scroll
+    check('/W save: after j*150,k*40 (ABOVE+window+$$B+tail) round-trips byte-exact',
+          _vsave(['j' * 150, 'k' * 40]) == vcontent)
+
+    # (d) edit deep, then save: the virtual save must match a RAM-only editor fed
+    # the same keys (the real oracle for an edited document).
+    ev = Editor(vcontent, args=' /W2048'); er = Editor(vcontent)
+    try:
+        for k in ['j' * 120, 'oPHASE4 SAVE LINE\x1b']:
+            ev.key(k, idle=3000); er.key(k, idle=3000)
+        ev.key(':wq\r', idle=4000); er.key(':wq\r', idle=4000)
+        vfile = bytes(ev.diskfile('TEST', 'TXT')).rstrip(b'\x1a')
+        rfile = bytes(er.diskfile('TEST', 'TXT')).rstrip(b'\x1a')
+    finally:
+        ev.close(); er.close()
+    check('/W save: edited document matches RAM-only oracle byte-exact', vfile == rfile)
+    check('/W save: the edit is present in the saved file', b'PHASE4 SAVE LINE' in vfile)
+
+    # (e) /B keeps the old file as name.BAK (original content); real file = new edit
+    eb = Editor(vcontent, args=' /W2048 /B')
+    try:
+        eb.key('j' * 20, idle=3000)
+        eb.key('oBAK TEST LINE\x1b', idle=3000)
+        eb.key(':wq\r', idle=4000)
+        names = eb.listed()
+        bak = bytes(eb.diskfile('TEST', 'BAK')).rstrip(b'\x1a')
+        txt = bytes(eb.diskfile('TEST', 'TXT')).rstrip(b'\x1a')
+    finally:
+        eb.close()
+    check('/B save: name.BAK exists', ('TEST', 'BAK') in names)
+    check('/B save: name.BAK holds the ORIGINAL document', bak == vcontent)
+    check('/B save: the real file holds the new edit', b'BAK TEST LINE' in txt)
+
+    # (f) without /B: no name.BAK; scratch ($$$/$$B) gone after the quit
+    en = Editor(vcontent, args=' /W2048')
+    try:
+        en.key('j' * 20, idle=3000)
+        en.key(':wq\r', idle=4000)
+        names = en.listed()
+    finally:
+        en.close()
+    check('no /B: no name.BAK left behind', ('TEST', 'BAK') not in names)
+    check('virtual save: name.$$$ scratch gone after quit', ('TEST', '$$$') not in names)
+    check('virtual save: name.$$B scratch gone after quit', ('TEST', '$$B') not in names)
+
     # --- bugs.txt: word motions w/b/e vs W/B/E (punctuation boundaries) ---
     cp = b'foo.bar baz\r\nsecond line\r\n'   # f0 o1 o2 .3 b4 a5 r6 _7 b8 a9 z10
     e = Editor(cp); e.key('w')

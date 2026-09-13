@@ -70,7 +70,7 @@ If you are ever unsure which mode you are in, press `ESC`. From command mode
 ### 3.1 Command line
 
 ```
-VIEDIT [filename] [/Ln] [/Cn] [/R]
+VIEDIT [filename] [/Ln] [/Cn] [/R] [/B]
 ```
 
 | Argument   | Meaning                                                        |
@@ -79,6 +79,7 @@ VIEDIT [filename] [/Ln] [/Cn] [/R]
 | `/Ln`      | Use `n` screen **lines** (rows). Clamped to 24–200.          |
 | `/Cn`      | Use `n` screen **columns**. Clamped to 80–132.               |
 | `/R`       | Open **read-only** — `:w` and `ZZ` refuse to write.          |
+| `/B`       | Keep a **backup**: on each save, rename the previous file to `name.BAK` before writing the new one. |
 
 Examples:
 
@@ -86,6 +87,7 @@ Examples:
 A>VIEDIT REPORT.TXT          edit REPORT.TXT at the default 80x24
 A>VIEDIT REPORT.TXT /L43     edit on a 43-line terminal
 A>VIEDIT BIOS.ASM /R         view a file read-only
+A>VIEDIT REPORT.TXT /B       keep the prior version as REPORT.BAK on save
 A>VIEDIT                     start with an empty buffer
 ```
 

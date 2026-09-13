@@ -30,6 +30,7 @@
         EXTRN   FIOPEN, INFCB, OUTFCB   ; VIFILEIO
         EXTRN   ABFCB, RSFCB            ; VIFILEIO -- scratch FCBs (VIQUIT cleanup)
         EXTRN   VMODE, VMALLOW, WINCAP, GAPRSV  ; VIVM -- virtual-buffer config
+        EXTRN   BAKSW           ; VIFILEIO -- /B .BAK-on-save switch
         EXTRN   VMFILL          ; VIVM -- pre-fill the window below the cursor
         EXTRN   WININIT         ; VIWIN -- reset line caches after open
         EXTRN   CURWLN          ; VIWIN -- cursor window line (= CURLN, RAM-only)
@@ -931,10 +932,18 @@ CMP_SW:
         JZ      CMP_C
         CPI     'W'
         JZ      CMP_W
+        CPI     'B'
+        JZ      CMP_BAK
         JMP     CMP_LP
 CMP_RO:
         MVI     A,1
         STA     RDONLY
+        INX     H
+        DCR     B
+        JMP     CMP_LP
+CMP_BAK:
+        MVI     A,1             ; /B : keep the old file as name.BAK on every save
+        STA     BAKSW
         INX     H
         DCR     B
         JMP     CMP_LP

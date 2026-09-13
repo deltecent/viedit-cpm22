@@ -29,7 +29,7 @@ python3 build_vi.py KEYTST   # key-decoder test stub
 MAX_LIVE=20 python3 smoke_vi.py   # full-screen smoke test (see _MAX_LIVE below)
 ```
 
-`build_vi.py` produces `VIEDIT.COM` (21120 bytes) and `VIEDIT.SYM` here. The
+`build_vi.py` produces `VIEDIT.COM` (21760 bytes) and `VIEDIT.SYM` here. The
 build is reproducible — two builds differ only in the embedded build-timestamp
 (`VIBLD.INC`). `smoke_vi.py` boots VIEDIT on test files, renders the VT100
 screen, drives command/insert-mode keys, and checks the screen + save
@@ -125,7 +125,7 @@ smoke test's `_smoke_work/` scratch are regenerated each run.
 
 ## Status
 
-- **Build:** reproducible (VIEDIT.COM = 21120 bytes; KEYTST also builds).
+- **Build:** reproducible (VIEDIT.COM = 21760 bytes; KEYTST also builds).
   `SCRTST` is a stale Phase-2 stub: its `VISCREEN` references `MKDEL`/`MKINS`,
   which now exist only in the full VIEDIT link, so it fails to link.
-- **Smoke test:** 357 passed / 0 failed at `MAX_LIVE=20`.
+- **Smoke test:** 368 passed / 0 failed at `MAX_LIVE=20`.

@@ -29,7 +29,7 @@ This file is a high-level overview. The full end-user manual is
 ## Running it
 
 ```
-VIEDIT [filename] [/Ln] [/Cn] [/R]
+VIEDIT [filename] [/Ln] [/Cn] [/R] [/B]
 ```
 
 | Argument   | Meaning                                                       |
@@ -38,6 +38,7 @@ VIEDIT [filename] [/Ln] [/Cn] [/R]
 | `/Ln`      | Use `n` screen rows (clamped 24–200).                         |
 | `/Cn`      | Use `n` screen columns (clamped 80–132).                      |
 | `/R`       | Open **read-only** — `:w` and `ZZ` refuse to write.          |
+| `/B`       | Keep a **backup**: rename the prior file to `name.BAK` on save. |
 
 Examples:
 
@@ -45,6 +46,7 @@ Examples:
 A>VIEDIT REPORT.TXT          edit REPORT.TXT at 80x24 (or auto-detected size)
 A>VIEDIT REPORT.TXT /L43     edit on a 43-line terminal
 A>VIEDIT BIOS.ASM /R         view a file read-only
+A>VIEDIT REPORT.TXT /B       keep the prior version as REPORT.BAK on save
 A>VIEDIT                     start with an empty buffer
 ```
 
