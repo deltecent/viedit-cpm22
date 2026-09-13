@@ -1,0 +1,380 @@
+;============================================================
+; FILE:    VICMDDAT.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  VICMD data: vars, messages, CMDTAB/ACTTAB dispatch tables, BLDTS
+;------------------------------------------------------------
+; Split out of VICMD.MAC -- see DESIGN.md / build_vi.py link order.
+;============================================================
+        INCLUDE VI.INC
+        PUBLIC  ACTTAB, BLDTS, CMDTAB, CWTAB, DDLCNT, DGM_BLT
+        PUBLIC  DGM_BUF, DGM_FREE, DGM_LNS, EBADCMD, EFNPTR, ELINE
+        PUBLIC  EMKUNS, EMODF, ENOFILE, ENOTFND, ENOUNDO, ERDONLY
+        PUBLIC  ERNGBIG, ESUBPAT, ESUBRNG, ETOOBIG, EWANTF, EXBUF
+        PUBLIC  EXLEN, FCBSV, FCCHR, FCDIR, FCSAV, FCTYP
+        PUBLIC  FDELOK, FMULTI, GCOLMSG, GMSG, GOFMSG, GPEND
+        PUBLIC  GPTGT, GROMSG, GSIZMSG, HFN, HMLBOT, HMLLST
+        PUBLIC  HMLTOP, INSMSG, KWSTAT, LBJ, LNCREM, MARKS
+        PUBLIC  MKANY, MKDLT, MKSHT, MKTMP, MKTMP2, NEWLEN
+        PUBLIC  NPUTLN, OLDLEN, OPB, OPCHAR, OPEND, OPLO
+        PUBLIC  OPN, OPSTART, PDECC, PDEPTH, PDIR, PGREQ
+        PUBLIC  PGSVCO, PGSVLN, PGTOP, PINCC, PSP, PTOPSV
+        PUBLIC  PUTOFF, RCNT, RDPCH, RDPOS, REDSAV, REPMSG
+        PUBLIC  RMODSV, RNEED, RNGERR, SCANP, SCBASE, SCGAPB
+        PUBLIC  SCR1E, SCR2E, SCR2S, SCTXE, SHCUR, SHHI
+        PUBLIC  SHLO, SHN, SHRBEG, SHRLEN, SHTMP, SHUNDOK
+        PUBLIC  SHITBOT, SHITTOP, SLINE, SNOTFND, SNOTPFX, SRCBUF
+        PUBLIC  SRCDIR, SRCH0, SRCLEN, STATBUF, SWRAPF
+        PUBLIC  STARLEN, STARSAV, STARWP, SUBCNT, SUBCUR, SUBDELIM
+        PUBLIC  SUBENTRY, SUBGLOB, SUBLAST, SUBLMAT, SUBLNS, SUBNEW
+        PUBLIC  SUBOLD, SUBSM1, SUBSM2, SUBSTRT, SUBTB, SUBTOT
+        PUBLIC  SUBUK, SVERR, SVWRTG, SVWRTN, UB, UCMTINS
+        PUBLIC  UCMTLEN, UINSCNT, UNDOBP, UNDOLEN, UNDOPOS, UNDOTYP
+        PUBLIC  URBT, UWP, VADVCO, VADVN, VJCUR, VJLONGM
+        PUBLIC  VJSAV, VSCAN, WBIG, WCLS, WSTART, WWANTQ
+        PUBLIC  XCNT, YBUFP, YLEN, YLNEND, YLNSAV, YLNSCN
+        PUBLIC  YNK1MSG, YNKMSG, YTYP, YWP, ZPEND
+        EXTRN   HELPSC, VCBIGA, VCBIGB, VCBIGC, VCBIGD, VCBIGE
+        EXTRN   VCBIGF, VCBIGI, VCBIGN, VCBIGO, VCBIGP, VCBIGS
+        EXTRN   VCBIGT, VCBIGW, VC_0, VC_A, VC_B, VC_BTICK
+        EXTRN   VC_CARET, VC_COMMA, VC_CTRLG, VC_DOT, VC_E, VC_EOL
+        EXTRN   VC_EX, VC_F, VC_GG, VC_H, VC_HASH, VC_HFDN
+        EXTRN   VC_HFUP, VC_HIGH, VC_I, VC_J, VC_JOIN, VC_K
+        EXTRN   VC_L, VC_LOWL, VC_MARK, VC_MIDL, VC_N, VC_O
+        EXTRN   VC_P, VC_PCT, VC_PGDN, VC_PGUP, VC_QM, VC_QUOTE
+        EXTRN   VC_R, VC_RCH, VC_REDR, VC_S, VC_SEMI, VC_SLASH
+        EXTRN   VC_STAR, VC_TILDE, VC_TT, VC_U, VC_W, VC_X
+        CSEG
+        CSEG
+PGTOP:  DW      0               ; ^F/^B: abs top-of-window line
+PGREQ:  DW      0               ; ^F: probed line (one past the bottom row)
+PGSVLN: DW      0               ; ^F: saved cursor line for the no-scroll restore
+PGSVCO: DB      0               ; ^F: saved cursor column for the no-scroll restore
+HFN:    DB      0               ; ^D/^U: half-page line count (NEDIT/2)
+VADVCO: DB      0               ; VADVG: display-column accumulator (survives calls)
+VADVN:  DB      0               ; VADVG: content bytes to bulk-advance the cursor
+RCNT:   DW      0               ; count snapshot for the current command (0=none)
+FCCHR:  DB      0               ; f/F/t/T target char
+FCTYP:  DB      0               ; 0 = f/F (on char), 1 = t/T (before/after)
+FCDIR:  DB      1               ; 1 = forward, 0FFh = backward
+FCSAV:  DW      0               ; cursor offset saved for restore on a miss
+SRCLEN: DB      0               ; search pattern length (0 = none yet)
+SRCDIR: DB      1               ; 1 = forward, 0FFh = backward
+RDPCH:  DB      0               ; search prompt char
+SRCH0:  DW      0               ; search: original cursor offset
+SWRAPF: DB      0               ; search: 1 = scan wrapped past a file boundary
+SCANP:  DW      0               ; search: current candidate offset
+LBJ:    DW      0               ; LBYTE: requested offset
+UNDOBP: DW      0               ; -> UNDOBUF (past image, out of the .COM)
+YBUFP:  DW      0               ; -> YBUF (past image, out of the .COM)
+UNDOTYP:DB      0               ; UT_NONE / UT_INS / UT_DEL
+UNDOPOS:DW      0               ; undo: offset to restore at
+UNDOLEN:DW      0               ; undo: UNDOBUF length (deleted bytes)
+UINSCNT:DW      0               ; undo: inserted byte count
+UWP:    DW      0               ; undo: UNDOBUF write pointer
+REDSAV: DW      0               ; u / . : total line count before the edit
+UB:     DB      0               ; undo: byte being recorded
+XCNT:   DB      0               ; x: remaining chars to delete this command
+DDLCNT: DB      0               ; linewise delete/yank: remaining line count
+NPUTLN: DB      0               ; linewise put: number of lines pasted
+PTOPSV: DW      0               ; linewise put: saved TOPLN (scroll detection)
+YLNSAV: DW      0               ; linewise yank: saved cursor offset to restore
+YLNSCN: DW      0               ; linewise yank: scan pointer
+YLNEND: DW      0               ; linewise yank: R2 end pointer
+PINCC:  DB      0               ; % : nesting-increment bracket char
+PDECC:  DB      0               ; % : nesting-decrement bracket char
+PDIR:   DB      1               ; % : 1 = forward, 0FFh = backward
+PDEPTH: DW      0               ; % : nesting depth
+PSP:    DW      0               ; % : scan offset
+SNOTFND:DB      'Pattern not found',NUL
+SNOTPFX:DB      'Pattern not found: ',NUL
+SHITBOT:DB      'search hit BOTTOM, continuing at TOP',NUL
+SHITTOP:DB      'search hit TOP, continuing at BOTTOM',NUL
+VJLONGM:DB      'Line too long',NUL
+STATBUF:DS      64              ; status-line compose buffer (msg + pattern + NUL)
+SRCBUF: DS      41              ; search pattern (40 chars + slack)
+SCBASE: DW      0               ; search: cached buffer base
+SCGAPB: DW      0               ; search: cached GAPBG
+SCR1E:  DW      0               ; search: R1 end pointer (base+GAPBG)
+SCR2S:  DW      0               ; search: R2 start pointer (base+GAPEN)
+SCR2E:  DW      0               ; search: R2 end pointer
+SCTXE:  DW      0               ; search: cached TXEND
+GPEND:  DB      0               ; pending 'g' (for gg)
+ZPEND:  DB      0               ; pending 'Z' (for ZZ)
+WBIG:   DB      0               ; word motion: 0 = w/b/e, 1 = W/B/E
+WCLS:   DB      0               ; word motion: class of the run being scanned
+OPCHAR: DB      0               ; active operator char (d/c/y) during OPHANDLE
+OPSTART:DW      0               ; operator motion: range start offset
+OPEND:  DW      0               ; operator motion: range end offset
+OPLO:   DW      0               ; operator: low end of the range
+OPN:    DW      0               ; operator: range length (counts down in OPDELN)
+FDELOK: DB      0               ; d/c: 1 = ESC[P delete fast path is eligible
+FMULTI: DB      0               ; d/c: 1 = range spans a line break -> full redraw
+CWTAB:  DB      0               ; CWSCAN: TAB-present flag scratch
+VJSAV:  DW      0               ; J: original cursor offset (restore on reject)
+VJCUR:  DW      0               ; J: current line length (for the MAXCOLS check)
+OPB:    DB      0               ; operator: byte being copied
+YTYP:   DB      0               ; yank type: 0 = charwise, 1 = linewise
+YLEN:   DW      0               ; yank length
+YWP:    DW      0               ; yank write pointer (D builds incrementally)
+PUTOFF: DW      0               ; put: insertion offset (to reseat the cursor)
+GPTGT:  DW      0               ; GOTOPOS target offset
+EXLEN:  DB      0               ; ex line length
+SVERR:  DB      0               ; last save error flag
+INSMSG: DB      '-- INSERT --',NUL
+REPMSG: DB      '-- REPLACE --',NUL
+SHLO:   DW      0               ; line shift (>> << > <): low line (0-based)
+SHHI:   DW      0               ; line shift: high line (inclusive)
+SHCUR:  DW      0               ; line shift: line being processed
+SHTMP:  DW      0               ; line shift: scratch (clamp)
+SHN:    DB      0               ; line shift: leading-space delete counter
+SHRBEG: DW      0               ; shift undo: region start offset
+SHRLEN: DW      0               ; shift undo: bytes left to snapshot
+SHUNDOK:DB      0               ; shift undo: 1 = region recorded, 0 = disabled
+MARKS:  DW      0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH
+        DW      0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH
+        DW      0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH,0FFFFH
+        DW      0FFFFH,0FFFFH   ; marks a..z: cursor offset, 0FFFFH=unset
+MKANY:  DB      0               ; 1 once any mark is set (adjust fast-out)
+MKTMP:  DW      0               ; mark range scratch
+MKTMP2: DW      0               ; mark range scratch
+MKDLT:  DB      0               ; MKSH: shift delta (+1 / 0FFH)
+MKSHT:  DW      0               ; MKSH: threshold offset
+RNGERR: DB      0               ; ex range: bad/unset mark flag
+LNCREM: DB      0               ; LNCHK: lines left to scan
+EMKUNS: DB      'Mark not set',NUL
+ERNGBIG:DB      'Range too large',NUL
+GMSG:   DB      ' line ',NUL
+GOFMSG: DB      ' of ',NUL
+GCOLMSG:DB      ' col ',NUL
+GSIZMSG:DB      ', ',NUL
+GROMSG: DB      ' [readonly]',NUL
+EMODF:  DB      'No write since last change (add ! to override)',NUL
+ERDONLY:DB      'File is read only',NUL
+ENOUNDO:DB      'Nothing to undo',NUL
+EBADCMD:DB      'Unknown command',NUL
+ENOFILE:DB      'No file name',NUL
+ENOTFND:DB      'File not found',NUL
+ETOOBIG:DB      'File too large',NUL
+SVWRTG: DB      'writing ',NUL   ; save status: pre-write
+SVWRTN: DB      ' written',NUL   ; save status: post-write
+YNKMSG: DB      ' lines yanked',NUL
+YNK1MSG:DB      ' line yanked',NUL
+HMLTOP: DW      0               ; H/M/L: absolute top visible line
+HMLBOT: DW      0               ; H/M/L: absolute bottom visible line
+HMLLST: DW      0               ; H/M/L: last file line index (scratch)
+STARSAV:DW      0               ; * / # : original cursor (restore if no word)
+WSTART: DW      0               ; * / # : word-start offset (search resumes here)
+STARWP: DW      0               ; * / # : SRCBUF write pointer
+STARLEN:DB      0               ; * / # : captured word length
+WWANTQ: DB      0               ; :w -> 1 if a 'q' suffix (wq) was typed
+EWANTF: DB      0               ; :e -> 1 if '!' (force, discard changes)
+RNEED:  DW      0               ; :r FSIZE gate: file size in records
+RDPOS:  DW      0               ; :r: insertion-start offset (cursor restore)
+RMODSV: DB      0               ; :r: BD_MODIF saved across a read into an unnamed buffer
+EFNPTR: DW      0               ; :e: saved filename pointer in EXBUF
+FCBSV:  DS      FCB_SIZ         ; saved INFCB/OUTFCB across :r / :w filename
+KWSTAT: DB      'stat',NUL
+; --- :s substitute state ---
+SUBOLD: DS      41              ; pattern to match (literal, <=40 + slack)
+OLDLEN:DB      0               ; SUBOLD length
+SUBNEW: DS      41              ; replacement text
+NEWLEN:DB      0               ; SUBNEW length
+SUBGLOB:DB      0               ; 1 = 'g' flag (all matches per line)
+SUBDELIM:DB     0               ; active field delimiter
+SLINE:  DW      0               ; range start line (1-based)
+ELINE:  DW      0               ; range end line (1-based)
+SUBTOT: DW      0               ; total lines (clamp scratch)
+SUBCUR: DW      0               ; line being processed (0-based)
+SUBCNT: DW      0               ; replacements made
+SUBLNS: DW      0               ; lines changed
+SUBLMAT:DB      0               ; 1 = current line already matched
+SUBSTRT:DB      0               ; 1 = undo record opened
+SUBUK:  DB      0               ; 1 = undo record still valid (not overflowed)
+UCMTLEN:DW      0               ; committed UNDOLEN (after last replacement)
+UCMTINS:DW      0               ; committed UINSCNT
+SUBLAST:DW      0               ; offset of the last change (cursor landing)
+SUBENTRY:DW     0               ; cursor at entry (restore on no match)
+SUBTB:  DB      0               ; SADV1 crossed-byte scratch
+URBT:   DB      0               ; URECB byte scratch
+SUBSM1: DB      ' subs, ',NUL
+SUBSM2: DB      ' lines',NUL
+ESUBPAT:DB      'No previous pattern',NUL
+ESUBRNG:DB      'Backwards range given',NUL
+DGM_BLT:DB      'built ',NUL
+DGM_BUF:DB      '  buf=',NUL
+DGM_FREE:DB     ' free=',NUL
+DGM_LNS:DB      ' lines=',NUL
+        INCLUDE VIBLD.INC       ; BLDTS: build timestamp (regenerated each build)
+EXBUF:  DS      EXMAX+1
+
+
+;------------------------------------------------------------
+; VSCAN - table-driven command dispatch (replaces long CPI/JZ chains).
+; Entry: A = char (C also = char, preserved), HL -> table of {DB ch, DW addr}
+; terminated by DB 0.  On match: JMP handler (handler RETs to the main loop,
+; exactly like the old JZ).  On miss: RET (ignore the key).  Preserves B,C;
+; clobbers A,D,E,H,L -- the same registers the old CPI chain left as scratch.
+;------------------------------------------------------------
+VSCAN:
+VSCAN1: MOV     A,M             ; A = entry char (0 = end of table)
+        ORA     A
+        RZ                      ; miss -> ignore key
+        INX     H
+        CMP     C               ; entry char == typed char?
+        MOV     E,M             ; E = handler addr low
+        INX     H
+        MOV     D,M             ; D = handler addr high
+        INX     H               ; -> next entry
+        JNZ     VSCAN1
+        XCHG                    ; HL = handler
+        PCHL                    ; jump (A = matched char)
+
+;------------------------------------------------------------
+; CMDTAB - command-mode keys (post count-snapshot).
+;------------------------------------------------------------
+CMDTAB:
+        DB      'h'
+        DW      VC_H
+        DB      'l'
+        DW      VC_L
+        DB      'j'
+        DW      VC_J
+        DB      'k'
+        DW      VC_K
+        DB      '0'
+        DW      VC_0
+        DB      '$'
+        DW      VC_EOL
+        DB      'w'
+        DW      VC_W
+        DB      'b'
+        DW      VC_B
+        DB      'e'
+        DW      VC_E
+        DB      'W'
+        DW      VCBIGW
+        DB      'B'
+        DW      VCBIGB
+        DB      'E'
+        DW      VCBIGE
+        DB      '^'
+        DW      VC_CARET
+        DB      'H'
+        DW      VC_HIGH
+        DB      'M'
+        DW      VC_MIDL
+        DB      'L'
+        DW      VC_LOWL
+        DB      '*'
+        DW      VC_STAR
+        DB      '#'
+        DW      VC_HASH
+        DB      'G'
+        DW      VC_GG
+        DB      07H
+        DW      VC_CTRLG
+        DB      '~'
+        DW      VC_TILDE
+        DB      'J'
+        DW      VC_JOIN
+        DB      'r'
+        DW      VC_RCH
+        DB      'R'
+        DW      VC_R
+        DB      'D'
+        DW      VCBIGD
+        DB      'C'
+        DW      VCBIGC
+        DB      'S'
+        DW      VCBIGS
+        DB      's'
+        DW      VC_S
+        DB      'f'
+        DW      VC_F
+        DB      'F'
+        DW      VCBIGF
+        DB      't'
+        DW      VC_TT
+        DB      'T'
+        DW      VCBIGT
+        DB      ';'
+        DW      VC_SEMI
+        DB      ','
+        DW      VC_COMMA
+        DB      '/'
+        DW      VC_SLASH
+        DB      '?'
+        DW      VC_QM
+        DB      'n'
+        DW      VC_N
+        DB      'N'
+        DW      VCBIGN
+        DB      '%'
+        DW      VC_PCT
+        DB      'u'
+        DW      VC_U
+        DB      '.'
+        DW      VC_DOT
+        DB      'p'
+        DW      VC_P
+        DB      'P'
+        DW      VCBIGP
+        DB      'x'
+        DW      VC_X
+        DB      'i'
+        DW      VC_I
+        DB      'a'
+        DW      VC_A
+        DB      'A'
+        DW      VCBIGA
+        DB      'I'
+        DW      VCBIGI
+        DB      'o'
+        DW      VC_O
+        DB      'O'
+        DW      VCBIGO
+        DB      ':'
+        DW      VC_EX
+        DB      'K'
+        DW      HELPSC
+        DB      06H
+        DW      VC_PGDN
+        DB      02H
+        DW      VC_PGUP
+        DB      04H
+        DW      VC_HFDN
+        DB      15H
+        DW      VC_HFUP
+        DB      0CH
+        DW      VC_REDR
+        DB      'm'
+        DW      VC_MARK
+        DB      60H
+        DW      VC_BTICK
+        DB      27H
+        DW      VC_QUOTE
+        DB      0               ; end
+
+;------------------------------------------------------------
+; ACTTAB - action keys (arrows/Home/End/PgUp/PgDn).
+;------------------------------------------------------------
+ACTTAB:
+        DB      ACT_CURLT
+        DW      VC_H
+        DB      ACT_CURRT
+        DW      VC_L
+        DB      ACT_CURDN
+        DW      VC_J
+        DB      ACT_CURUP
+        DW      VC_K
+        DB      ACT_LINST
+        DW      VC_0
+        DB      ACT_LINEN
+        DW      VC_EOL
+        DB      ACT_PGDN
+        DW      VC_PGDN
+        DB      ACT_PGUP
+        DW      VC_PGUP
+        DB      0               ; end
+
+        END

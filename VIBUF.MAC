@@ -1,0 +1,856 @@
+;============================================================
+; FILE:    VIBUF.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  Gap buffer text engine -- VERBATIM CRLF storage
+;------------------------------------------------------------
+; The buffer stores file bytes verbatim (no CR strip).  Layout:
+;   R1:  base .. base+GAPBG-1        (text before cursor)
+;   Gap: base+GAPBG .. base+GAPEN-1  (free)
+;   R2:  base+GAPEN .. base+BSIZE-1  (text at/after cursor)
+;   cursor byte under it = R2[0] = (base+GAPEN); BD_CSOFF == BD_GAPBG.
+;
+; The line-ending invariant (VI.INC): a CR immediately before an LF is part
+; of the line break; the cursor crosses CR,LF (or bare LF) as one unit and is
+; never left between them.  GBMVRT / GBMVLT enforce this.
+;
+; This module is the low-level engine.  Line scanning, the window/boundary
+; engine, and file I/O live in VIWIN / VIFILEIO.
+;------------------------------------------------------------
+; EXPORTS:
+;   BDFLD   A=BD_xxx -> HL=field address (uses CURBDP)
+;   GBLDHW  A=BD_xxx -> HL=field value (16-bit)
+;   GBSTHW  A=BD_xxx, HL=value -> store field
+;   GBINIT  HL=desc, DE=base, BC=size -> init empty buffer, cursor at 0
+;   GBINSRT A=byte  -> insert at cursor; A=0 ok / A=FFH full
+;   GBDELRT         -> delete byte at cursor (R2[0])
+;   GBDLFT          -> delete byte before cursor (R1 end)
+;   GBMVRT          -> cursor right one position (crosses CR,LF atomically)
+;   GBMVLT          -> cursor left  one position (crosses CR,LF atomically)
+;   GBPKRT  -> A = byte at cursor (R2[0]), or 0FFH at end of text
+;   GBPKLT  -> A = byte before cursor (R1 end), or 0FFH at start of text
+;============================================================
+        INCLUDE VI.INC
+
+        EXTRN   CURBDP          ; word: address of the active descriptor
+        EXTRN   NLNVAL          ; VIWIN: total-line-count cache valid flag
+        EXTRN   BDESC0          ; the (single) buffer descriptor, fixed link addr.
+        EXTRN   MKINS, MKDEL    ; VICMD: shift marks on insert/delete
+                                ; CURBDP always == BDESC0, so the hot per-byte
+                                ; primitives address its fields directly as
+                                ; link-time constants (BDESC0+BD_xxx) instead of
+                                ; the CURBDP-indirected BDFLD path -- ~6x cheaper
+                                ; field access on the cursor-motion fast path.
+
+        PUBLIC  BDFLD, GBLDHW, GBSTHW, GBINIT
+        PUBLIC  GBINSRT, GBDELRT, GBDLFT, GBMVRT, GBMVLT, GBPKRT, GBPKLT
+        PUBLIC  GBMLNS, GBMLNE, PKRT2, GBMVTOP, GBINCF, GBDECF
+        PUBLIC  GBGETLN, GBADVN, GBBAKN, GBR2RG, MV1RT
+
+        CSEG
+
+;------------------------------------------------------------
+; BDFLD - field address.  Entry A = BD_xxx offset.  Exit HL = &field.
+; Clobbers A.  Preserves BC, DE.
+;------------------------------------------------------------
+BDFLD:
+        LHLD    CURBDP
+        ADD     L
+        MOV     L,A
+        RNC                     ; no carry into high byte -> HL ready (common case)
+        INR     H
+        RET
+
+;------------------------------------------------------------
+; GBLDHW - load 16-bit field value.  A = offset -> HL = value.
+;------------------------------------------------------------
+GBLDHW:
+        CALL    BDFLD
+        MOV     A,M
+        INX     H
+        MOV     H,M
+        MOV     L,A
+        RET
+
+;------------------------------------------------------------
+; GBSTHW - store HL into 16-bit field.  A = offset, HL = value.
+; Preserves HL.
+;------------------------------------------------------------
+GBSTHW:
+        PUSH    H
+        CALL    BDFLD           ; HL = &field
+        POP     D               ; DE = value
+        MOV     M,E
+        INX     H
+        MOV     M,D
+        XCHG                    ; HL = value (preserved)
+        RET
+
+;------------------------------------------------------------
+; GBINIT - initialise the descriptor for an empty buffer.
+; Entry: HL = descriptor address, DE = buffer base, BC = capacity.
+; Result: gap = whole buffer; R1 and R2 empty; cursor at offset 0.
+;------------------------------------------------------------
+GBINIT:
+        SHLD    CURBDP          ; activate this descriptor (HL=desc)
+        ; HL=desc, DE=base, BC=capacity.  GBSTHW preserves BC.
+        XCHG                    ; HL = base
+        MVI     A,BD_BSTAR
+        CALL    GBSTHW          ; BD_BSTAR = base (HL preserved)
+        MOV     H,B
+        MOV     L,C             ; HL = capacity
+        MVI     A,BD_BSIZE
+        CALL    GBSTHW          ; BD_BSIZE = capacity (HL preserved)
+        MVI     A,BD_GAPEN
+        CALL    GBSTHW          ; BD_GAPEN = capacity (gap = whole buffer)
+        ; zero the running fields
+        LXI     H,0
+        MVI     A,BD_GAPBG
+        CALL    GBSTHW
+        LXI     H,0
+        MVI     A,BD_CSOFF
+        CALL    GBSTHW
+        LXI     H,0
+        MVI     A,BD_TXEND
+        CALL    GBSTHW
+        LXI     H,0
+        MVI     A,BD_TOPLN
+        CALL    GBSTHW
+        ; zero the byte fields
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MVI     M,0
+        MVI     A,BD_CSCOL
+        CALL    BDFLD
+        MVI     M,0
+        MVI     A,BD_MODIF
+        CALL    BDFLD
+        MVI     M,0
+        RET
+
+;------------------------------------------------------------
+; Internal: R2HEAD -> HL = address of R2[0] = base + GAPEN.
+;           Z set if R2 empty (GAPEN == BSIZE).
+;------------------------------------------------------------
+R2HEAD:
+        LHLD    BDESC0+BD_GAPEN ; HL = GAPEN
+        XCHG                    ; DE = GAPEN
+        LHLD    BDESC0+BD_BSIZE ; HL = BSIZE
+        ; Z if GAPEN == BSIZE
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        ORA     C               ; A=0 (Z) if equal -> R2 empty
+        PUSH    PSW
+        LHLD    BDESC0+BD_BSTAR ; HL = base
+        DAD     D               ; HL = base + GAPEN
+        POP     PSW             ; restore Z flag
+        RET
+
+;------------------------------------------------------------
+; Internal: R1TAIL -> HL = address of R1's last byte = base + GAPBG - 1.
+;           Z set if R1 empty (GAPBG == 0).
+;------------------------------------------------------------
+R1TAIL:
+        LHLD    BDESC0+BD_GAPBG ; HL = GAPBG
+        MOV     A,H
+        ORA     L
+        PUSH    PSW             ; Z if GAPBG == 0 (R1 empty)
+        XCHG                    ; DE = GAPBG
+        LHLD    BDESC0+BD_BSTAR ; HL = base
+        DAD     D               ; HL = base + GAPBG
+        DCX     H               ; HL = base + GAPBG - 1
+        POP     PSW
+        RET
+
+;------------------------------------------------------------
+; GBPKRT - A = byte at cursor (R2[0]); 0FFH if R2 empty (end of text).
+;------------------------------------------------------------
+GBPKRT:
+        CALL    R2HEAD
+        JZ      GBPK_FF
+        MOV     A,M
+        RET
+GBPK_FF:
+        MVI     A,0FFH
+        RET
+
+;------------------------------------------------------------
+; GBPKLT - A = byte before cursor (R1 end); 0FFH if R1 empty.
+;------------------------------------------------------------
+GBPKLT:
+        CALL    R1TAIL
+        JZ      GBPK_FF
+        MOV     A,M
+        RET
+
+;------------------------------------------------------------
+; GBINSRT - insert byte A at the cursor (gap start).
+; Exit: A=0 inserted; A=0FFH gap full.  Sets BD_MODIF.
+;------------------------------------------------------------
+GBINSRT:
+        PUSH    PSW             ; save byte
+        ; full if GAPBG == GAPEN
+        LHLD    BDESC0+BD_GAPBG ; HL = GAPBG
+        XCHG                    ; DE = GAPBG
+        LHLD    BDESC0+BD_GAPEN ; HL = GAPEN
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        ORA     C
+        JZ      GBINS_FULL      ; GAPBG == GAPEN -> no gap
+        ; write byte at base + GAPBG (DE still = GAPBG)
+        LHLD    BDESC0+BD_BSTAR ; HL = base
+        DAD     D               ; HL = base + GAPBG
+        POP     PSW             ; A = byte
+        MOV     M,A
+        ; GAPBG++, CSOFF++ (CSOFF == GAPBG), TXEND++
+        LHLD    BDESC0+BD_GAPBG
+        INX     H
+        SHLD    BDESC0+BD_GAPBG
+        SHLD    BDESC0+BD_CSOFF
+        LHLD    BDESC0+BD_TXEND
+        INX     H
+        SHLD    BDESC0+BD_TXEND
+        CALL    SETMOD
+        CALL    MKINS           ; shift marks past the inserted byte
+        XRA     A               ; A = 0 (ok)
+        RET
+GBINS_FULL:
+        POP     PSW
+        MVI     A,0FFH
+        RET
+
+;------------------------------------------------------------
+; GBDELRT - delete the byte at the cursor (R2[0]): grow the gap right.
+; No-op if R2 empty.  Sets BD_MODIF when something is deleted.
+;------------------------------------------------------------
+GBDELRT:
+        CALL    R2HEAD
+        RZ                      ; R2 empty
+        LHLD    BDESC0+BD_GAPEN
+        INX     H
+        SHLD    BDESC0+BD_GAPEN ; GAPEN++
+        LHLD    BDESC0+BD_TXEND
+        DCX     H
+        SHLD    BDESC0+BD_TXEND ; TXEND--
+        CALL    MKDEL           ; shift marks for the forward delete
+        JMP     SETMOD
+
+;------------------------------------------------------------
+; GBDLFT - delete the byte before the cursor (R1 end): shrink R1.
+; No-op if R1 empty.  Sets BD_MODIF when something is deleted.
+;------------------------------------------------------------
+GBDLFT:
+        CALL    R1TAIL
+        RZ                      ; R1 empty
+        LHLD    BDESC0+BD_GAPBG
+        DCX     H
+        SHLD    BDESC0+BD_GAPBG ; GAPBG--
+        SHLD    BDESC0+BD_CSOFF ; CSOFF-- (CSOFF == GAPBG)
+        LHLD    BDESC0+BD_TXEND
+        DCX     H
+        SHLD    BDESC0+BD_TXEND ; TXEND--
+        CALL    MKDEL           ; shift marks for the backward delete
+        JMP     SETMOD
+
+;------------------------------------------------------------
+; MV1RT - move ONE byte from R2 head to R1 end (cursor right one byte).
+; Assumes R2 non-empty (caller checked).  Updates GAPBG/GAPEN/CSOFF.
+;------------------------------------------------------------
+MV1RT:
+        ; mem[base+GAPBG] = mem[base+GAPEN]; then GAPBG++,CSOFF++,GAPEN++.
+        ; Direct field addressing (BDESC0); CSOFF==GAPBG so one store sets both.
+        LHLD    BDESC0+BD_BSTAR ; HL = base
+        XCHG                    ; DE = base
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D               ; HL = base+GAPEN (src)
+        MOV     C,M             ; C = byte
+        LHLD    BDESC0+BD_GAPBG
+        DAD     D               ; HL = base+GAPBG (dst)
+        MOV     M,C             ; copy byte
+        LHLD    BDESC0+BD_GAPBG
+        INX     H
+        SHLD    BDESC0+BD_GAPBG
+        SHLD    BDESC0+BD_CSOFF ; CSOFF == GAPBG
+        LHLD    BDESC0+BD_GAPEN
+        INX     H
+        SHLD    BDESC0+BD_GAPEN
+        RET
+
+;------------------------------------------------------------
+; MV1LT - move ONE byte from R1 end to R2 head (cursor left one byte).
+; Assumes R1 non-empty (caller checked).  Updates GAPBG/GAPEN/CSOFF.
+;------------------------------------------------------------
+MV1LT:
+        ; GAPBG--, CSOFF--, GAPEN-- ; then mem[base+GAPEN] = mem[base+GAPBG].
+        ; Direct field addressing (BDESC0); CSOFF==GAPBG so one store sets both.
+        LHLD    BDESC0+BD_GAPBG
+        DCX     H
+        SHLD    BDESC0+BD_GAPBG
+        SHLD    BDESC0+BD_CSOFF ; new GAPBG (= CSOFF)
+        LHLD    BDESC0+BD_GAPEN
+        DCX     H
+        SHLD    BDESC0+BD_GAPEN ; new GAPEN
+        LHLD    BDESC0+BD_BSTAR ; HL = base
+        XCHG                    ; DE = base
+        LHLD    BDESC0+BD_GAPBG
+        DAD     D               ; HL = base+GAPBG (src)
+        MOV     C,M             ; C = byte
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D               ; HL = base+GAPEN (dst)
+        MOV     M,C
+        RET
+
+;------------------------------------------------------------
+; GBMVRT - cursor right one position.  Crosses CR,LF atomically:
+; move one byte; if it was CR and R2 now starts with LF, move the LF too.
+; No-op at end of text.
+;------------------------------------------------------------
+GBMVRT:
+        CALL    R2HEAD
+        RZ                      ; at end of text
+        MOV     A,M             ; A = byte about to cross
+        PUSH    PSW             ; save it (MV1RT clobbers A)
+        CALL    MV1RT
+        POP     PSW             ; A = crossed byte
+        CPI     CR
+        RNZ                     ; not CR -> done (one byte)
+        ; was CR: cross the LF too if R2 now starts with LF
+        CALL    R2HEAD
+        RZ                      ; CR was at end -> done
+        MOV     A,M
+        CPI     LF
+        RNZ                     ; lone CR -> done
+        JMP     MV1RT           ; cross the LF
+
+;------------------------------------------------------------
+; GBMVLT - cursor left one position.  Crosses CR,LF atomically:
+; move one byte; if it was LF and R1 now ends with CR, move the CR too.
+; No-op at start of text.
+;------------------------------------------------------------
+GBMVLT:
+        CALL    R1TAIL
+        RZ                      ; at start of text
+        MOV     A,M             ; A = byte about to cross
+        PUSH    PSW             ; save it (MV1LT clobbers A)
+        CALL    MV1LT
+        POP     PSW             ; A = crossed byte
+        CPI     LF
+        RNZ                     ; not LF -> done
+        ; was LF: cross the CR too if R1 now ends with CR
+        CALL    R1TAIL
+        RZ                      ; LF was at start -> done
+        MOV     A,M
+        CPI     CR
+        RNZ                     ; bare LF -> done
+        JMP     MV1LT           ; cross the CR
+
+;------------------------------------------------------------
+; Field increment / decrement helpers (16-bit).  A = BD_xxx offset.
+; Preserve nothing of interest beyond the descriptor; clobber A, HL.
+;------------------------------------------------------------
+GBINCF:
+        CALL    BDFLD           ; HL = &field
+        INR     M
+        RNZ
+        INX     H
+        INR     M
+        RET
+GBDECF:
+        CALL    BDFLD           ; HL = &field
+        MOV     A,M
+        SUI     1
+        MOV     M,A
+        RNC                     ; low byte was non-zero -> no borrow (common case)
+        INX     H
+        DCR     M
+        RET
+
+;------------------------------------------------------------
+; SETMOD - set BD_MODIF = 1.  Single chokepoint for every mutation
+; (GBINSRT/GBDELRT/GBDLFT all route here), so it also invalidates the
+; lazy total-line-count cache (NLNVAL, owned by VIWIN).  A is clobbered,
+; which is fine: no caller relies on SETMOD's return value.
+;------------------------------------------------------------
+SETMOD:
+        MVI     A,BD_MODIF
+        CALL    BDFLD
+        MVI     M,1
+        XRA     A
+        STA     NLNVAL          ; total-line count is now stale
+        RET
+
+;------------------------------------------------------------
+; PKRT2 - peek the byte AFTER the cursor's byte (R2[1]).
+; A = R2[1], or 0FFH if R2 holds fewer than 2 bytes.
+;------------------------------------------------------------
+PKRT2:
+        LHLD    BDESC0+BD_GAPEN ; HL = GAPEN
+        XCHG                    ; DE = GAPEN
+        LHLD    BDESC0+BD_BSIZE ; HL = BSIZE
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A             ; HL = BSIZE - GAPEN = R2 length
+        ORA     A               ; high byte != 0 -> length >= 256
+        JNZ     PKRT2_OK
+        MOV     A,L
+        CPI     2
+        JC      PKRT2_FF        ; R2 length < 2
+PKRT2_OK:
+        LHLD    BDESC0+BD_GAPEN
+        INX     H               ; GAPEN+1
+        XCHG                    ; DE = GAPEN+1
+        LHLD    BDESC0+BD_BSTAR ; HL = base
+        DAD     D               ; HL = base + GAPEN + 1
+        MOV     A,M
+        RET
+PKRT2_FF:
+        MVI     A,0FFH
+        RET
+
+;------------------------------------------------------------
+; GBR2RG - return the R2 (at/after cursor) byte range as raw pointers:
+;   HL = R2 head = base+GAPEN (the cursor byte); DE = R2 end = base+BSIZE.
+; Lets a caller scan the current-and-following text read-only (no cursor move).
+;------------------------------------------------------------
+GBR2RG:
+        LHLD    BDESC0+BD_BSTAR
+        XCHG                    ; DE = base
+        LHLD    BDESC0+BD_BSIZE
+        DAD     D               ; HL = base+BSIZE (end)
+        PUSH    H
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D               ; HL = base+GAPEN (head); DE = base
+        POP     D               ; DE = end
+        RET
+
+;------------------------------------------------------------
+; GBADVN - advance the cursor RIGHT by BC bytes via a single block move
+; (R2[0..BC) -> R1 end), then GAPBG/CSOFF/GAPEN += BC.  RAW: no CR,LF
+; semantics -- the caller guarantees the run is plain content within one line
+; (reaching a line end / goal column never lands mid-CR,LF).  BC must be <= R2
+; length.  Replaces BC individual GBMVRT calls with one memmove + O(1) updates.
+;------------------------------------------------------------
+GBADVN:
+        MOV     A,B
+        ORA     C
+        RZ                      ; nothing to move
+        MOV     H,B
+        MOV     L,C
+        SHLD    GBNCNT          ; remember the count
+        LHLD    BDESC0+BD_BSTAR
+        XCHG                    ; DE = base
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D               ; HL = base+GAPEN (src)
+        SHLD    GBNSRC
+        LHLD    BDESC0+BD_GAPBG
+        DAD     D               ; HL = base+GAPBG (dst); DE still = base
+        SHLD    GBNDST
+        LHLD    GBNCNT
+        MOV     B,H
+        MOV     C,L             ; BC = count
+        LHLD    GBNDST
+        XCHG                    ; DE = dst
+        LHLD    GBNSRC          ; HL = src
+GADVN_L:
+        MOV     A,M             ; copy forward (dst < src, no overlap hazard)
+        STAX    D
+        INX     H
+        INX     D
+        DCX     B
+        MOV     A,B
+        ORA     C
+        JNZ     GADVN_L
+        LHLD    GBNCNT
+        XCHG                    ; DE = cnt
+        LHLD    BDESC0+BD_GAPBG
+        DAD     D
+        SHLD    BDESC0+BD_GAPBG
+        SHLD    BDESC0+BD_CSOFF ; CSOFF == GAPBG
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D
+        SHLD    BDESC0+BD_GAPEN
+        RET
+
+;------------------------------------------------------------
+; GBBAKN - move the cursor LEFT by BC bytes via a single block move
+; (R1 tail -> R2 head), then GAPBG/CSOFF/GAPEN -= BC.  RAW (see GBADVN).
+; BC must be <= R1 length (GAPBG).
+;------------------------------------------------------------
+GBBAKN:
+        MOV     A,B
+        ORA     C
+        RZ
+        MOV     H,B
+        MOV     L,C
+        SHLD    GBNCNT
+        LHLD    BDESC0+BD_BSTAR
+        XCHG                    ; DE = base
+        LHLD    BDESC0+BD_GAPBG
+        DAD     D
+        DCX     H               ; HL = base+GAPBG-1 (highest source byte)
+        SHLD    GBNSRC
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D
+        DCX     H               ; HL = base+GAPEN-1 (highest dest byte)
+        SHLD    GBNDST
+        LHLD    GBNCNT
+        MOV     B,H
+        MOV     C,L             ; BC = count
+        LHLD    GBNDST
+        XCHG                    ; DE = dst
+        LHLD    GBNSRC          ; HL = src
+GBAKN_L:
+        MOV     A,M             ; copy backward (dst > src, no overlap hazard)
+        STAX    D
+        DCX     H
+        DCX     D
+        DCX     B
+        MOV     A,B
+        ORA     C
+        JNZ     GBAKN_L
+        LHLD    GBNCNT
+        XCHG                    ; DE = cnt
+        LHLD    BDESC0+BD_GAPBG
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A
+        SHLD    BDESC0+BD_GAPBG
+        SHLD    BDESC0+BD_CSOFF
+        LHLD    BDESC0+BD_GAPEN
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A
+        SHLD    BDESC0+BD_GAPEN
+        RET
+
+;------------------------------------------------------------
+; GBMLNS - move cursor to the START of the current line (just after the
+; previous line's LF, or BOB).  Does not cross to the previous line.
+; Scans R1 backward for the bound, then moves left in ONE block (GBBAKN).
+;------------------------------------------------------------
+GBMLNS:
+        LHLD    BDESC0+BD_BSTAR
+        XCHG                    ; DE = base (lower bound)
+        LHLD    BDESC0+BD_GAPBG
+        DAD     D               ; HL = base+GAPBG = cursor (R1 end, exclusive)
+        LXI     B,0             ; BC = content bytes before the cursor on this line
+MLNS_LP:
+        MOV     A,H
+        CMP     D
+        JNZ     MLNS_NE
+        MOV     A,L
+        CMP     E
+        JZ      MLNS_DN         ; reached base -> line start is BOB
+MLNS_NE:
+        DCX     H               ; the byte just before the (scan) cursor
+        MOV     A,M
+        CPI     LF
+        JZ      MLNS_DN         ; previous byte is LF -> already at line start
+        INX     B               ; content byte on this line
+        JMP     MLNS_LP
+MLNS_DN:
+        JMP     GBBAKN          ; move left BC bytes in one block
+
+;------------------------------------------------------------
+; GBMLNE - move cursor to the END of the current line: the position just
+; before the line break (R2[0] = CR-of-CRLF, or bare LF, or EOB).  The
+; last content byte ends R1.  Does not cross to the next line.
+; Scans R2 forward for the break, then moves right in ONE block (GBADVN).
+;------------------------------------------------------------
+GBMLNE:
+        LHLD    BDESC0+BD_BSTAR
+        XCHG                    ; DE = base
+        LHLD    BDESC0+BD_BSIZE
+        DAD     D               ; HL = base+BSIZE (R2 end)
+        PUSH    H               ; save end
+        LHLD    BDESC0+BD_GAPEN
+        DAD     D               ; HL = base+GAPEN = cursor (scan ptr); DE = base
+        POP     D               ; DE = R2 end (loop invariant)
+        LXI     B,0             ; BC = content bytes from cursor to the break
+MLNE_LP:
+        MOV     A,H             ; scan == end?  (EOB)
+        CMP     D
+        JNZ     MLNE_NE
+        MOV     A,L
+        CMP     E
+        JZ      MLNE_DN
+MLNE_NE:
+        MOV     A,M
+        CPI     LF
+        JZ      MLNE_DN         ; bare LF -> EOL
+        CPI     CR
+        JNZ     MLNE_CON        ; ordinary content
+        ; CR: a line break only if the next byte is LF
+        INX     H               ; scan+1
+        MOV     A,H
+        CMP     D
+        JNZ     MLNE_PK
+        MOV     A,L
+        CMP     E
+        JZ      MLNE_LCR        ; CR is the final byte -> lone CR is content
+MLNE_PK:
+        MOV     A,M
+        CPI     LF
+        JZ      MLNE_CRLF       ; CR,LF -> stop ON the CR
+        ; lone CR: count it (already at scan+1) and continue
+MLNE_LCR:
+        INX     B
+        JMP     MLNE_LP
+MLNE_CRLF:
+        DCX     H               ; back onto the CR (the stop position)
+        JMP     MLNE_DN
+MLNE_CON:
+        INX     H
+        INX     B
+        JMP     MLNE_LP
+MLNE_DN:
+        JMP     GBADVN          ; move right BC bytes in one block
+
+;------------------------------------------------------------
+; GBMVTOP - move the cursor to the very top of the buffer (offset 0) by a
+; single backward block move of R1 to just before R2.  Resets TOPLN, CSROW,
+; CSCOL = 0.  (Used after a bulk load that appended all text into R1.)
+;------------------------------------------------------------
+GBMVTOP:
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = GAPBG = N
+        MOV     A,H
+        ORA     L
+        JZ      GMT_POS         ; R1 empty -> already at top
+        SHLD    GMTCNT
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        SHLD    GMTBAS          ; base
+        XCHG                    ; DE = base
+        LHLD    GMTCNT
+        DAD     D
+        DCX     H
+        SHLD    GMTSRC          ; src end = base + N - 1
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG                    ; DE = GAPEN
+        LHLD    GMTBAS
+        DAD     D
+        DCX     H               ; dest end = base + GAPEN - 1
+        XCHG                    ; DE = dest end
+        LHLD    GMTCNT
+        MOV     B,H
+        MOV     C,L             ; BC = N
+        LHLD    GMTSRC          ; HL = src end
+GMT_CLP:
+        MOV     A,M
+        STAX    D
+        DCX     H
+        DCX     D
+        DCX     B
+        MOV     A,B
+        ORA     C
+        JNZ     GMT_CLP
+        ; GAPEN -= N
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG                    ; DE = GAPEN
+        LHLD    GMTCNT
+        MOV     A,E
+        SUB     L
+        MOV     L,A
+        MOV     A,D
+        SBB     H
+        MOV     H,A             ; HL = GAPEN - N
+        MVI     A,BD_GAPEN
+        CALL    GBSTHW
+        LXI     H,0
+        MVI     A,BD_GAPBG
+        CALL    GBSTHW
+        LXI     H,0
+        MVI     A,BD_CSOFF
+        CALL    GBSTHW
+GMT_POS:
+        LXI     H,0
+        MVI     A,BD_TOPLN
+        CALL    GBSTHW
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MVI     M,0
+        MVI     A,BD_CSCOL
+        CALL    BDFLD
+        MVI     M,0
+        RET
+
+;------------------------------------------------------------
+; CMPHD - compare HL with DE.  Z set if HL == DE.
+; Clobbers A only; preserves BC, DE, HL.
+;------------------------------------------------------------
+CMPHD:
+        MOV     A,H
+        CMP     D
+        RNZ
+        MOV     A,L
+        CMP     E
+        RET
+
+;------------------------------------------------------------
+; GBGETLN - copy the VISIBLE bytes of the current line into a buffer.
+; The cursor is NOT moved.  Verbatim display rule (VI.INC): the trailing
+; CR,LF (or bare LF) is excluded; a CR not immediately before an LF is
+; ordinary content and IS copied.
+;
+; Entry: DE = destination buffer, B = max bytes to copy
+; Exit:  B = number of bytes copied; A,C,D,E,H,L clobbered
+;------------------------------------------------------------
+GBGETLN:
+        XCHG                    ; HL = dest
+        SHLD    GGLWP
+        MOV     A,B
+        STA     GGLMAX
+        XRA     A
+        STA     GGLCNT
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        SHLD    GGLBAS
+        ; ----- R1 portion: from line start to base+GAPBG-1 -----
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = GAPBG
+        MOV     A,H
+        ORA     L
+        JZ      GGLR2           ; R1 empty -> no before-cursor content
+        XCHG                    ; DE = GAPBG
+        LHLD    GGLBAS
+        DAD     D               ; HL = base+GAPBG = r1end (exclusive)
+        SHLD    GGLR1E
+        XCHG                    ; DE = r1end (scan cursor)
+        ; scan backward for the LF that ends the previous line
+GGLSB:
+        DCX     D
+        LDAX    D
+        CPI     LF
+        JZ      GGLSBF          ; found previous LF
+        LHLD    GGLBAS
+        CALL    CMPHD           ; cur (DE) == base (HL)?
+        JNZ     GGLSB
+        XCHG                    ; HL = base = line start
+        JMP     GGLR1C
+GGLSBF:
+        XCHG                    ; HL = cur (the LF)
+        INX     H               ; line start = byte after the LF
+GGLR1C:
+        ; copy [HL(start) .. GGLR1E)  -- pure content, no LF here
+        PUSH    H
+        LHLD    GGLR1E
+        XCHG                    ; DE = r1end
+        POP     H               ; HL = cur
+GGLR1L:
+        CALL    CMPHD           ; cur == r1end?
+        JZ      GGLR2
+        MOV     A,M
+        CALL    GGLPUT
+        INX     H
+        JMP     GGLR1L
+        ; ----- R2 portion: from base+GAPEN, stop at line break -----
+GGLR2:
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG
+        LHLD    GGLBAS
+        DAD     D               ; HL = base+GAPEN (cur)
+        PUSH    H
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW
+        XCHG
+        LHLD    GGLBAS
+        DAD     D               ; HL = base+BSIZE
+        SHLD    GGLR2E
+        POP     H               ; HL = cur
+GGLR2L:
+        PUSH    H
+        LHLD    GGLR2E
+        XCHG                    ; DE = r2end
+        POP     H               ; HL = cur
+        CALL    CMPHD           ; cur == r2end (end of buffer)?
+        JZ      GGLDONE
+        MOV     A,M
+        CPI     LF
+        JZ      GGLDONE         ; bare LF -> end of line
+        CPI     CR
+        JNZ     GGLR2PS         ; ordinary content
+        ; CR: end-of-line only if the next byte is LF
+        PUSH    H
+        INX     H               ; cur+1
+        CALL    CMPHD           ; cur+1 == r2end?  (DE still r2end)
+        JZ      GGLCRC          ; lone CR at end -> content
+        MOV     A,M
+        CPI     LF
+        JZ      GGLCREO         ; CR,LF -> stop, exclude CR
+GGLCRC:
+        POP     H               ; restore cur
+        MVI     A,CR            ; lone CR is content
+        JMP     GGLR2PS
+GGLCREO:
+        POP     H
+        JMP     GGLDONE
+GGLR2PS:
+        CALL    GGLPUT          ; A = content byte
+        INX     H
+        JMP     GGLR2L
+GGLDONE:
+        LDA     GGLCNT
+        MOV     B,A
+        RET
+
+;------------------------------------------------------------
+; GGLPUT - append A to the GBGETLN output if not yet at GGLMAX.
+; Preserves BC, DE, HL.
+;------------------------------------------------------------
+GGLPUT:
+        PUSH    H
+        PUSH    D
+        PUSH    PSW
+        LDA     GGLCNT
+        MOV     E,A
+        LDA     GGLMAX
+        CMP     E               ; MAX - CNT: Z when full
+        JZ      GGLP_X
+        LHLD    GGLWP
+        POP     PSW
+        PUSH    PSW
+        MOV     M,A
+        INX     H
+        SHLD    GGLWP
+        LDA     GGLCNT
+        INR     A
+        STA     GGLCNT
+GGLP_X:
+        POP     PSW
+        POP     D
+        POP     H
+        RET
+
+        CSEG
+GBNCNT: DW      0               ; GBADVN/GBBAKN: block-move byte count
+GBNSRC: DW      0               ; GBADVN/GBBAKN: source pointer
+GBNDST: DW      0               ; GBADVN/GBBAKN: destination pointer
+GMTCNT: DW      0               ; GBMVTOP: byte count (= GAPBG)
+GMTBAS: DW      0               ; GBMVTOP: buffer base
+GMTSRC: DW      0               ; GBMVTOP: source-end pointer
+GGLWP:  DW      0               ; GBGETLN: dest write pointer
+GGLBAS: DW      0               ; GBGETLN: buffer base
+GGLR1E: DW      0               ; GBGETLN: R1 end (base+GAPBG)
+GGLR2E: DW      0               ; GBGETLN: R2 end (base+BSIZE)
+GGLMAX: DB      0               ; GBGETLN: max bytes
+GGLCNT: DB      0               ; GBGETLN: bytes copied so far
+
+        END

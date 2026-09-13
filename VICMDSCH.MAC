@@ -1,0 +1,870 @@
+;============================================================
+; FILE:    VICMDSCH.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  find-char (f F t T ; ,), window/word search, fast literal search, %
+;------------------------------------------------------------
+; Split out of VICMD.MAC -- see DESIGN.md / build_vi.py link order.
+;============================================================
+        INCLUDE VI.INC
+        PUBLIC  VCBIGF, VCBIGN, VCBIGT, VC_COMMA, VC_F, VC_HASH
+        PUBLIC  VC_N, VC_PCT, VC_QM, VC_SEMI, VC_SLASH, VC_STAR
+        PUBLIC  VC_TT
+        EXTRN   BCONIN, FCCHR, FCDIR, FCSAV, FCTYP, GBCSOF
+        EXTRN   GBLDHW, GBMVLT, GBMVRT, GBPKLT, GBPKRT, GCLR
+        EXTRN   GOTOPOS, LBJ, OUTCHR, PDECC, PDEPTH, PDIR
+        EXTRN   PINCC, PKRTF, PSP, RDPCH, SBHLDE, SCANP
+        EXTRN   SCBASE, SCGAPB, SCR1E, SCR2E, SCR2S, SCTXE
+        EXTRN   SETDRTY, SHITBOT, SHITTOP, SNOTPFX, SRCBUF, SRCDIR
+        EXTRN   SRCH0, SRCLEN, STARLEN, STARSAV, STARWP, STATBUF
+        EXTRN   STATCLR, STATHOME, STATMSG, SWRAPF, WSTART
+        CSEG
+;============================================================
+; f{c} F{c} t{c} T{c} ; , - find a char on the current line.
+;   f/F land ON the char; t/T land just before/after it.  FCDIR 1=fwd FFh=bck;
+;   FCTYP 0 = f/F, 1 = t/T.  ; repeats, , repeats in the opposite direction.
+;============================================================
+VC_F:   MVI     A,1
+        STA     FCDIR
+        XRA     A
+        STA     FCTYP
+        JMP     FREAD
+VCBIGF:
+        MVI     A,0FFH
+        STA     FCDIR
+        XRA     A
+        STA     FCTYP
+        JMP     FREAD
+VC_TT:  MVI     A,1
+        STA     FCDIR
+        MVI     A,1
+        STA     FCTYP
+        JMP     FREAD
+VCBIGT:
+        MVI     A,0FFH
+        STA     FCDIR
+        MVI     A,1
+        STA     FCTYP
+FREAD:                          ; read and remember the target char
+        CALL    BCONIN
+        STA     FCCHR
+        JMP     FCEXE
+VC_SEMI:                        ; repeat last f/F/t/T as-is
+        JMP     FCEXE
+VC_COMMA:                       ; repeat in the opposite direction (one-shot)
+        CALL    FLIPDIR
+        CALL    FCEXE
+        JMP     FLIPDIR
+
+FLIPDIR:
+        LDA     FCDIR
+        CPI     1
+        JNZ     FD_F
+        MVI     A,0FFH
+        STA     FCDIR
+        RET
+FD_F:   MVI     A,1
+        STA     FCDIR
+        RET
+
+FCEXE:
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    FCSAV           ; save for restore on a miss
+        LDA     FCDIR
+        CPI     1
+        JZ      FC_FWD
+;--- backward (F / T) ---
+FCB_LP:
+        CALL    GBPKLT
+        CPI     0FFH
+        JZ      FC_FAIL         ; start of buffer
+        CPI     LF
+        JZ      FC_FAIL         ; reached start of line
+        CALL    GBMVLT
+        CALL    GBPKRT          ; char now under the cursor
+        MOV     B,A
+        LDA     FCCHR
+        CMP     B
+        JNZ     FCB_LP
+        ; hit
+        LDA     FCTYP
+        ORA     A
+        JZ      FC_DONE         ; F: land on the char
+        CALL    GBMVRT          ; T: land just after it
+        JMP     FC_DONE
+;--- forward (f / t) ---
+FC_FWD:
+FCF_LP:
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      FC_FAIL
+        CPI     LF
+        JZ      FC_FAIL
+        CPI     CR
+        JZ      FC_FAIL
+        CALL    GBMVRT
+        CALL    GBPKRT          ; char now under the cursor
+        CPI     0FFH
+        JZ      FC_FAIL
+        CPI     LF
+        JZ      FC_FAIL
+        CPI     CR
+        JZ      FC_FAIL
+        MOV     B,A
+        LDA     FCCHR
+        CMP     B
+        JNZ     FCF_LP
+        LDA     FCTYP
+        ORA     A
+        JZ      FC_DONE         ; f: land on the char
+        CALL    GBMVLT          ; t: land just before it
+FC_DONE:
+        JMP     GCLR
+FC_FAIL:
+        MVI     A,BEL
+        CALL    OUTCHR
+        LHLD    FCSAV
+        CALL    GOTOPOS         ; cursor unchanged on a miss
+        RET
+
+;============================================================
+; / ? n N - search the resident window (in-memory) for a literal pattern.
+;   SRCDIR 1 = forward, 0FFh = backward.  Wraps once.  Cursor moves to the
+;   match start; "Pattern not found" otherwise.  (Whole-file search across the
+;   BEFORE/AFTER scratch is a later refinement -- DESIGN section 7.)
+;============================================================
+VC_SLASH:
+        MVI     A,'/'
+        CALL    RDPAT
+        JC      SRCH_CAN
+        MVI     A,1
+        STA     SRCDIR
+        JMP     DOSRCH
+VC_QM:  MVI     A,'?'
+        CALL    RDPAT
+        JC      SRCH_CAN
+        MVI     A,0FFH
+        STA     SRCDIR
+        JMP     DOSRCH
+VC_N:   LDA     SRCLEN
+        ORA     A
+        RZ                      ; no prior pattern
+        JMP     DOSRCH
+VCBIGN:
+        LDA     SRCLEN
+        ORA     A
+        RZ
+        CALL    FLIPSDIR
+        CALL    DOSRCH
+        JMP     FLIPSDIR        ; restore the stored direction
+SRCH_CAN:
+        CALL    STATCLR
+        JMP     SETDRTY
+
+FLIPSDIR:
+        LDA     SRCDIR
+        CPI     1
+        JNZ     FSD_F
+        MVI     A,0FFH
+        STA     SRCDIR
+        RET
+FSD_F:  MVI     A,1
+        STA     SRCDIR
+        RET
+
+DOSRCH:
+        LDA     SRCLEN
+        ORA     A
+        RZ                      ; empty pattern -> no-op
+        XRA     A
+        STA     SWRAPF          ; assume no wrap until a scan crosses the boundary
+        CALL    SHOWPAT         ; echo "/pattern" / "?pattern" on the status row
+        LDA     SRCDIR
+        CPI     1
+        JZ      SRCHFW
+        JMP     SRCHBK
+
+;--- SHOWPAT - status row: the prompt char ('/' fwd, '?' bck) + current pattern,
+;    shown via STATMSG so it persists for a cycle (this is the live search echo
+;    and the post-hit "still showing /pattern" of real vi).  Effective SRCDIR is
+;    used, so a reversed N repeat correctly flips '/' <-> '?'.
+SHOWPAT:
+        LXI     H,STATBUF
+        LDA     SRCDIR
+        CPI     1
+        MVI     A,'/'
+        JZ      SP_PC
+        MVI     A,'?'
+SP_PC:  MOV     M,A
+        INX     H
+        JMP     APPATZ          ; append SRCBUF[0..SRCLEN), NUL, then STATMSG
+
+;--- APPATZ - HL = dest in STATBUF.  Append the SRCLEN-byte pattern from SRCBUF,
+;    terminate with NUL, then show STATBUF on the status row (tail-calls STATMSG).
+APPATZ:
+        LXI     D,SRCBUF
+        LDA     SRCLEN
+        MOV     B,A
+APZ_LP: MOV     A,B
+        ORA     A
+        JZ      APZ_E
+        LDAX    D
+        MOV     M,A
+        INX     D
+        INX     H
+        DCR     B
+        JMP     APZ_LP
+APZ_E:  MVI     M,NUL
+        LXI     D,STATBUF
+        JMP     STATMSG
+
+;--- SCOPYZ - copy the NUL-terminated string at DE into HL.  Stops on (does not
+;    copy) the NUL; returns HL pointing at the slot where the NUL would go.
+SCOPYZ: LDAX    D
+        ORA     A
+        RZ
+        MOV     M,A
+        INX     D
+        INX     H
+        JMP     SCOPYZ
+
+;============================================================
+; * / # - search forward / backward for the word under (or after) the cursor.
+; The word ([A-Za-z0-9_]) is captured into SRCBUF as a literal pattern (no
+; word-boundary anchoring -- our search engine is literal), then the normal
+; forward/backward search runs from the word start (so it lands on the NEXT /
+; PREVIOUS occurrence, wrapping).
+;============================================================
+VC_STAR:
+        MVI     A,1
+        STA     SRCDIR
+        JMP     WRDSCH
+VC_HASH:
+        MVI     A,0FFH
+        STA     SRCDIR
+WRDSCH:
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    STARSAV         ; original cursor (restore if no word found)
+WS_SKIP:                        ; advance to the first word char at/after cursor
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      WS_NONE         ; end of buffer, no word
+        CALL    ISWORD
+        JNZ     WS_FOUND
+        CALL    GBMVRT
+        JMP     WS_SKIP
+WS_FOUND:                       ; step left to the start of the word
+        CALL    GBPKLT
+        CALL    ISWORD
+        JZ      WS_AT0
+        CALL    GBMVLT
+        JMP     WS_FOUND
+WS_AT0:
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    WSTART          ; word-start offset (search resumes here)
+        LXI     H,SRCBUF
+        SHLD    STARWP
+        XRA     A
+        STA     STARLEN
+WS_CAP:                         ; copy the word into SRCBUF (cursor walks to end)
+        CALL    GBPKRT
+        CALL    ISWORD
+        JZ      WS_CAPD
+        LDA     STARLEN
+        CPI     40
+        JNC     WS_CAPNX        ; pattern buffer full -> stop appending, keep walking
+        CALL    GBPKRT
+        LHLD    STARWP
+        MOV     M,A
+        INX     H
+        SHLD    STARWP
+        LDA     STARLEN
+        INR     A
+        STA     STARLEN
+WS_CAPNX:
+        CALL    GBMVRT
+        JMP     WS_CAP
+WS_CAPD:
+        LHLD    WSTART
+        CALL    GOTOPOS         ; cursor back to the word start
+        LDA     STARLEN
+        STA     SRCLEN
+        JMP     DOSRCH
+WS_NONE:
+        LHLD    STARSAV
+        CALL    GOTOPOS         ; no word -> restore the cursor
+        MVI     A,BEL
+        JMP     OUTCHR
+
+;--- ISWORD - A = char.  Return A=1 (NZ) if a word char [A-Za-z0-9_], else A=0
+;    (Z).  CY clear.  0FFh (EOB) and CR/LF/space classify as non-word.
+ISWORD:
+        CPI     '0'
+        JC      ISW_NO
+        CPI     '9'+1
+        JC      ISW_YES
+        CPI     'A'
+        JC      ISW_NO
+        CPI     'Z'+1
+        JC      ISW_YES
+        CPI     '_'
+        JZ      ISW_YES
+        CPI     'a'
+        JC      ISW_NO
+        CPI     'z'+1
+        JC      ISW_YES
+ISW_NO: XRA     A               ; not a word char (Z set)
+        RET
+ISW_YES:MVI     A,1
+        ORA     A               ; set flags (NZ)
+        RET
+
+;============================================================
+; Fast literal search (physical-pointer scan).  The descriptor fields are
+; constant during a search, so SRCHSET caches the two text runs as raw pointers
+; ONCE; the scan then walks memory directly (CMP M / INX H) with a cheap
+; first-byte gate before the full PMATCH compare -- ~40x the old per-byte
+; logical->physical reconversion (LBYTE).  A hit's physical pointer is mapped
+; back to a logical offset (PH2LOG) only on success.
+;   R1 (before gap): [base,  SCR1E)   logical [0, GAPBG)
+;   R2 (at/after):   [SCR2S, SCR2E)   logical [GAPBG, TXEND)
+;============================================================
+SRCHSET:
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        SHLD    SCBASE
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW
+        SHLD    SCGAPB
+        XCHG                    ; DE = GAPBG
+        LHLD    SCBASE
+        DAD     D               ; base + GAPBG
+        SHLD    SCR1E
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG                    ; DE = GAPEN
+        LHLD    SCBASE
+        DAD     D               ; base + GAPEN = R2 start
+        SHLD    SCR2S
+        MVI     A,BD_TXEND
+        CALL    GBLDHW
+        SHLD    SCTXE
+        XCHG                    ; DE = TXEND
+        LHLD    SCGAPB
+        MOV     A,E
+        SUB     L
+        MOV     C,A
+        MOV     A,D
+        SBB     H
+        MOV     B,A             ; BC = TXEND - GAPBG = R2 length
+        LHLD    SCR2S
+        MOV     A,L
+        ADD     C
+        MOV     L,A
+        MOV     A,H
+        ADC     B
+        MOV     H,A             ; SCR2S + R2len = R2 end
+        SHLD    SCR2E
+        RET
+
+; LOG2PH - DE = logical offset -> HL = physical pointer.  (BC preserved.)
+LOG2PH:
+        LHLD    SCGAPB
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H
+        JNC     L2P_R2          ; L >= GAPBG -> R2
+        LHLD    SCBASE
+        DAD     D               ; base + L
+        RET
+L2P_R2:
+        LHLD    SCGAPB
+        XCHG                    ; HL = L, DE = GAPBG
+        CALL    SBHLDE          ; HL = HL - DE
+        XCHG                    ; DE = L - GAPBG
+        LHLD    SCR2S
+        DAD     D               ; SCR2S + (L - GAPBG)
+        RET
+
+; PH2LOG - HL = physical pointer -> HL = logical offset.
+PH2LOG:
+        XCHG                    ; DE = P
+        LHLD    SCR1E
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H
+        JNC     P2L_R2          ; P >= SCR1E -> R2
+        LHLD    SCBASE
+        XCHG                    ; DE = base, HL = P
+        CALL    SBHLDE          ; HL = HL - DE
+        RET
+P2L_R2:
+        LHLD    SCR2S
+        XCHG                    ; DE = SCR2S, HL = P
+        CALL    SBHLDE          ; HL = HL - DE
+        XCHG                    ; DE = P - SCR2S
+        LHLD    SCGAPB
+        DAD     D               ; GAPBG + (P - SCR2S)
+        RET
+
+; PMATCH - compare SRCBUF[0..SRCLEN) against the text starting at physical HL,
+; walking the gap (SCR1E -> SCR2S), stopping at SCR2E.  CY clear = match.
+PMATCH:
+        LDA     SRCLEN
+        MOV     B,A             ; remaining
+        LXI     D,SRCBUF        ; DE = pattern ptr
+PM_LP:
+        MOV     A,B
+        ORA     A
+        JZ      PM_YES
+        LDA     SCR2E           ; end of text?
+        CMP     L
+        JNZ     PM_G
+        LDA     SCR2E+1
+        CMP     H
+        JZ      PM_NO           ; HL == SCR2E -> past end
+PM_G:
+        LDA     SCR1E           ; gap jump?
+        CMP     L
+        JNZ     PM_RD
+        LDA     SCR1E+1
+        CMP     H
+        JNZ     PM_RD
+        LHLD    SCR2S
+PM_RD:
+        MOV     C,M             ; text byte
+        LDAX    D               ; pattern byte
+        CMP     C
+        JNZ     PM_NO
+        INX     H
+        INX     D
+        DCR     B
+        JMP     PM_LP
+PM_YES:
+        ORA     A               ; clear CY
+        RET
+PM_NO:
+        STC
+        RET
+
+;--- forward search: scan (CSOFF, TXEND) then wrap [0, CSOFF] ---
+SRCHFW:
+        CALL    SRCHSET
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    SRCH0
+        XCHG                    ; DE = SRCH0
+        LHLD    SCTXE
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = TXEND - SRCH0
+        MOV     A,B
+        ORA     C
+        JZ      SFW_WRAP        ; cursor at end -> wrap
+        DCX     B               ; count1 = TXEND - SRCH0 - 1
+        MOV     A,B
+        ORA     C
+        JZ      SFW_WRAP
+        LHLD    SRCH0
+        INX     H
+        XCHG                    ; DE = SRCH0+1
+        CALL    LOG2PH          ; HL = P
+        MOV     D,B
+        MOV     E,C             ; DE = count1
+SFW1:
+        MOV     A,D
+        ORA     E
+        JZ      SFW_WRAP
+        DCX     D
+        LDA     SRCBUF
+        CMP     M               ; first byte gate
+        JNZ     SFW1_NX
+        PUSH    D
+        PUSH    H
+        CALL    PMATCH
+        POP     H
+        POP     D
+        JNC     SFW_HIT
+SFW1_NX:
+        INX     H
+        LDA     SCR1E
+        CMP     L
+        JNZ     SFW1
+        LDA     SCR1E+1
+        CMP     H
+        JNZ     SFW1
+        LHLD    SCR2S           ; gap jump
+        JMP     SFW1
+SFW_WRAP:
+        MVI     A,1
+        STA     SWRAPF          ; forward scan ran off the bottom -> wrapping to top
+        LHLD    SRCH0
+        INX     H
+        XCHG                    ; DE = count2 = SRCH0+1
+        LHLD    SCBASE          ; P = base (logical 0)
+SFW2:
+        MOV     A,D
+        ORA     E
+        JZ      SRCH_MISS
+        DCX     D
+        LDA     SRCBUF
+        CMP     M
+        JNZ     SFW2_NX
+        PUSH    D
+        PUSH    H
+        CALL    PMATCH
+        POP     H
+        POP     D
+        JNC     SFW_HIT
+SFW2_NX:
+        INX     H
+        LDA     SCR1E
+        CMP     L
+        JNZ     SFW2
+        LDA     SCR1E+1
+        CMP     H
+        JNZ     SFW2
+        LHLD    SCR2S
+        JMP     SFW2
+SFW_HIT:
+        CALL    PH2LOG
+        SHLD    SCANP
+        JMP     SRCH_HIT
+
+;--- backward search: scan [0,CSOFF) downward then wrap (CSOFF,TXEND) down ---
+SRCHBK:
+        CALL    SRCHSET
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    SRCH0
+        MOV     A,H
+        ORA     L
+        JZ      SBK_WRAP        ; at offset 0 -> wrap
+        XCHG                    ; DE = SRCH0
+        MOV     B,D
+        MOV     C,E             ; BC = SRCH0 = count1
+        DCX     D               ; DE = SRCH0-1
+        CALL    LOG2PH          ; HL = P
+        MOV     D,B
+        MOV     E,C             ; DE = count1
+SBK1:
+        MOV     A,D
+        ORA     E
+        JZ      SBK_WRAP
+        DCX     D
+        LDA     SRCBUF
+        CMP     M
+        JNZ     SBK1_NX
+        PUSH    D
+        PUSH    H
+        CALL    PMATCH
+        POP     H
+        POP     D
+        JNC     SFW_HIT
+SBK1_NX:
+        LDA     SCR2S           ; P-- with backward gap jump (SCR2S -> SCR1E)
+        CMP     L
+        JNZ     SBK1_D
+        LDA     SCR2S+1
+        CMP     H
+        JNZ     SBK1_D
+        LHLD    SCR1E
+SBK1_D:
+        DCX     H
+        JMP     SBK1
+SBK_WRAP:
+        MVI     A,1
+        STA     SWRAPF          ; backward scan ran off the top -> wrapping to bottom
+        LHLD    SCTXE
+        MOV     A,H
+        ORA     L
+        JZ      SRCH_MISS       ; empty buffer
+        XCHG                    ; DE = TXEND
+        LHLD    SRCH0
+        MOV     A,E
+        SUB     L
+        MOV     C,A
+        MOV     A,D
+        SBB     H
+        MOV     B,A             ; BC = TXEND - SRCH0
+        DCX     B               ; count2 = TXEND - SRCH0 - 1
+        MOV     A,B
+        ORA     C
+        JZ      SRCH_MISS
+        LHLD    SCTXE
+        DCX     H
+        XCHG                    ; DE = TXEND-1
+        CALL    LOG2PH          ; HL = P
+        MOV     D,B
+        MOV     E,C             ; DE = count2
+SBK2:
+        MOV     A,D
+        ORA     E
+        JZ      SRCH_MISS
+        DCX     D
+        LDA     SRCBUF
+        CMP     M
+        JNZ     SBK2_NX
+        PUSH    D
+        PUSH    H
+        CALL    PMATCH
+        POP     H
+        POP     D
+        JNC     SFW_HIT
+SBK2_NX:
+        LDA     SCR2S
+        CMP     L
+        JNZ     SBK2_D
+        LDA     SCR2S+1
+        CMP     H
+        JNZ     SBK2_D
+        LHLD    SCR1E
+SBK2_D:
+        DCX     H
+        JMP     SBK2
+
+SRCH_HIT:
+        LHLD    SCANP
+        CALL    GOTOPOS         ; move cursor to the match; VADJ adjusts the view
+        ; No forced full redraw: the main loop's VADJ sees where the cursor
+        ; landed and does the cheapest update -- a same-page match is just a
+        ; CURPOS, one line off-screen scrolls one row, and only a far jump
+        ; raises DIRTY for a full repaint.
+        LDA     SWRAPF
+        ORA     A
+        JZ      SH_NOWRAP       ; no wrap -> leave the "/pattern" echo on the row
+        LDA     SRCDIR          ; wrapped: report which boundary we crossed
+        CPI     1
+        LXI     D,SHITBOT       ; forward: hit BOTTOM, continuing at TOP
+        JZ      SH_MSG
+        LXI     D,SHITTOP       ; backward: hit TOP, continuing at BOTTOM
+SH_MSG: JMP     STATMSG
+SH_NOWRAP:
+        RET                     ; SHOWPAT's echo (STMSGF=1) stays up
+SRCH_MISS:
+        LXI     H,STATBUF       ; compose "Pattern not found: <pattern>"
+        LXI     D,SNOTPFX
+        CALL    SCOPYZ
+        JMP     APPATZ
+
+;--- LBYTE - HL = logical offset; exit A = byte there, CY clear; CY set if the
+;    offset is past the end of the resident text.
+LBYTE:
+        SHLD    LBJ
+        MVI     A,BD_TXEND
+        CALL    GBLDHW
+        XCHG                    ; DE = TXEND
+        LHLD    LBJ
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JNC     LB_EOF          ; j >= TXEND
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW
+        XCHG                    ; DE = GAPBG
+        LHLD    LBJ
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JC      LB_R1           ; j < GAPBG (in R1)
+        ; R2: offset = GAPEN + (j - GAPBG)
+        LHLD    LBJ
+        CALL    SBHLDE          ; HL = HL - DE
+        PUSH    H
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        POP     D               ; DE = j - GAPBG
+        DAD     D               ; HL = GAPEN + (j-GAPBG)
+        JMP     LB_ADDR
+LB_R1:
+        LHLD    LBJ             ; offset = j
+LB_ADDR:
+        PUSH    H
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        POP     D               ; DE = offset
+        DAD     D               ; HL = base + offset
+        MOV     A,M
+        ORA     A               ; clear CY
+        RET
+LB_EOF:
+        STC
+        RET
+
+;--- RDPAT - read a search pattern into SRCBUF.  Entry A = prompt char.
+;    Exit: CY clear = search (SRCLEN/SRCBUF set, or kept from the last search on
+;    a bare CR that reuses the previous pattern -- vi's "/<CR>").  CY set =
+;    cancel (ESC, BS past the prompt, or a bare CR with no previous pattern).
+RDPAT:
+        STA     RDPCH
+        CALL    STATHOME        ; clear status row, home cursor to it
+        LDA     RDPCH
+        CALL    OUTCHR
+        LXI     H,SRCBUF
+        MVI     C,0
+RP_LP:
+        PUSH    B
+        PUSH    H
+        CALL    BCONIN
+        POP     H
+        POP     B
+        CPI     CR
+        JZ      RP_DONE
+        CPI     BS
+        JZ      RP_BS
+        CPI     DEL
+        JZ      RP_BS
+        CPI     ESC
+        JZ      RP_CAN
+        MOV     B,A             ; candidate char
+        MOV     A,C
+        CPI     40
+        JNC     RP_FULL         ; buffer full: bell, ignore
+        MOV     A,B
+        MOV     M,A
+        INX     H
+        INR     C
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        JMP     RP_LP
+RP_FULL:
+        MVI     A,BEL
+        CALL    OUTCHR
+        JMP     RP_LP
+RP_BS:
+        MOV     A,C
+        ORA     A
+        JZ      RP_CAN           ; BS past the prompt cancels the search
+        DCX     H
+        DCR     C
+        PUSH    B               ; OUTCHR clobbers B,C,H,L -- save the count/ptr
+        PUSH    H
+        MVI     A,BS
+        CALL    OUTCHR
+        MVI     A,' '
+        CALL    OUTCHR
+        MVI     A,BS
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        JMP     RP_LP
+RP_DONE:
+        MOV     A,C
+        ORA     A
+        JZ      RP_REUSE        ; bare CR -> reuse the previous pattern (if any)
+        STA     SRCLEN          ; A = C (new pattern length)
+        RET                     ; CY clear -> search the freshly typed pattern
+RP_REUSE:
+        LDA     SRCLEN          ; keep the previous SRCLEN/SRCBUF untouched; with
+        ORA     A               ; no prior pattern, cancel so the stray prompt
+        JZ      RP_CAN          ; char gets cleared (vi does nothing)
+        RET                     ; CY clear (A nonzero) -> search the last pattern
+RP_CAN:
+        STC
+        RET
+
+;============================================================
+; % - jump to the matching bracket.  Scans the resident window via LBYTE,
+; tracking nesting depth.  ( ) [ ] { }.  BEL if not on a bracket / no match.
+;============================================================
+VC_PCT:
+        CALL    GBPKRT
+        CPI     '('
+        JZ      P_OP1
+        CPI     '['
+        JZ      P_OP2
+        CPI     '{'
+        JZ      P_OP3
+        CPI     ')'
+        JZ      P_CL1
+        CPI     ']'
+        JZ      P_CL2
+        CPI     '}'
+        JZ      P_CL3
+        MVI     A,BEL           ; not on a bracket
+        JMP     OUTCHR
+P_OP1:  MVI     A,'('
+        STA     PINCC
+        MVI     A,')'
+        JMP     P_FWD
+P_OP2:  MVI     A,'['
+        STA     PINCC
+        MVI     A,']'
+        JMP     P_FWD
+P_OP3:  MVI     A,'{'
+        STA     PINCC
+        MVI     A,'}'
+P_FWD:  STA     PDECC
+        MVI     A,1
+        STA     PDIR
+        JMP     PSCAN
+P_CL1:  MVI     A,')'
+        STA     PINCC
+        MVI     A,'('
+        JMP     P_BCK
+P_CL2:  MVI     A,']'
+        STA     PINCC
+        MVI     A,'['
+        JMP     P_BCK
+P_CL3:  MVI     A,'}'
+        STA     PINCC
+        MVI     A,'{'
+P_BCK:  STA     PDECC
+        MVI     A,0FFH
+        STA     PDIR
+PSCAN:
+        LXI     H,1
+        SHLD    PDEPTH          ; the bracket under the cursor counts as depth 1
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    PSP
+PSC_LP:
+        LDA     PDIR
+        CPI     1
+        JZ      PSC_FW
+        LHLD    PSP             ; backward
+        MOV     A,H
+        ORA     L
+        JZ      PSC_FAIL
+        DCX     H
+        SHLD    PSP
+        JMP     PSC_CHK
+PSC_FW: LHLD    PSP
+        INX     H
+        SHLD    PSP
+PSC_CHK:
+        LHLD    PSP
+        CALL    LBYTE
+        JC      PSC_FAIL
+        MOV     B,A
+        LDA     PINCC
+        CMP     B
+        JZ      PSC_INC
+        LDA     PDECC
+        CMP     B
+        JZ      PSC_DEC
+        JMP     PSC_LP
+PSC_INC:
+        LHLD    PDEPTH
+        INX     H
+        SHLD    PDEPTH
+        JMP     PSC_LP
+PSC_DEC:
+        LHLD    PDEPTH
+        DCX     H
+        SHLD    PDEPTH
+        MOV     A,H
+        ORA     L
+        JNZ     PSC_LP
+        LHLD    PSP             ; depth 0 -> the match
+        CALL    GOTOPOS
+        JMP     SETDRTY
+PSC_FAIL:
+        MVI     A,BEL
+        JMP     OUTCHR
+
+        END

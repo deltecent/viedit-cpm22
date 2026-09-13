@@ -1,0 +1,1636 @@
+;============================================================
+; FILE:    VISCREEN.MAC
+; PROJECT: VIEDIT (viedit/) -- vi-style CP/M editor
+; MODULE:  VT100 output, screen redraw, horizontal scroll
+;------------------------------------------------------------
+; Ported from ../viedit/VESCREEN.MAC onto the viedit VIBUF descriptor.
+; Differences from the reference:
+;   * INCLUDE VI.INC (not VE.INC).
+;   * This module OWNS the screen-engine state and geometry (DIRTY,
+;     DRTLINE, HSCROL, NROWS/NCOLS/NEDIT/NSTAT + derived) and the BIOS
+;     output primitive BCONOUT, exporting them PUBLIC.  VI.MAC (Phase 4)
+;     sets the geometry at startup; until then the defaults below stand.
+;   * OUTBOTLN is deferred: it needs line-movement primitives (GBMVDN/
+;     GBMVUP) that the boundary layer has not exposed yet.  It is wired in
+;     with the dd/ESC[M command path in Phase 4.
+;
+; Screen layout (defaults; runtime-configurable via the geometry vars):
+;   Rows 1..EDITROW  edit area  (CSROW 0..EDITROW-1, terminal row CSROW+1)
+;   Row  STATROW     status / ex / search / startup banner
+;
+; VT100 cursor addressing: ESC [ row ; col H  (1-based)
+; Erase to end of line:    ESC [ K
+;
+; Horizontal scroll:
+;   HSCROL = byte offset of first visible column (0 = no scroll).
+;   AUTOSCR adjusts HSCROL so cursor column (CSCOL) is visible.
+;   SCRDRAW and SCREDCL skip the first HSCROL bytes of each line.
+;   Tab expansion is NOT performed; raw bytes are shown.
+;
+; Virtual reader (VRD_INIT / VRD_NEXT):
+;   Reads R1+R2 as a contiguous byte stream WITHOUT moving the gap
+;   cursor.  SCRDRAW renders text through it, so a redraw touches only
+;   resident RAM -- it never triggers disk I/O (DESIGN 6.4 / 11.B).
+;------------------------------------------------------------
+; EXPORTS: SCRDRAW SCREDCL SCRLNE AUTOSCR CURPOS SHOWMOD
+;          STATMSG STATCLR OUTSTR OUTCHR GOTOXY OUTN16 PRFNAM
+;          OUTICH OUTINSLN OUTDELLN STSTART BCONOUT
+;          DIRTY DRTLINE HSCROL NROWS NCOLS NEDIT NSTAT
+;          NEDITM NEDITP NCOLSM NCOLSP RDONLY
+;============================================================
+        INCLUDE VI.INC
+
+        EXTRN   CURBDP          ; active descriptor ptr (VI.MAC / stub)
+        EXTRN   BDFLD           ; VIBUF -- field-address helper
+        EXTRN   GBGETLN         ; VIBUF -- copy current line text
+        EXTRN   GBLDHW          ; VIBUF -- load a 16-bit descriptor field
+
+        PUBLIC  SCRDRAW, SCREDCL, AUTOSCR, CURPOS, SHOWMOD
+        PUBLIC  STATMSG, STATCLR, OUTSTR, OUTCHR, GOTOXY, OUTN16, PRFNAM
+        PUBLIC  OUTICH, OUTINSLN, OUTDELLN, STSTART
+        PUBLIC  SCRLUPN, SCRLDNN, OUTBOTLN, OUTDLBL
+        PUBLIC  SCREDAT               ; multi-line put (O-style draw at a row)
+        PUBLIC  SCRLNE, FASTOP, FASTCH, FASTN
+        PUBLIC  HELPSC
+        PUBLIC  BCONOUT, BCONIN, BCONST
+        PUBLIC  DIRTY, DRTLINE, HSCROL
+        PUBLIC  NROWS, NCOLS, NEDIT, NSTAT
+        PUBLIC  NEDITM, NEDITP, NCOLSM, NCOLSP, RDONLY
+        PUBLIC  REPACT, CHGD, RECRST, REPCOMMIT, REPGO, REPMORE
+
+        CSEG
+
+;------------------------------------------------------------
+; BCONOUT - the console output primitive: tail-call BIOS CONOUT.
+; The warm-boot vector at 0001H = BIOS jump-table WBOOT entry (base+3);
+; CONOUT = WBOOT+9.  BIOS has no register contract, so callers that need
+; registers preserved save them (OUTCHR's callers do).
+; Entry: C = character.  Exit: all regs clobbered.
+;------------------------------------------------------------
+BCONOUT:
+        LHLD    1
+        LXI     D,9
+        DAD     D
+        PCHL
+
+;------------------------------------------------------------
+; BCONIN - blocking console input.  The single input chokepoint, so it also
+; drives the `.` repeat machinery:
+;   * when REPACT (replaying): return the next byte from RPLYBUF until drained,
+;     then fall through to real input;
+;   * otherwise read BIOS CONIN and (unless replaying) append the byte to RECBUF
+;     so the current command's keystrokes can be committed for `.`.
+; Exit: A = char (BIOS conIn parity-masks to 7-bit).
+;------------------------------------------------------------
+BCONIN:
+        LDA     REPACT
+        ORA     A
+        JZ      BCI_REAL
+        ; replaying: next RPLYBUF byte if any
+        LHLD    RPLYLEN
+        XCHG                    ; DE = len
+        LHLD    RPLYPOS         ; HL = pos
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JNC     BCI_REAL        ; pos >= len: drained -> real input
+        LXI     D,RPLYBUF
+        DAD     D               ; HL = RPLYBUF + pos
+        MOV     C,M
+        LHLD    RPLYPOS
+        INX     H
+        SHLD    RPLYPOS
+        MOV     A,C
+        RET
+BCI_REAL:
+        LHLD    1
+        LXI     D,6
+        DAD     D
+        CALL    BCI_GO          ; A = char from BIOS CONIN
+        STA     RECCH
+        LDA     REPACT
+        ORA     A
+        JNZ     BCI_DONE        ; don't record replayed input
+        LHLD    RECPOS          ; append to RECBUF if room (< RECMAX)
+        MOV     A,H
+        ORA     A
+        JNZ     BCI_DONE
+        LDA     RECPOS
+        CPI     RECMAX
+        JNC     BCI_DONE
+        LXI     D,RECBUF
+        DAD     D
+        LDA     RECCH
+        MOV     M,A
+        LHLD    RECPOS
+        INX     H
+        SHLD    RECPOS
+BCI_DONE:
+        LDA     RECCH
+        RET
+BCI_GO: PCHL                    ; HL = CONIN entry; RETs here with A = char
+
+;------------------------------------------------------------
+; Repeat (`.`) control API (state owned here since BCONIN is the chokepoint).
+;------------------------------------------------------------
+RECRST:                         ; start recording a fresh command
+        LXI     H,0
+        SHLD    RECPOS
+        RET
+REPCOMMIT:                      ; commit the recorded keys as the last change
+        LHLD    RECPOS
+        SHLD    RPLYLEN
+        MOV     B,L             ; RECPOS < RECMAX (128), fits a byte
+        MOV     A,B
+        ORA     A
+        RZ
+        LXI     H,RECBUF
+        LXI     D,RPLYBUF
+RPC_LP: MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     RPC_LP
+        RET
+REPGO:                          ; begin replaying the last change
+        LXI     H,0
+        SHLD    RPLYPOS
+        MVI     A,1
+        STA     REPACT
+        RET
+REPMORE:                        ; A=1 if replay has more bytes; else A=0 + stop
+        LHLD    RPLYLEN
+        XCHG
+        LHLD    RPLYPOS
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JC      RPM_YES         ; pos < len
+        XRA     A
+        STA     REPACT          ; drained: leave replay mode
+        XRA     A
+        RET
+RPM_YES:
+        MVI     A,1
+        RET
+
+;------------------------------------------------------------
+; BCONST - console status: tail-call BIOS CONST (= WBOOT+3).
+; Exit: A = FFH if a char is ready, A = 00H if not.  All regs clobbered.
+;------------------------------------------------------------
+BCONST:
+        LHLD    1
+        LXI     D,3
+        DAD     D
+        PCHL
+
+;------------------------------------------------------------
+; OUTCHR - write one character to the console.  Entry: A = char.
+;------------------------------------------------------------
+OUTCHR:
+        MOV     C,A
+        JMP     BCONOUT
+
+;------------------------------------------------------------
+; OUTSTR - write NUL-terminated string.  Entry: DE = address.
+;------------------------------------------------------------
+OUTSTR:
+        LDAX    D
+        ORA     A
+        RZ
+        PUSH    D
+        CALL    OUTCHR
+        POP     D
+        INX     D
+        JMP     OUTSTR
+
+;------------------------------------------------------------
+; OUTNUM8 - output 1-2 decimal digits, no leading zero.  A = value 0..99.
+;------------------------------------------------------------
+OUTNUM8:
+        MVI     B,'0'-1
+ON8LP:
+        INR     B
+        SUI     10
+        JNC     ON8LP
+        ADI     10
+        PUSH    PSW
+        MOV     A,B
+        CPI     '0'
+        JZ      ON8SK
+        CALL    OUTCHR
+ON8SK:
+        POP     PSW
+        ADI     '0'
+        CALL    OUTCHR
+        RET
+
+;------------------------------------------------------------
+; GOTOXY - position cursor (VT100 ESC [ row ; col H).
+; Entry: D = row (1-based); E = col (1-based).
+;------------------------------------------------------------
+GOTOXY:
+        PUSH    D
+        LXI     D,CSIPFX        ; "ESC["
+        CALL    OUTSTR
+        POP     D
+        PUSH    D
+        MVI     H,0
+        MOV     L,D             ; HL = row
+        CALL    OUTN16
+        MVI     A,';'
+        CALL    OUTCHR
+        POP     D
+        MVI     H,0
+        MOV     L,E             ; HL = col
+        CALL    OUTN16
+        MVI     A,'H'
+        CALL    OUTCHR
+        RET
+
+;------------------------------------------------------------
+; STATCLR - clear status row (col 1, erase to EOL).  Resets STMSGF.
+;------------------------------------------------------------
+STATCLR:
+        XRA     A
+        STA     STMSGF
+        LDA     NSTAT
+        MOV     D,A
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,KLSTR
+        JMP     OUTSTR
+
+;------------------------------------------------------------
+; STATMSG - display NUL-terminated message on the status row.
+; Sets STMSGF so INFOBAR preserves the message for one cycle.
+; Entry: DE = message address.
+;------------------------------------------------------------
+STATMSG:
+        PUSH    D
+        CALL    STATCLR
+        POP     D
+        MVI     A,1
+        STA     STMSGF
+        JMP     OUTSTR
+
+;------------------------------------------------------------
+; AUTOSCR - adjust HSCROL so cursor column (CSCOL) is visible.
+; Sets DIRTY if HSCROL changes.
+;------------------------------------------------------------
+AUTOSCR:
+        MVI     A,BD_CSCOL
+        CALL    BDFLD           ; HL = &BD_CSCOL
+        MOV     B,M             ; B = CSCOL
+
+        LDA     HSCROL
+        CMP     B               ; HSCROL - CSCOL
+        JC      AUS_RT          ; HSCROL < CSCOL
+        JZ      AUS_OK          ; HSCROL == CSCOL
+        ; HSCROL > CSCOL: scroll left
+        MOV     A,B
+        STA     HSCROL
+        JMP     AUS_DRT
+AUS_RT:
+        LDA     HSCROL
+        MOV     C,A
+        LDA     NCOLS
+        ADD     C               ; A = HSCROL + NCOLS
+        MOV     C,A
+        MOV     A,B             ; A = CSCOL
+        CMP     C               ; carry if CSCOL < HSCROL+NCOLS
+        JC      AUS_OK
+        ; CSCOL >= HSCROL+NCOLS: scroll right -> HSCROL = CSCOL-NCOLS+1
+        LDA     NCOLSM
+        MOV     C,A
+        MOV     A,B
+        SUB     C
+        STA     HSCROL
+AUS_DRT:
+        MVI     A,1
+        STA     DIRTY
+AUS_OK:
+        RET
+
+;------------------------------------------------------------
+; CURPOS - position hardware cursor to BD_CSROW / BD_CSCOL.
+; Terminal row = CSROW + 1; screen col = CSCOL - HSCROL + 1 (1-based).
+; Assumes AUTOSCR has run (HSCROL <= CSCOL < HSCROL+NCOLS).
+;------------------------------------------------------------
+CURPOS:
+        MVI     A,BD_CSROW
+        CALL    BDFLD           ; HL = &BD_CSROW
+        MOV     C,M             ; C = CSROW
+        INX     H               ; HL = &BD_CSCOL
+        MOV     B,M             ; B = CSCOL
+        MOV     A,C
+        ADI     1
+        MOV     D,A             ; D = terminal row
+        LDA     HSCROL
+        MOV     C,A
+        MOV     A,B
+        SUB     C               ; CSCOL - HSCROL
+        INR     A               ; +1 (1-based)
+        MOV     E,A             ; E = screen col
+        JMP     GOTOXY
+
+;------------------------------------------------------------
+; SHOWMOD - write a mode indicator to the status row.
+; Entry: DE = NUL-terminated mode string (or 0 to just clear).
+;------------------------------------------------------------
+SHOWMOD:
+        PUSH    D
+        CALL    STATCLR
+        POP     D
+        MOV     A,D
+        ORA     E
+        RZ
+        JMP     OUTSTR
+
+;------------------------------------------------------------
+; PRFNAM - print filename from BD_FNAME ([DRIVE:]NAME[.EXT]).
+;------------------------------------------------------------
+PRFNAM:
+        LHLD    CURBDP
+        LXI     D,BD_FNAME+1
+        DAD     D
+        MOV     A,M
+        ORA     A
+        JZ      PFN_NOFIL
+        LHLD    CURBDP
+        LXI     D,BD_FNAME
+        DAD     D               ; HL = &drive byte
+        MOV     A,M
+        ORA     A
+        JZ      PFN_NM
+        PUSH    H
+        DCR     A
+        ADI     'A'
+        CALL    OUTCHR
+        MVI     A,':'
+        CALL    OUTCHR
+        POP     H
+PFN_NM:
+        INX     H               ; HL = &name[0]
+        MVI     B,8
+PFN_NL:
+        MOV     A,M
+        ORA     A
+        JZ      PFN_EX
+        CPI     ' '
+        JZ      PFN_EX
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     PFN_NL
+PFN_EX:
+        LHLD    CURBDP
+        LXI     D,BD_FNAME+9
+        DAD     D
+        MOV     A,M
+        ORA     A
+        RZ
+        CPI     ' '
+        RZ
+        PUSH    H
+        MVI     A,'.'
+        CALL    OUTCHR
+        POP     H
+        MVI     B,3
+PFN_EL:
+        MOV     A,M
+        ORA     A
+        RZ
+        CPI     ' '
+        RZ
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     PFN_EL
+        RET
+PFN_NOFIL:
+        LXI     D,NOFNSTR
+        JMP     OUTSTR
+
+;============================================================
+; VRD_INIT - initialise the virtual reader at the start of TOPLN.
+; Sets VPTR, VEND1, VRDGAP, VEND2; skips TOPLN LFs.
+;============================================================
+VRD_INIT:
+        MVI     A,BD_BSTAR
+        CALL    VLFLD
+        SHLD    VRBASE
+        MVI     A,BD_GAPBG
+        CALL    VLFLD
+        PUSH    H
+        LHLD    VRBASE
+        POP     D
+        DAD     D               ; base + GAPBG
+        SHLD    VEND1
+        MVI     A,BD_GAPEN
+        CALL    VLFLD
+        PUSH    H
+        LHLD    VRBASE
+        POP     D
+        DAD     D               ; base + GAPEN
+        SHLD    VRDGAP
+        MVI     A,BD_BSIZE
+        CALL    VLFLD
+        PUSH    H
+        LHLD    VRBASE
+        POP     D
+        DAD     D               ; base + BSIZE
+        SHLD    VEND2
+        LHLD    VRBASE
+        SHLD    VPTR
+        ; --- seek to the top-of-screen line: scan BACK from the cursor ---
+        ; All text before the cursor is contiguous in R1 (the gap is AT the
+        ; cursor), so the top visible line is the start of the line CSROW rows
+        ; above the cursor = just after the (CSROW+1)th linefeed going back.
+        ; Bounded by CSROW (<= NEDIT), so a redraw near the bottom of a big
+        ; resident file no longer rescans the whole buffer (O(screen), not
+        ; O(TOPLN)).  Lands on the same line the old forward TOPLN-skip did,
+        ; since CSROW = winline - TOPLN.
+        MVI     A,BD_CSROW
+        CALL    VLFLD
+        MOV     A,L
+        INR     A               ; (CSROW + 1) linefeeds to find going back
+        MOV     C,A
+        LHLD    VEND1           ; HL = base + GAPBG = cursor (end of R1)
+VRDI_BK:
+        XCHG                    ; DE = ptr
+        LHLD    VRBASE          ; HL = base
+        MOV     A,E
+        SUB     L
+        MOV     B,A
+        MOV     A,D
+        SBB     H
+        ORA     B
+        JZ      VRDI_TOP        ; reached buffer start -> top = base
+        XCHG                    ; HL = ptr
+        DCX     H
+        MOV     A,M
+        CPI     LF
+        JNZ     VRDI_BK
+        DCR     C
+        JNZ     VRDI_BK
+        INX     H               ; top line starts just after that LF
+        SHLD    VPTR
+        RET
+VRDI_TOP:
+        LHLD    VRBASE
+        SHLD    VPTR
+        RET
+
+;------------------------------------------------------------
+; VLFLD - load 16-bit descriptor field (local; like VIBUF GBLDHW).
+; Entry: A = BD_xxx offset.  Exit: HL = value; BC,DE preserved.
+;------------------------------------------------------------
+VLFLD:
+        LHLD    CURBDP
+        ADD     L
+        MOV     L,A
+        MVI     A,0
+        ADC     H
+        MOV     H,A
+        MOV     A,M
+        INX     H
+        MOV     H,M
+        MOV     L,A
+        RET
+
+;============================================================
+; VRD_NEXT - next byte from the virtual reader (R1 then R2 as one stream).
+; Exit: A = byte; A = FFH at end of buffer; HL,DE clobbered.
+;============================================================
+VRD_NEXT:
+        LHLD    VPTR            ; HL = current ptr (loaded once)
+        XCHG                    ; DE = ptr
+        LHLD    VEND1           ; at the gap?  ptr == VEND1
+        MOV     A,H
+        CMP     D
+        JNZ     VRN_CHK
+        MOV     A,L
+        CMP     E
+        JNZ     VRN_CHK
+        LHLD    VRDGAP          ; jump across the gap to the R2 head
+        XCHG                    ; DE = VRDGAP (new ptr)
+VRN_CHK:
+        LHLD    VEND2           ; end of buffer?  ptr (DE) >= VEND2
+        MOV     A,H
+        CMP     D
+        JC      VRN_END
+        JNZ     VRN_RD
+        MOV     A,E
+        CMP     L
+        JNC     VRN_END
+VRN_RD:
+        XCHG                    ; HL = ptr
+        MOV     A,M             ; A = byte
+        INX     H
+        SHLD    VPTR            ; advance
+        RET
+VRN_END:
+        MVI     A,0FFH
+        RET
+
+
+;============================================================
+; SCRDRAW - full screen redraw.  Renders EDITROW rows from TOPLN with
+; HSCROL.  Rows past EOF show "~".  Clears DIRTY and DRTLINE.
+; Reads only resident RAM (via the virtual reader) -- never disk.
+;
+; The repaint is done in place: each row is positioned, erased to EOL (ESC[K
+; in SDPOS), then drawn -- so the screen updates top-to-bottom without the
+; whole-screen blank flash of an up-front ESC[2J.  The status row is blanked
+; via STATCLR at the end (SDDN), matching the old ESC[2J behaviour.
+;============================================================
+SCRDRAW:
+        LXI     D,HIDSTR
+        CALL    OUTSTR
+        CALL    VRD_INIT
+        MVI     A,1
+        STA     SDROW
+SDLP:
+        LDA     NEDITP
+        MOV     B,A
+        LDA     SDROW
+        CMP     B
+        JNC     SDDN            ; all edit rows done
+        CALL    SDPOS           ; position to col 1 of this row (home / CR,LF)
+        LXI     H,LINEBUF
+        SHLD    VRWP
+        MVI     B,0             ; byte count
+        MVI     C,0             ; EOF flag
+SDFIL:
+        MOV     A,B
+        CPI     MAXCOLS
+        JNC     SDFULL
+        CALL    VRD_NEXT
+        CPI     0FFH
+        JZ      SDEOF1
+        CPI     LF
+        JZ      SDLEND
+        LHLD    VRWP
+        MOV     M,A
+        INX     H
+        SHLD    VRWP
+        INR     B
+        JMP     SDFIL
+SDLEND:
+        ; line terminated by LF: a CR immediately before it is part of the
+        ; line break (verbatim storage, VI.INC) -- drop it so it is not sent
+        ; to the terminal.
+        MOV     A,B
+        ORA     A
+        JZ      SDOUT
+        LHLD    VRWP
+        DCX     H
+        MOV     A,M
+        CPI     CR
+        JNZ     SDOUT
+        DCR     B
+        JMP     SDOUT
+SDFULL:
+        CALL    VRD_NEXT
+        CPI     0FFH
+        JZ      SDEOF1
+        CPI     LF
+        JNZ     SDFULL
+        JMP     SDOUT
+SDEOF1:
+        MVI     C,1
+SDOUT:
+        MOV     A,C
+        STA     SDEOFL          ; save EOF flag first (TABEXP clobbers C)
+        CALL    TABEXP          ; LINEBUF[0..B) raw -> DSPBUF; B = display count
+        MOV     A,B
+        STA     SDCNT
+        LDA     HSCROL
+        MOV     E,A
+        LDA     SDCNT
+        MOV     B,A
+        MOV     A,E
+        CMP     B               ; HSCROL vs total
+        JNC     SDNO_VIS        ; HSCROL >= total
+        ; visible = min(total - HSCROL, NCOLS)
+        MOV     A,B
+        SUB     E
+        MOV     C,A
+        LDA     NCOLSP
+        MOV     D,A
+        MOV     A,C
+        CMP     D
+        JC      SDVIS1
+        LDA     NCOLS
+SDVIS1:
+        MOV     B,A             ; B = visible count
+        LXI     H,DSPBUF        ; emit from the tab-expanded copy
+        MOV     A,E             ; HSCROL
+        ADD     L
+        MOV     L,A
+        MVI     A,0
+        ADC     H
+        MOV     H,A
+SDFAST:
+        MOV     A,M
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     SDFAST
+        LDA     SDEOFL
+        ORA     A
+        JNZ     SDEOF
+        JMP     SDNXT
+SDNO_VIS:
+        LDA     SDEOFL
+        ORA     A
+        JZ      SDNXT           ; line ended with LF: blank row
+        ; EOF: tilde unless this is the cursor row
+        MVI     A,BD_CSROW
+        CALL    VLFLD
+        MOV     A,L
+        INR     A               ; CSROW+1
+        MOV     B,A
+        LDA     SDROW
+        CMP     B
+        JZ      SDNXT           ; cursor row: blank, no tilde
+        MVI     A,'~'
+        CALL    OUTCHR
+        JMP     SDEOF
+SDNXT:
+        LDA     SDROW
+        INR     A
+        STA     SDROW
+        JMP     SDLP
+SDEOF:
+        LDA     SDROW
+        INR     A
+        STA     SDROW
+SDEFT:
+        LDA     NEDITP
+        MOV     B,A
+        LDA     SDROW
+        CMP     B
+        JNC     SDDN
+        CALL    SDPOS           ; position to col 1 of this row (home / CR,LF)
+        MVI     A,'~'
+        CALL    OUTCHR
+        LDA     SDROW
+        INR     A
+        STA     SDROW
+        JMP     SDEFT
+SDDN:
+        LDA     STMSGF          ; a status message posted this cycle (search msgs,
+        ORA     A               ; etc.) must survive the redraw it triggered
+        JNZ     SDDN_MSG
+        CALL    STATCLR         ; blank the status row (old ESC[2J cleared it too)
+        JMP     SDDN_CUR
+SDDN_MSG:
+        XRA     A
+        STA     STMSGF          ; consume: preserved for THIS redraw only
+SDDN_CUR:
+        LXI     D,SHWSTR
+        CALL    OUTSTR
+        CALL    CURPOS
+        XRA     A
+        STA     DIRTY
+        STA     DRTLINE
+        RET
+
+;------------------------------------------------------------
+; SDPOS - position to column 1 of the current draw row (SDROW) and erase it.
+; Row 1 homes the cursor (ESC[H); every later row emits CR,LF to step down one
+; row to column 1.  This replaces a per-row ESC[r;cH (~6-7 bytes) with 2 bytes
+; for positioning.  Each row is then erased to EOL (ESC[K) before SCRDRAW draws
+; over it, so the repaint needs no up-front ESC[2J -- the screen updates in
+; place with no blank flash.  Safe because: rendered content is clipped to
+; NCOLS so a row never auto-wraps (and CR cancels any pending wrap); and rows
+; are drawn strictly 1..NEDIT, so no LF is ever issued at the bottom screen
+; line (which would scroll).  Requires the scroll region to span the screen,
+; which every VT100 line primitive restores before returning.
+;------------------------------------------------------------
+SDPOS:
+        LDA     SDROW
+        CPI     1
+        JNZ     SDP_NL
+        LXI     D,HOMSTR        ; first row: home
+        CALL    OUTSTR
+        JMP     SDP_EL
+SDP_NL:
+        LXI     D,CRLFST        ; later rows: CR,LF to next row, column 1
+        CALL    OUTSTR
+SDP_EL:
+        LXI     D,KLSTR         ; erase the row to EOL (replaces up-front ESC[2J)
+        JMP     OUTSTR
+
+;============================================================
+; SCRLNE - current-line update for the main loop's DRTLINE branch.  When the
+; insert/replace handler armed an incremental char emit (FASTOP set) and it is
+; safe, emit just that char via the VT100 insert/overwrite-char primitives
+; instead of repainting the whole line; otherwise fall back to SCREDCL.
+;   FASTOP 1 = insert (shift the rest of the line right with ESC[@)
+;   FASTOP 2 = overwrite (no shift; print over the cursor cell)
+;   FASTOP 3 = delete FASTN cells at the cursor (ESC[P, shift the rest left)
+; The terminal cursor is still at the pre-keystroke position (the insertion
+; point) from the previous CURPOS, so no repositioning is needed.  Guards:
+; the affected cell must be visible (CSCOL > HSCROL), and for an insert there
+; must be no TAB between the cursor and end of line (a tab would re-stop and
+; the terminal's 1-cell shift would be wrong).
+;
+; Exit: A = 1 if the char was emitted incrementally -- the terminal cursor
+; advanced exactly one cell and now sits at the new BD_CSCOL, so the caller
+; may SKIP the trailing CURPOS (a redundant ESC[r;cH).  A = 0 if it fell back
+; to SCREDCL (which moved the cursor), so the caller MUST run CURPOS.
+;============================================================
+SCRLNE:
+        LDA     FASTOP
+        ORA     A
+        JZ      SLN_FULL
+        CPI     3
+        JZ      SLN_DEL         ; delete uses its own (looser) visibility guard
+        ; insert/overwrite: the edited cell (CSCOL-1) must be on screen: CSCOL > HSCROL
+        MVI     A,BD_CSCOL
+        CALL    BDFLD
+        MOV     B,M             ; B = CSCOL
+        LDA     HSCROL
+        CMP     B               ; carry iff HSCROL < CSCOL
+        JNC     SLN_FULL        ; cell not safely visible -> full line redraw
+        LDA     FASTOP
+        CPI     2
+        JZ      SLN_OVR
+        ; insert: bail if a TAB lies between the cursor and end of line
+        CALL    TABAFT
+        ORA     A
+        JNZ     SLN_FULL
+        LXI     H,1
+        CALL    OUTICH          ; ESC[1@ : open one cell, shift the rest right
+        LDA     FASTCH
+        CALL    OUTCHR
+        MVI     A,1             ; fast path: cursor already correct, skip CURPOS
+        RET
+SLN_DEL:
+        ; delete FASTN cells at the cursor (cw/ce).  Eligibility (forward motion,
+        ; in-line, no TAB in [cursor,EOL)) was checked pre-delete by the caller,
+        ; so a tight ESC[NP is correct; the cursor does not move.  Visibility: the
+        ; cursor CELL must be on screen, i.e. CSCOL >= HSCROL (the deletion starts
+        ; AT the cursor, unlike insert/overwrite whose cell is CSCOL-1).
+        MVI     A,BD_CSCOL
+        CALL    BDFLD
+        MOV     B,M             ; B = CSCOL
+        LDA     HSCROL
+        CMP     B               ; CY if HSCROL < CSCOL; Z if equal
+        JC      SLN_DOK
+        JNZ     SLN_FULL        ; HSCROL > CSCOL -> cursor left of viewport
+SLN_DOK:
+        ; cw/ce enters insert mode, and ENTINS just wrote "-- INSERT --" on the
+        ; status row -- so the terminal cursor is NOT on the edit line.  Position
+        ; it before deleting (still far cheaper than a full SCREDCL repaint).
+        CALL    CURPOS
+        LDA     FASTN
+        MOV     L,A
+        MVI     H,0
+        CALL    OUTDCH          ; ESC[<N>P : delete N cells, shift the rest left
+        MVI     A,1             ; cursor already at the edit cell, skip outer CURPOS
+        RET
+SLN_OVR:
+        LDA     FASTCH
+        CALL    OUTCHR          ; overwrite the cursor cell in place
+        MVI     A,1             ; fast path: cursor already correct, skip CURPOS
+        RET
+SLN_FULL:
+        CALL    SCREDCL
+        XRA     A               ; full redraw moved the cursor: caller runs CURPOS
+        RET
+
+;------------------------------------------------------------
+; TABAFT - A=1 if a TAB occurs between the cursor and end of the current line,
+; else A=0.  Scans R2 (base+GAPEN .. base+BSIZE) until LF/CR/end.
+;------------------------------------------------------------
+TABAFT:
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG                    ; DE = GAPEN
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW          ; HL = base
+        DAD     D               ; HL = base+GAPEN = cursor (R2 head)
+        PUSH    H
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW
+        XCHG                    ; DE = BSIZE
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        DAD     D               ; HL = base+BSIZE = R2 end
+        XCHG                    ; DE = R2 end
+        POP     H               ; HL = cursor
+TAF_LP:
+        MOV     A,L
+        CMP     E
+        JNZ     TAF_NE
+        MOV     A,H
+        CMP     D
+        JZ      TAF_NO          ; reached end of buffer
+TAF_NE:
+        MOV     A,M
+        CPI     LF
+        JZ      TAF_NO          ; end of line
+        CPI     CR
+        JZ      TAF_NO          ; CR break (CRLF) ends the displayed line
+        CPI     TAB
+        JZ      TAF_YES
+        INX     H
+        JMP     TAF_LP
+TAF_YES:
+        MVI     A,1
+        RET
+TAF_NO:
+        XRA     A
+        RET
+
+;============================================================
+; SCREDCL - redraw the current line only.  Positions to CSROW+1, erases,
+; writes the line via GBGETLN (with HSCROL).  Clears DRTLINE.
+; Caller positions the hardware cursor afterwards (CURPOS).
+;============================================================
+SCREDCL:
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MOV     A,M
+        ADI     1
+        MOV     D,A             ; D = terminal row (CSROW + 1)
+        CALL    SCREDAT
+        XRA     A
+        STA     DRTLINE
+        RET
+
+;------------------------------------------------------------
+; SCREDAT - erase and redraw the CURRENT line at terminal row D (1-based).
+; Like SCREDCL but the row is a parameter and DRTLINE is left alone, so callers
+; can paint several lines at successive rows (e.g. a multi-line put).
+;------------------------------------------------------------
+SCREDAT:
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,KLSTR
+        CALL    OUTSTR
+        LXI     D,LINEBUF
+        MVI     B,MAXCOLS
+        CALL    GBGETLN         ; B = total chars
+        JMP     SCROUTLN        ; output the visible portion (HSCROL + NCOLS clip)
+
+
+;------------------------------------------------------------
+; SCROUTLN - output LINEBUF[0..B) clipped to the viewport (HSCROL .. +NCOLS) at
+; the current cursor position.  Entry: B = total chars in LINEBUF.  Plain (no
+; highlight).  Shared by SCREDCL and OUTBOTLN.
+;------------------------------------------------------------
+SCROUTLN:
+        CALL    TABEXP          ; LINEBUF[0..B) raw -> DSPBUF; B = display count
+        LDA     HSCROL
+        MOV     E,A
+        MOV     A,B
+        CMP     E
+        RZ                      ; total == HSCROL -> nothing visible
+        RC                      ; total <  HSCROL -> nothing visible
+        SUB     E               ; total - HSCROL
+        MOV     C,A
+        LDA     NCOLSP
+        MOV     D,A
+        MOV     A,C
+        CMP     D
+        JC      SCRO_VG
+        LDA     NCOLS
+SCRO_VG:
+        MOV     B,A             ; B = visible count
+        LXI     H,DSPBUF        ; emit from the tab-expanded copy
+        MOV     A,E             ; HSCROL
+        ADD     L
+        MOV     L,A
+        MVI     A,0
+        ADC     H
+        MOV     H,A
+SCRO_LP:
+        MOV     A,M
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     SCRO_LP
+        RET
+
+;------------------------------------------------------------
+; TABEXP - expand tabs in LINEBUF[0..B) into DSPBUF, tab stops every TABWID
+; columns.  A tab emits at least one space and advances to the next stop.
+; Output is clamped to MAXCOLS display cells.  Entry: B = raw byte count.
+; Exit: B = display cell count.  Clobbers A, C, D, E, H, L.
+;------------------------------------------------------------
+TABEXP:
+        LXI     H,LINEBUF       ; HL = source
+        LXI     D,DSPBUF        ; DE = dest
+        MVI     C,0             ; C = display column produced
+TBX_LP:
+        MOV     A,B
+        ORA     A
+        JZ      TBX_DN
+        MOV     A,M
+        CPI     TAB
+        JZ      TBX_TAB
+        ; ordinary byte: store if there is room
+        MOV     A,C
+        CPI     MAXCOLS
+        JNC     TBX_NX          ; display full -> drop
+        MOV     A,M
+        STAX    D
+        INX     D
+        INR     C
+        JMP     TBX_NX
+TBX_TAB:
+        ; emit spaces until the column is a multiple of TABWID (>=1 space)
+TBX_TS:
+        MOV     A,C
+        CPI     MAXCOLS
+        JNC     TBX_NX          ; display full -> stop expanding
+        MVI     A,' '
+        STAX    D
+        INX     D
+        INR     C
+        MOV     A,C
+        ANI     TABWID-1        ; column MOD TABWID (power of two)
+        JNZ     TBX_TS
+TBX_NX:
+        INX     H
+        DCR     B
+        JMP     TBX_LP
+TBX_DN:
+        MOV     B,C             ; B = display cell count
+        RET
+
+;------------------------------------------------------------
+; OUTN16 - print HL as unsigned decimal, no leading zeros (HL=0 -> "0").
+;------------------------------------------------------------
+OUTN16:
+        MVI     B,0
+        LXI     D,10000
+        CALL    ONDIG
+        LXI     D,1000
+        CALL    ONDIG
+        LXI     D,100
+        CALL    ONDIG
+        LXI     D,10
+        CALL    ONDIG
+        MOV     A,L
+        ADI     '0'
+        PUSH    B
+        CALL    OUTCHR
+        POP     B
+        RET
+ONDIG:
+        PUSH    D
+        MVI     C,0
+ONDGLP:
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JC      ONDGPR
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A
+        INR     C
+        JMP     ONDGLP
+ONDGPR:
+        POP     D
+        MOV     A,C
+        ORA     A
+        JNZ     ONDGNZ
+        MOV     A,B
+        ORA     A
+        RZ
+        PUSH    H
+        PUSH    B
+        MVI     A,'0'
+        CALL    OUTCHR
+        POP     B
+        POP     H
+        RET
+ONDGNZ:
+        MVI     B,1
+        ADI     '0'
+        PUSH    H
+        PUSH    B
+        CALL    OUTCHR
+        POP     B
+        POP     H
+        RET
+
+;------------------------------------------------------------
+; OUTICH - emit ESC[N@ (insert N blanks at cursor).  Entry: HL = N.
+;------------------------------------------------------------
+OUTICH:
+        PUSH    H
+        LXI     D,CSIPFX
+        CALL    OUTSTR
+        POP     H
+        CALL    OUTN16
+        MVI     A,'@'
+        JMP     OUTCHR
+
+;------------------------------------------------------------
+; OUTDCH - emit ESC[NP (delete N chars at cursor, shift the rest left).
+; Entry: HL = N.
+;------------------------------------------------------------
+OUTDCH:
+        PUSH    H
+        LXI     D,CSIPFX
+        CALL    OUTSTR
+        POP     H
+        CALL    OUTN16
+        MVI     A,'P'
+        JMP     OUTCHR
+
+;------------------------------------------------------------
+; OUTINSLN - insert a blank line at the cursor row (ESC[L]).
+; Sets the scroll region to the edit area so the status row is protected.
+;------------------------------------------------------------
+OUTINSLN:
+        LDA     NEDIT
+        CALL    OUTSRGN
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MOV     A,M
+        ADI     1
+        MOV     D,A
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,ILSTR
+        CALL    OUTSTR
+        JMP     OUTSRGF
+
+;------------------------------------------------------------
+; OUTSRGN - set scroll region to rows 1..A (ESC [ 1 ; A r).
+;------------------------------------------------------------
+OUTSRGN:
+        PUSH    PSW
+        LXI     D,CSIPFX        ; "ESC["
+        CALL    OUTSTR
+        MVI     A,'1'
+        CALL    OUTCHR
+        MVI     A,';'
+        CALL    OUTCHR
+        POP     PSW
+        CALL    OUTNUM8
+        MVI     A,'r'
+        JMP     OUTCHR
+
+; OUTSRGF - reset the scroll region to the full physical screen (ESC[r).  Used
+; to RESTORE after a line primitive: unlike ESC[1;NROWS r it never clamps a
+; terminal taller than NROWS, so the region is full-screen in steady state
+; (and a crash/improper exit between operations leaves it unclamped).
+OUTSRGF:
+        LXI     D,SRGFST
+        JMP     OUTSTR
+SRGFST: DB      ESC,'[','r',NUL
+
+;------------------------------------------------------------
+; OUTDELLN - delete the line at the cursor row (ESC[M], scroll up).
+; Sets the scroll region to the edit area so the status row is protected.
+;------------------------------------------------------------
+OUTDELLN:
+        LDA     NEDIT
+        CALL    OUTSRGN
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MOV     A,M
+        ADI     1
+        MOV     D,A
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,DLSTR
+        CALL    OUTSTR
+        JMP     OUTSRGF
+
+;------------------------------------------------------------
+; SCRLUPN - the viewport scrolled UP by A lines (TOPLN decreased by A: ^B, k, ^U
+; or a backward page).  Rolls the screen DOWN one line at a time, A times: each
+; step issues a Reverse Index (RI = ESC M) at the top edit row -- the terminal
+; scrolls the region down one line natively -- and draws the new top line into
+; row 1.  The new top lines come in REVERSE file order; rather than re-seat the
+; reader from the top each step, a line pointer (VPLINE) is walked backward one
+; line per step via VRDPREV, so this is a single O(screen) pass like SCRLDNN.
+; A in 1..NEDIT.  Normal mode only.
+;------------------------------------------------------------
+SCRLUPN:
+        STA     SCRNN           ; N = lines to roll
+        LDA     NEDIT
+        CALL    OUTSRGN         ; scroll region = edit rows (protect status row)
+        LXI     D,HIDSTR        ; hide the cursor: no visible hop during the roll
+        CALL    OUTSTR
+        CALL    VRD_INIT        ; reader at the top-of-screen line (once)
+        LDA     SCRNN           ; skip N-1 lines to the highest newly-exposed line
+        DCR     A
+        MOV     C,A
+SUP_SK:
+        MOV     A,C
+        ORA     A
+        JZ      SUP_S0
+        CALL    VRDLINE
+        DCR     C
+        JMP     SUP_SK
+SUP_S0:
+        LHLD    VPTR
+        SHLD    VPLINE          ; VPLINE = start of the first line to draw
+        LDA     SCRNN
+        DCR     A
+        STA     SCRNN           ; N-1 steps remain after the first draw
+SUP_LP:
+        MVI     D,1             ; top edit row
+        MVI     E,1
+        CALL    GOTOXY
+        MVI     A,ESC           ; RI (ESC M) at the region top: scrolls down 1
+        CALL    OUTCHR
+        MVI     A,'M'
+        CALL    OUTCHR
+        LHLD    VPLINE          ; seat the reader at the line for row 1
+        SHLD    VPTR
+        MVI     A,1
+        STA     SDRROW
+        CALL    DRAW1R          ; draw the new top line into row 1
+        LDA     SCRNN
+        ORA     A
+        JZ      SUP_DONE
+        DCR     A
+        STA     SCRNN
+        LHLD    VPLINE          ; walk back one line for the next row 1
+        CALL    VRDPREV
+        SHLD    VPLINE
+        JMP     SUP_LP
+SUP_DONE:
+        LXI     D,SHWSTR        ; restore the cursor
+        CALL    OUTSTR
+        JMP     OUTSRGF         ; restore full-screen region (tail)
+
+;------------------------------------------------------------
+; SCRLDNN - the viewport scrolled DOWN by A lines (TOPLN increased by A: ^F, j,
+; ^D or a forward page).  Rolls the screen UP one line at a time, A times: each
+; step issues a Delete-Line (DL = ESC[M) at the region TOP -- the terminal scrolls the
+; region up one line natively -- and draws the next newly-exposed line into row
+; NEDIT.  One forward reader pass (O(screen)).  A in 1..NEDIT.  Normal mode only.
+;------------------------------------------------------------
+SCRLDNN:
+        STA     SCRNN           ; N = lines to roll
+        LDA     NEDIT
+        CALL    OUTSRGN
+        LXI     D,HIDSTR        ; hide the cursor: no visible hop during the roll
+        CALL    OUTSTR
+        CALL    VRD_INIT        ; reader at the top-of-screen line
+        LDA     NEDIT           ; skip NEDIT-N to the first newly-exposed line
+        MOV     B,A
+        LDA     SCRNN
+        MOV     C,A
+        MOV     A,B
+        SUB     C
+        MOV     C,A             ; C = NEDIT - N
+SDN_SK:
+        MOV     A,C
+        ORA     A
+        JZ      SDN_LP
+        CALL    VRDLINE
+        DCR     C
+        JMP     SDN_SK
+SDN_LP:
+        LDA     SCRNN
+        ORA     A
+        JZ      SDN_DONE
+        MVI     D,1             ; region TOP row
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,DLSTR         ; DL (ESC[M) at the top: region scrolls up 1.
+        CALL    OUTSTR          ; Region-aware, unlike IND/LF which some serial
+                                ; terminals scroll full-screen -- eating status.
+        LDA     NEDIT
+        STA     SDRROW          ; draw the next exposed line at the bottom row
+        CALL    DRAW1R
+        LDA     SCRNN
+        DCR     A
+        STA     SCRNN
+        JMP     SDN_LP
+SDN_DONE:
+        LXI     D,SHWSTR        ; restore the cursor
+        CALL    OUTSTR
+        JMP     OUTSRGF
+
+;------------------------------------------------------------
+; DRAW1R - draw the virtual reader's CURRENT line at terminal row SDRROW (erase
+; the row first; a row past EOF shows '~' unless it is the cursor's row).
+; Advances the reader past the drawn line.  Factored out of the old SDROWS so
+; the scroll rollers share one line-painter.  Clobbers A,B,C,D,E,H,L.
+;------------------------------------------------------------
+DRAW1R:
+        CALL    VRDLINE         ; B = char count, A = 1 if EOF (no LF)
+        PUSH    PSW
+        PUSH    B
+        LDA     SDRROW
+        MOV     D,A
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,KLSTR
+        CALL    OUTSTR
+        POP     B
+        POP     PSW
+        ORA     A
+        JZ      D1R_TEXT        ; not EOF -> draw it (blank if count 0)
+        MOV     A,B
+        ORA     A
+        JNZ     D1R_TEXT        ; EOF but content present (last line) -> draw it
+        LDA     SDRROW          ; past EOF: tilde unless this is the cursor row
+        MOV     D,A
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MOV     A,M
+        INR     A
+        CMP     D
+        RZ                      ; cursor row -> leave blank
+        MVI     A,'~'
+        JMP     OUTCHR
+D1R_TEXT:
+        JMP     SCROUTLN
+
+;------------------------------------------------------------
+; VRDPREV - HL = the start of a line in R1 (the resident text before the gap,
+; where SCRLUPN's redrawn lines all live).  Return HL = the start of the
+; PREVIOUS line: scan back from two bytes before HL for the LF that terminates
+; the line before it (previous start = that LF + 1), or VRBASE if there is none
+; (the previous line is the first line of the buffer).  Clobbers A,D,E.
+;------------------------------------------------------------
+VRDPREV:
+        XCHG                    ; DE = current line start P
+        LHLD    VRBASE
+        MOV     A,E             ; if P == VRBASE there is no previous line
+        CMP     L
+        JNZ     VPV_GO
+        MOV     A,D
+        CMP     H
+        RZ                      ; HL already = VRBASE -> return it
+VPV_GO:
+        XCHG                    ; HL = P, DE = VRBASE (lower bound)
+        DCX     H               ; P-1 = LF terminating the previous line
+        DCX     H               ; P-2 = scan below that LF
+VPV_LP:
+        MOV     A,H             ; HL < VRBASE?  -> previous line is the first line
+        CMP     D
+        JC      VPV_BASE
+        JNZ     VPV_RD
+        MOV     A,L
+        CMP     E
+        JC      VPV_BASE
+VPV_RD:
+        MOV     A,M
+        CPI     LF
+        JZ      VPV_HIT
+        DCX     H
+        JMP     VPV_LP
+VPV_HIT:
+        INX     H               ; LF + 1 = previous line start
+        RET
+VPV_BASE:
+        XCHG                    ; HL = VRBASE
+        RET
+
+;------------------------------------------------------------
+; VRDLINE - read the current virtual-reader line into LINEBUF.  Exit: B = char
+; count (a CR immediately before the terminating LF is dropped, per verbatim
+; storage); A = 1 if the line ended at EOF (no LF), else 0.  Advances VRD past
+; the LF.  Plain text (no highlight).
+;------------------------------------------------------------
+VRDLINE:
+        LXI     H,LINEBUF
+        SHLD    VRWP
+        MVI     B,0
+VRDL_LP:
+        MOV     A,B
+        CPI     MAXCOLS
+        JNC     VRDL_FULL
+        CALL    VRD_NEXT
+        CPI     0FFH
+        JZ      VRDL_EOF
+        CPI     LF
+        JZ      VRDL_END
+        LHLD    VRWP
+        MOV     M,A
+        INX     H
+        SHLD    VRWP
+        INR     B
+        JMP     VRDL_LP
+VRDL_FULL:                      ; line longer than the buffer: consume to LF/EOF
+        CALL    VRD_NEXT
+        CPI     0FFH
+        JZ      VRDL_EOF
+        CPI     LF
+        JNZ     VRDL_FULL
+VRDL_END:                       ; ended with LF: drop a CR just before it
+        MOV     A,B
+        ORA     A
+        JZ      VRDL_OK
+        LHLD    VRWP
+        DCX     H
+        MOV     A,M
+        CPI     CR
+        JNZ     VRDL_OK
+        DCR     B
+VRDL_OK:
+        XRA     A               ; not EOF
+        RET
+VRDL_EOF:
+        MVI     A,1             ; ended at EOF (no LF)
+        RET
+
+;------------------------------------------------------------
+; OUTBOTLN - redraw the BOTTOM edit row (screen row NEDIT).  Used after a
+; delete-line (dd / J) scrolls a fresh line into view at the bottom.  Walks the
+; virtual reader from the top of the screen to the last row -- O(screen).  Rows
+; beyond EOF show '~'.  (Not used in visual mode, so no highlight.)
+;------------------------------------------------------------
+OUTBOTLN:
+        CALL    VRD_INIT        ; VPTR = top-of-screen line
+        LDA     NEDITM          ; skip NEDIT-1 lines to reach the bottom row
+        MOV     C,A
+OBL_SK:
+        MOV     A,C
+        ORA     A
+        JZ      OBL_DRAW
+        CALL    VRDLINE
+        ORA     A
+        JNZ     OBL_TILDE       ; ran out of lines -> bottom row is past EOF
+        DCR     C
+        JMP     OBL_SK
+OBL_DRAW:
+        CALL    VRDLINE         ; read the bottom line (B = count, A = EOF flag)
+        PUSH    PSW             ; save EOF flag
+        PUSH    B               ; save the char count (GOTOXY/OUTSTR clobber B)
+        LDA     NEDIT           ; position at the bottom edit row, erase it
+        MOV     D,A
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,KLSTR
+        CALL    OUTSTR
+        POP     B               ; restore the char count
+        POP     PSW             ; restore EOF flag
+        ORA     A
+        JZ      OBL_OUT         ; normal line -> draw it
+        MOV     A,B             ; EOF line: content -> draw it (last line, no NL)
+        ORA     A
+        JNZ     OBL_OUT
+        JMP     OBL_TIL         ; EOF with no content -> '~' (row already erased)
+OBL_OUT:
+        JMP     SCROUTLN
+;------------------------------------------------------------
+; OBL_TIL - the (already erased) bottom row is past EOF: draw '~', but leave it
+; blank if it is the cursor's own row -- matching SCRDRAW's SDNO_VIS rule.
+;------------------------------------------------------------
+OBL_TIL:
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MOV     B,M             ; B = CSROW (0-based)
+        LDA     NEDITM          ; bottom edit row index (0-based)
+        CMP     B
+        RZ                      ; cursor on the bottom row -> leave blank
+        MVI     A,'~'
+        JMP     OUTCHR
+OBL_TILDE:                      ; bottom row beyond EOF -> '~' (or blank if cursor)
+        LDA     NEDIT
+        MOV     D,A
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,KLSTR
+        CALL    OUTSTR
+        JMP     OBL_TIL
+
+;------------------------------------------------------------
+; OUTDLBL - delete the screen line just BELOW the cursor (ESC[M at the cursor
+; row + 1), scrolling the rows under it up.  Used by J (the joined-away line
+; disappears).  Scroll region protects the status row.
+;------------------------------------------------------------
+OUTDLBL:
+        LDA     NEDIT
+        CALL    OUTSRGN
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MOV     A,M
+        ADI     2               ; CSROW(0-based)+2 = 1-based row below the cursor
+        MOV     D,A
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,DLSTR
+        CALL    OUTSTR
+        JMP     OUTSRGF
+
+;------------------------------------------------------------
+; STSTART - show the vi-style startup banner on the status row.
+; With a file:  "NAME.EXT" [readonly]   (no counts: lazy load -- D4)
+; No file:      VIEDIT 1.0 Copyright (C) ...
+;------------------------------------------------------------
+STSTART:
+        LDA     NSTAT
+        MOV     D,A
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,KLSTR
+        CALL    OUTSTR
+        MVI     A,BD_FNAME+1
+        CALL    BDFLD
+        MOV     A,M
+        CPI     ' '
+        JZ      STS_NOF
+        ORA     A
+        JZ      STS_NOF
+        MVI     A,'"'
+        CALL    OUTCHR
+        CALL    STS_NAM
+        MVI     A,'"'
+        CALL    OUTCHR
+        MVI     A,' '
+        CALL    OUTCHR
+        LDA     RDONLY
+        ORA     A
+        JZ      STS_HINT
+        LXI     D,STRRO
+        CALL    OUTSTR
+STS_HINT:
+        LXI     D,HLPHINT
+        JMP     OUTSTR
+STS_NOF:
+        LXI     D,COPYR
+        JMP     OUTSTR
+
+;--- STS_NAM - print the filename as NAME.EXT (space-trimmed) ---
+STS_NAM:
+        MVI     A,BD_FNAME+1
+        CALL    BDFLD
+        MVI     B,8
+STN_L:
+        MOV     A,M
+        CPI     ' '
+        JZ      STN_E
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     STN_L
+STN_E:
+        MVI     A,BD_FNAME+9
+        CALL    BDFLD
+        MOV     A,M
+        CPI     ' '
+        RZ
+        PUSH    H
+        MVI     A,'.'
+        CALL    OUTCHR
+        POP     H
+        MVI     B,3
+STE_L:
+        MOV     A,M
+        CPI     ' '
+        RZ
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     STE_L
+        RET
+
+;------------------------------------------------------------
+; HELPSC - paint a full-screen command summary, wait for any key, then
+; request a full redraw (DIRTY) so the editor screen is restored by the
+; main loop's SCRDRAW.  Triggered by normal-mode K and ex :h / :help.
+;------------------------------------------------------------
+HELPSC:
+        LXI     D,HIDSTR        ; hide the cursor while the overlay is up
+        CALL    OUTSTR
+        LXI     D,CLSSTR        ; clear screen
+        CALL    OUTSTR
+        MVI     D,1             ; home (row 1, col 1)
+        MVI     E,1
+        CALL    GOTOXY
+        LXI     D,HELPTX        ; CR,LF-separated summary, NUL-terminated
+        CALL    OUTSTR
+        CALL    BCONIN          ; any key dismisses (keystroke consumed)
+        MVI     A,1
+        STA     DIRTY           ; main loop repaints the editor
+        RET
+
+        CSEG
+
+; VT100 escape strings
+CSIPFX: DB      ESC,'[',0
+CLSSTR: DB      ESC,'[','2','J',0
+HOMSTR: DB      ESC,'[','H',0
+CRLFST: DB      CR,LF,0
+KLSTR:  DB      ESC,'[','K',0
+HIDSTR: DB      ESC,'[','?','2','5','l',0
+SHWSTR: DB      ESC,'[','?','2','5','h',0
+ILSTR:  DB      ESC,'[','L',0
+DLSTR:  DB      ESC,'[','M',0
+NOFNSTR:DB      '[No File]',0
+STRRO:  DB      '[readonly] ',0
+COPYR:  DB      'VIEDIT 1.0 Copyright (C) 2026 Deltec Enterprises LLC',0
+HLPHINT:DB      'Press K for help',0
+
+; Help overlay text -- each line ends CR,LF; whole block NUL-terminated.
+; Kept to <= 16 rows / <= 62 cols so it fits the smallest screen (24x80).
+HELPTX:
+        DB      'VIEDIT 1.0 - Command Summary      (press any key to return)',CR,LF
+        DB      CR,LF
+        DB      'MOVE  h j k l move   0 $ line ends   w b e word   W B E WORD',CR,LF
+        DB      '      f F t T find   ; , repeat      gg G top/bot   nG line n',CR,LF
+        DB      '      ^F ^B page     ^D ^U half      %  match bracket',CR,LF
+        DB      CR,LF
+        DB      'EDIT  i a I A insert    o O open line     R replace mode',CR,LF
+        DB      '      x del char   r{c} repl char   ~ case   J join lines',CR,LF
+        DB      '      d c y op+motion   dd yy cc line   D C S s line edits',CR,LF
+        DB      '      p P put   u undo   . repeat',CR,LF
+        DB      CR,LF
+        DB      'FIND  / ? search   n N next/prev',CR,LF
+        DB      CR,LF
+        DB      'MARK  m{a-z} set   `{a-z} exact jump   ''{a-z} line jump',CR,LF
+        DB      'MISC  y''a d''a c''a mark range   ^G status   ^L redraw   K help',CR,LF
+        DB      CR,LF
+        DB      'FILE  :w write  :w file save-as  :r file read  :e file edit',CR,LF
+        DB      'EXIT  :q quit   :q! force   :wq :x ZZ write+quit',CR,LF
+        DB      0
+
+; Screen-engine state (owned here; PUBLIC)
+DIRTY:  DB      0               ; 1 = full redraw pending
+DRTLINE:DB      0               ; 1 = current-line redraw pending
+HSCROL: DB      0               ; viewport left column (byte offset)
+SCRNN:  DB      0               ; SCRLUPN/SCRLDNN: line count for this scroll
+SDRROW: DB      0               ; SDROWS: current terminal row being drawn
+RDONLY: DB      0               ; 1 = read-only file
+
+; Runtime screen geometry (defaults match VI.INC; VI.MAC may resize).
+NROWS:  DB      SCRROWS         ; total rows
+NCOLS:  DB      SCRCOLS         ; visible columns
+NEDIT:  DB      EDITROW         ; edit-area rows
+NSTAT:  DB      STATROW         ; status row
+NEDITM: DB      EDITROW-1       ; NEDIT - 1
+NEDITP: DB      EDITROW+1       ; NEDIT + 1
+NCOLSM: DB      SCRCOLS-1       ; NCOLS - 1
+NCOLSP: DB      SCRCOLS+1       ; NCOLS + 1
+
+STMSGF: DB      0               ; 1 = status message active (survive one INFOBAR)
+; --- repeat (`.`) state ---
+RECMAX  EQU     128
+REPACT: DB      0               ; 1 = replaying a recorded change
+CHGD:   DB      0               ; 1 = current command modified the buffer
+RECCH:  DB      0               ; BCONIN: char being recorded
+RECPOS: DW      0               ; bytes recorded for the current command
+RPLYLEN:DW      0               ; bytes in the committed last-change script
+RPLYPOS:DW      0               ; replay read position
+RECBUF: DS      RECMAX          ; current command's keystrokes
+RPLYBUF:DS      RECMAX          ; committed last-change keystrokes
+SDROW:  DB      0               ; SCRDRAW: current draw row
+SDCNT:  DB      0               ; SCRDRAW: saved line byte count
+SDEOFL: DB      0               ; SCRDRAW: saved EOF flag
+
+LINEBUF: DS     MAXCOLS+1       ; raw line bytes (no tab expansion)
+DSPBUF:  DS     MAXCOLS+1       ; tab-expanded display cells (TABEXP output)
+FASTOP:  DB     0               ; SCRLNE: 0 none / 1 insert / 2 overwrite / 3 delete-N
+FASTCH:  DB     0               ; SCRLNE: the char to emit incrementally
+FASTN:   DB     0               ; SCRLNE: cell count for the delete fast path (FASTOP 3)
+
+; Virtual reader state
+VRBASE: DW      0
+VPTR:   DW      0
+VEND1:  DW      0
+VRDGAP: DW      0
+VEND2:  DW      0
+VRWP:   DW      0
+VPLINE: DW      0               ; SCRLUPN: backward-walk line start
+
+        END

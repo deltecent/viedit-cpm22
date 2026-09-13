@@ -1,0 +1,690 @@
+;============================================================
+; FILE:    VICMDSUB.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  ex substitute :[range]s/old/new/[g]
+;------------------------------------------------------------
+; Split out of VICMD.MAC -- see DESIGN.md / build_vi.py link order.
+;============================================================
+        INCLUDE VI.INC
+        PUBLIC  EX_S, EX_SUB, ISRNGC
+        EXTRN   AUTOSCR, CURLN, EBADCMD, ELINE, EMKUNS, ESUBPAT
+        EXTRN   ESUBRNG, EXBUF, EXKW, EXMSG, EX_FIN, EX_STAT
+        EXTRN   GBCSOF, GBDELRT, GBGOTOL, GBINSRT, GBLDHW, GBNLNS
+        EXTRN   GBPKRT, GOTOPOS, KWSTAT, MKIDXA, MKTMP, MKTMP2
+        EXTRN   MV1RT, NEWLEN, OLDLEN, OUTN16, OUTSTR, PKRTF
+        EXTRN   RNGERR, SCRDRAW, SLINE, SNOTFND, SRCBUF, SRCDIR
+        EXTRN   SRCLEN, STATHOME, SUBCNT, SUBCUR, SUBDELIM, SUBENTRY
+        EXTRN   SUBGLOB, SUBLAST, SUBLMAT, SUBLNS, SUBNEW, SUBOLD
+        EXTRN   SUBSM1, SUBSM2, SUBSTRT, SUBTB, SUBTOT, SUBUK
+        EXTRN   UCMTINS, UCMTLEN, UINSCNT, UNDOBP, UNDOLEN, UNDOPOS
+        EXTRN   UNDOTYP, URBT, UWP, VADJ
+        CSEG
+;============================================================
+; Ex substitute :[range]s/old/new/[g]
+;
+; A single generic range engine drives every form.  A range resolves to two
+; 1-based line numbers SLINE..ELINE; the bare ':s' defaults both to the current
+; line.  Addresses: '.' (current), '$' (last), a decimal line number, and '%'
+; (== 1,$).  The body parser fills SUBOLD/SUBNEW (literal, like our search) and
+; the 'g' flag; an empty OLD reuses the last search pattern (SRCBUF); a bare
+; ':s' with no body reuses the previous substitution.
+;
+; The walk visits SLINE..ELINE one byte at a time (literal compare against the
+; contiguous R2 run at the cursor, which never crosses a line break because the
+; pattern holds no CR/LF).  Each replacement records the deleted bytes and counts
+; the inserted bytes into ONE unified undo record spanning [first match .. last
+; replacement]; unchanged bytes crossed between matches are recorded too so the
+; span stays contiguous, and the trailing run after the final match is rolled
+; back.  Overflowing UBMAX disables undo (UT_NONE) rather than corrupting it.
+;============================================================
+
+;--- ISRNGC - Z set if A introduces a line address: digit / . / $ / % / , .
+ISRNGC:
+        CPI     '.'
+        RZ
+        CPI     '$'
+        RZ
+        CPI     '%'
+        RZ
+        CPI     ','
+        RZ
+        CPI     27H             ; 'x mark address
+        RZ
+        CPI     '0'
+        JC      ISRNG_NO
+        CPI     '9'+1
+        JNC     ISRNG_NO
+        XRA     A               ; digit -> Z set
+        RET
+ISRNG_NO:
+        MVI     A,1
+        ORA     A               ; NZ -> not a range char
+        RET
+
+;--- EX_S - bare ':s...' (default range = current line); also ':stat'.
+EX_S:
+        LXI     H,KWSTAT
+        CALL    EXKW
+        JZ      EX_STAT         ; ':stat' shares the 's' prefix
+        CALL    CURLN           ; HL = 0-based current line
+        INX     H               ; -> 1-based
+        SHLD    SLINE
+        SHLD    ELINE
+        LXI     H,EXBUF+1       ; body after the 's'
+        JMP     EXS_BODY
+
+;--- EX_SUB - ranged ex command: parse the range, then require 's'.
+EX_SUB:
+        XRA     A
+        STA     RNGERR
+        LXI     H,EXBUF
+        CALL    PRANGE          ; sets SLINE/ELINE; HL -> command char
+        LDA     RNGERR
+        ORA     A
+        JNZ     EXS_MERR        ; bad mark in the range
+        MOV     A,M
+        CPI     's'
+        JNZ     EXS_BAD
+        INX     H               ; HL -> substitution body
+EXS_BODY:
+        CALL    PSUBST          ; parse /old/new/flags; CY = no pattern
+        JC      EXS_PERR
+        CALL    SUBVALID        ; clamp + validate range; CY = empty/backwards
+        JC      EXS_RERR
+        JMP     EXEC_SUB
+EXS_BAD:
+        LXI     D,EBADCMD
+        JMP     EXMSG
+EXS_PERR:
+        LXI     D,ESUBPAT
+        JMP     EXMSG
+EXS_RERR:
+        LXI     D,ESUBRNG
+        JMP     EXMSG
+EXS_MERR:
+        LXI     D,EMKUNS
+        JMP     EXMSG
+
+;--- PRANGE - parse a line range at [HL] into SLINE/ELINE (1-based).
+;    Forms: %  |  addr  |  addr,addr.  Exit: HL at the command char.
+PRANGE:
+        MOV     A,M
+        CPI     '%'
+        JZ      PR_ALL
+        CALL    PADDR           ; DE = addr1, HL advanced
+        PUSH    H
+        XCHG                    ; HL = addr1
+        SHLD    SLINE
+        SHLD    ELINE           ; single-line default
+        POP     H
+        MOV     A,M
+        CPI     ','
+        RNZ                     ; no second address
+        INX     H               ; skip ','
+        CALL    PADDR           ; DE = addr2
+        PUSH    H
+        XCHG
+        SHLD    ELINE
+        POP     H
+        RET
+PR_ALL:
+        INX     H               ; skip '%'
+        PUSH    H
+        LXI     H,1
+        SHLD    SLINE
+        CALL    GBNLNS          ; HL = total lines
+        SHLD    ELINE
+        POP     H
+        RET
+
+;--- PADDR - parse one address at [HL] -> DE = 1-based line.  HL advanced.
+;    '.' current, '$' last, else a decimal number.
+PADDR:
+        MOV     A,M
+        CPI     '.'
+        JZ      PA_DOT
+        CPI     '$'
+        JZ      PA_DOL
+        CPI     27H             ; 'x  -> mark's line
+        JZ      PA_MARK
+        JMP     RDNUM           ; digits -> DE; HL advanced
+PA_DOT:
+        INX     H
+        PUSH    H
+        CALL    CURLN           ; HL = 0-based
+        INX     H               ; -> 1-based
+        XCHG                    ; DE = value
+        POP     H
+        RET
+PA_DOL:
+        INX     H
+        PUSH    H
+        CALL    GBNLNS          ; HL = total (1-based last)
+        XCHG                    ; DE = value
+        POP     H
+        RET
+PA_MARK:
+        INX     H               ; skip the '
+        MOV     A,M             ; A = mark letter
+        INX     H               ; advance past the letter
+        SHLD    MKTMP2          ; save the text pointer
+        CALL    MKIDXA          ; HL = &MARKS[idx]; CY if not a..z
+        JC      PA_MBAD
+        MOV     E,M
+        INX     H
+        MOV     D,M             ; DE = stored offset
+        MOV     A,D
+        ANA     E
+        INR     A               ; 0FFFFH -> unset
+        JZ      PA_MBAD
+        CALL    GBCSOF          ; HL = current cursor offset
+        SHLD    MKTMP           ; save it
+        XCHG                    ; HL = mark offset
+        CALL    GOTOPOS
+        CALL    CURLN           ; HL = 0-based line of the mark
+        INX     H               ; 1-based
+        PUSH    H
+        LHLD    MKTMP
+        CALL    GOTOPOS         ; restore the cursor
+        POP     D               ; DE = mark line (1-based)
+        LHLD    MKTMP2          ; restore text pointer
+        RET
+PA_MBAD:
+        MVI     A,1
+        STA     RNGERR          ; bad/unset mark in the range
+        LXI     D,1
+        LHLD    MKTMP2
+        RET
+
+;--- RDNUM - read decimal at [HL] -> DE = value; HL left at the terminator.
+RDNUM:
+        LXI     D,0
+RDN_LP:
+        MOV     A,M
+        CPI     '0'
+        JC      RN_DN
+        CPI     '9'+1
+        JNC     RN_DN
+        PUSH    H               ; save text ptr
+        SUI     '0'
+        MOV     C,A
+        MVI     B,0             ; BC = digit
+        MOV     H,D
+        MOV     L,E             ; HL = value
+        DAD     H               ; *2
+        DAD     H               ; *4
+        DAD     H               ; *8
+        DAD     D               ; *9  (DE still = original value)
+        DAD     D               ; *10
+        DAD     B               ; + digit
+        XCHG                    ; DE = new value
+        POP     H               ; restore text ptr
+        INX     H
+        JMP     RDN_LP
+RN_DN:
+        RET
+
+;--- PSUBST - parse the body 'delim old delim new delim flags' at [HL].
+;    Fills SUBOLD/OLDLEN, SUBNEW/NEWLEN, SUBGLOB.  Empty OLD reuses SRCBUF;
+;    an empty body reuses the previous substitution.  CY set if no pattern.
+PSUBST:
+        MOV     A,M
+        ORA     A
+        JZ      PS_REUSE        ; ':s' alone -> repeat last substitution
+        STA     SUBDELIM
+        INX     H               ; past the delimiter
+        LXI     D,SUBOLD
+        MVI     C,0
+        CALL    PSCOPY          ; old -> SUBOLD; HL at delim or NUL; C = len
+        MOV     A,C
+        STA     OLDLEN
+        XRA     A
+        STA     NEWLEN
+        STA     SUBGLOB
+        MOV     A,M
+        ORA     A
+        JZ      PS_OLDCHK       ; ':s/old' -> empty new, no flags
+        INX     H               ; past the delimiter
+        LXI     D,SUBNEW
+        MVI     C,0
+        CALL    PSCOPY          ; new -> SUBNEW
+        MOV     A,C
+        STA     NEWLEN
+        MOV     A,M
+        ORA     A
+        JZ      PS_OLDCHK       ; ':s/old/new' -> no flags
+        INX     H               ; past the closing delimiter
+PS_FLP:
+        MOV     A,M
+        ORA     A
+        JZ      PS_OLDCHK
+        CPI     'g'
+        JNZ     PS_FNX
+        MVI     A,1
+        STA     SUBGLOB
+PS_FNX:
+        INX     H
+        JMP     PS_FLP
+PS_OLDCHK:
+        LDA     OLDLEN
+        ORA     A
+        JNZ     PS_OK           ; have an explicit OLD
+        LDA     SRCLEN          ; empty OLD -> reuse the last search pattern
+        ORA     A
+        JZ      PS_NOPAT
+        STA     OLDLEN
+        MOV     B,A
+        LXI     H,SRCBUF
+        LXI     D,SUBOLD
+        CALL    COPYB
+PS_OK:
+        JMP     PSMIRR
+PS_REUSE:
+        LDA     OLDLEN         ; need a previous substitution to repeat
+        ORA     A
+        JZ      PS_NOPAT
+        JMP     PSMIRR
+PS_NOPAT:
+        STC
+        RET
+;--- PSMIRR - mirror the parsed pattern into the / search register so n/N can
+;    repeat it (vi: ':s' sets the last search pattern).  Exit: CY clear.
+PSMIRR:
+        LDA     OLDLEN
+        STA     SRCLEN
+        MOV     B,A
+        LXI     H,SUBOLD
+        LXI     D,SRCBUF
+        CALL    COPYB
+        MVI     A,1
+        STA     SRCDIR          ; subsequent n repeats forward
+        ORA     A               ; CY clear
+        RET
+
+;--- PSCOPY - copy a delimited field [HL] -> [DE], up to SUBDELIM or NUL.
+;    '\<delim>' yields a literal delim; other backslashes are literal.  Caps at
+;    40 chars (extra are scanned but dropped).  C counts; HL left at terminator.
+PSCOPY:
+PSF_LP:
+        MOV     A,M
+        ORA     A
+        RZ                      ; NUL -> stop
+        MOV     B,A
+        LDA     SUBDELIM
+        CMP     B
+        RZ                      ; delimiter -> stop
+        MOV     A,B
+        CPI     '\'
+        JNZ     PSC_PUT
+        INX     H               ; look past the backslash
+        MOV     A,M
+        ORA     A
+        JZ      PSC_BSEND       ; '\' at end -> literal backslash
+        MOV     B,A
+        LDA     SUBDELIM
+        CMP     B
+        JZ      PSC_PUT2        ; '\<delim>' -> store delim (B), advance past it
+        DCX     H               ; not an escaped delim -> keep the backslash
+        MVI     B,'\'
+        JMP     PSC_PUT2
+PSC_BSEND:
+        DCX     H
+        MVI     B,'\'
+        JMP     PSC_PUT2
+PSC_PUT:
+        MOV     B,A
+PSC_PUT2:
+        MOV     A,C             ; C is the live field length counter
+        CPI     40
+        JNC     PSC_SK          ; field full -> drop, keep scanning
+        MOV     A,B
+        STAX    D
+        INX     D
+        INR     C
+PSC_SK:
+        INX     H
+        JMP     PSF_LP
+
+;--- COPYB - copy B bytes [HL] -> [DE].
+COPYB:
+        MOV     A,B
+        ORA     A
+        RZ
+CB_LP:
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     CB_LP
+        RET
+
+;--- SUBVALID - clamp ELINE to the file, force SLINE>=1, require SLINE<=ELINE.
+;    CY set if the range is empty/backwards.
+SUBVALID:
+        CALL    GBNLNS
+        SHLD    SUBTOT          ; total lines (1-based)
+        XCHG                    ; DE = total
+        LHLD    ELINE
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H               ; total - ELINE; CY if total < ELINE
+        JNC     SV_EOK
+        LHLD    SUBTOT
+        SHLD    ELINE           ; clamp ELINE to the last line
+SV_EOK:
+        LHLD    SLINE
+        MOV     A,H
+        ORA     L
+        JNZ     SV_SOK
+        LXI     H,1
+        SHLD    SLINE           ; SLINE>=1
+SV_SOK:
+        LHLD    SLINE
+        XCHG                    ; DE = SLINE
+        LHLD    ELINE
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D               ; ELINE - SLINE; CY if ELINE < SLINE
+        JC      SV_BAD
+        ORA     A               ; CY clear -> ok
+        RET
+SV_BAD:
+        STC
+        RET
+
+;--- EXEC_SUB - run the validated substitution over SLINE..ELINE.
+EXEC_SUB:
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    SUBENTRY        ; cursor to restore if nothing matches
+        LXI     H,0
+        SHLD    SUBCNT
+        SHLD    SUBLNS
+        XRA     A
+        STA     SUBSTRT         ; undo record not started
+        STA     SUBUK
+        LHLD    SLINE
+        DCX     H               ; 1-based -> 0-based
+        SHLD    SUBCUR
+        CALL    GBGOTOL         ; cursor at start of the first line in range
+ES_LINE:
+        LHLD    ELINE
+        DCX     H               ; 0-based last line
+        XCHG                    ; DE = last0
+        LHLD    SUBCUR
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H               ; last0 - SUBCUR; CY if SUBCUR > last0
+        JC      ES_DONE
+        XRA     A
+        STA     SUBLMAT         ; this line not matched yet
+ES_SCAN:
+        CALL    SMATCH          ; Z if pattern matches at the cursor
+        JNZ     ES_NOMAT
+        LDA     SUBGLOB
+        ORA     A
+        JNZ     ES_APPLY
+        LDA     SUBLMAT
+        ORA     A
+        JNZ     ES_TOEOL        ; non-global, already matched -> rest of line
+ES_APPLY:
+        CALL    DOSUBST         ; replace; cursor lands after the new text
+        LDA     SUBLMAT
+        ORA     A
+        JNZ     ES_AP2
+        LHLD    SUBLNS
+        INX     H
+        SHLD    SUBLNS          ; count this line once
+ES_AP2:
+        MVI     A,1
+        STA     SUBLMAT
+        LDA     SUBGLOB
+        ORA     A
+        JZ      ES_TOEOL        ; non-global -> done with this line
+        JMP     ES_SCAN         ; global -> keep matching
+ES_NOMAT:
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      ES_DONE         ; end of buffer
+        CPI     CR
+        JZ      ES_EOL
+        CPI     LF
+        JZ      ES_EOL
+        CALL    SADV1           ; step over one byte (records if active)
+        JMP     ES_SCAN
+ES_TOEOL:
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      ES_DONE
+        CPI     CR
+        JZ      ES_EOL
+        CPI     LF
+        JZ      ES_EOL
+        CALL    SADV1
+        JMP     ES_TOEOL
+ES_EOL:
+        CALL    GBPKRT
+        CPI     CR
+        JNZ     ES_EOL_LF
+        CALL    SADV1           ; cross CR (one byte; records if active)
+ES_EOL_LF:
+        CALL    GBPKRT
+        CPI     LF
+        JNZ     ES_NEXTLN
+        CALL    SADV1           ; cross LF
+ES_NEXTLN:
+        LHLD    SUBCUR
+        INX     H
+        SHLD    SUBCUR
+        JMP     ES_LINE
+ES_DONE:
+        LHLD    SUBCNT
+        MOV     A,H
+        ORA     L
+        JZ      ES_NONE         ; nothing replaced
+        ; finalize the unified undo record
+        LDA     SUBUK
+        ORA     A
+        JZ      ES_UOFF
+        LHLD    UCMTLEN
+        SHLD    UNDOLEN         ; drop the trailing unchanged run
+        LHLD    UCMTINS
+        SHLD    UINSCNT
+        MVI     A,UT_DEL
+        STA     UNDOTYP
+        JMP     ES_RESEAT
+ES_UOFF:
+        MVI     A,UT_NONE       ; record overflowed -> no undo
+        STA     UNDOTYP
+ES_RESEAT:
+        LHLD    SUBLAST
+        CALL    GOTOPOS         ; land on the last changed spot
+        CALL    VADJ
+        CALL    AUTOSCR
+        CALL    SCRDRAW
+        CALL    SUBSTAT         ; '<n> subs, <m> lines'
+        JMP     EX_FIN
+ES_NONE:
+        LHLD    SUBENTRY
+        CALL    GOTOPOS         ; nothing changed -> restore the cursor
+        LXI     D,SNOTFND
+        JMP     EXMSG
+
+;--- SMATCH - does SUBOLD[0..OLDLEN) match the text at the cursor?  The cursor
+;    run (R2) is contiguous in memory from base+GAPEN, so this is a plain memcmp
+;    bounded by R2 length.  A literal pattern holds no CR/LF, so a match cannot
+;    cross a line break.  Exit: Z set = match, NZ = no match.
+SMATCH:
+        LDA     OLDLEN
+        ORA     A
+        JZ      SM_NO           ; empty pattern -> never matches
+        MOV     C,A             ; C = pattern length (1..40)
+        MVI     A,BD_TXEND
+        CALL    GBLDHW
+        XCHG                    ; DE = TXEND
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = GAPBG
+        MOV     A,E
+        SUB     L
+        MOV     E,A
+        MOV     A,D
+        SBB     H
+        MOV     D,A             ; DE = R2 length = TXEND - GAPBG
+        MOV     A,D
+        ORA     A
+        JNZ     SM_LENOK        ; R2len >= 256 > pattern -> length is fine
+        MOV     A,E
+        CMP     C
+        JC      SM_NO           ; R2len < pattern length
+SM_LENOK:
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        XCHG                    ; DE = base
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW          ; HL = GAPEN
+        DAD     D               ; HL = base + GAPEN = cursor byte
+        LXI     D,SUBOLD
+        LDA     OLDLEN
+        MOV     B,A
+SM_LP:
+        LDAX    D               ; pattern byte
+        CMP     M               ; vs text byte
+        JNZ     SM_NO
+        INX     D
+        INX     H
+        DCR     B
+        JNZ     SM_LP
+        XRA     A               ; Z set -> match
+        RET
+SM_NO:
+        MVI     A,1
+        ORA     A               ; NZ -> no match
+        RET
+
+;--- DOSUBST - at a confirmed match: record+delete OLD, insert NEW, count it.
+DOSUBST:
+        LDA     SUBSTRT
+        ORA     A
+        JNZ     DS_AT
+        MVI     A,1             ; first match -> open the undo record here
+        STA     SUBSTRT
+        STA     SUBUK
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    UNDOPOS
+        LXI     H,0
+        SHLD    UNDOLEN
+        SHLD    UINSCNT
+        SHLD    UCMTLEN
+        SHLD    UCMTINS
+        LHLD    UNDOBP
+        SHLD    UWP
+DS_AT:
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    SUBLAST         ; cursor landing = start of this change
+        LDA     OLDLEN
+        MOV     B,A
+DS_DEL:
+        MOV     A,B
+        ORA     A
+        JZ      DS_INS
+        PUSH    B
+        CALL    GBPKRT          ; A = byte under the cursor
+        CALL    URECB           ; record it for undo (UNDOLEN++)
+        CALL    GBDELRT         ; remove it
+        POP     B
+        DCR     B
+        JMP     DS_DEL
+DS_INS:
+        LDA     NEWLEN
+        MOV     B,A
+        ORA     A
+        JZ      DS_CNT
+        LXI     H,SUBNEW
+DS_INSL:
+        MOV     A,M
+        PUSH    B
+        PUSH    H
+        CALL    GBINSRT         ; insert one NEW byte (cursor advances)
+        CALL    UINCINS         ; count it (UINSCNT++)
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     DS_INSL
+DS_CNT:
+        LHLD    SUBCNT
+        INX     H
+        SHLD    SUBCNT
+        LHLD    UNDOLEN
+        SHLD    UCMTLEN         ; commit the record up to this replacement
+        LHLD    UINSCNT
+        SHLD    UCMTINS
+        RET
+
+;--- SADV1 - advance the cursor one byte right; if the undo record is open,
+;    record the crossed byte as unchanged interior (UNDOLEN++ and UINSCNT++).
+SADV1:
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        RZ                      ; nothing to cross
+        STA     SUBTB
+        LDA     SUBSTRT
+        ORA     A
+        JZ      SA_MOVE
+        LDA     SUBTB
+        CALL    URECB           ; record original byte
+        CALL    UINCINS         ; count it on the inserted side too
+SA_MOVE:
+        JMP     MV1RT           ; move one byte R2 -> R1 (no CR/LF coalescing)
+
+;--- URECB - append byte A to the undo buffer while the record is enabled.
+;    Overflowing UBMAX clears SUBUK (undo disabled), leaving the edit intact.
+URECB:
+        STA     URBT
+        LDA     SUBUK
+        ORA     A
+        RZ
+        LHLD    UNDOLEN
+        LXI     D,UBMAX
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JNC     URB_OVF         ; UNDOLEN >= UBMAX
+        LHLD    UWP
+        LDA     URBT
+        MOV     M,A
+        INX     H
+        SHLD    UWP
+        LHLD    UNDOLEN
+        INX     H
+        SHLD    UNDOLEN
+        RET
+URB_OVF:
+        XRA     A
+        STA     SUBUK
+        RET
+
+;--- UINCINS - count one inserted byte toward the undo record (if enabled).
+UINCINS:
+        LDA     SUBUK
+        ORA     A
+        RZ
+        LHLD    UINSCNT
+        INX     H
+        SHLD    UINSCNT
+        RET
+
+;--- SUBSTAT - status line: '<count> subs, <lines> lines'.
+SUBSTAT:
+        CALL    STATHOME        ; clear status row, home cursor to it
+        LHLD    SUBCNT
+        CALL    OUTN16
+        LXI     D,SUBSM1        ; ' subs, '
+        CALL    OUTSTR
+        LHLD    SUBLNS
+        CALL    OUTN16
+        LXI     D,SUBSM2        ; ' lines'
+        JMP     OUTSTR
+
+        END

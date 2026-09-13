@@ -1,0 +1,16 @@
+;============================================================
+; FILE:    VIEND.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  End-of-image marker.  MUST be linked LAST.
+;------------------------------------------------------------
+; GAPBUF is the LAST symbol in the combined DSEG, so it marks the first free
+; byte after all code+data -- the base of the gap buffer, which extends from
+; here up to the stack ceiling.  Keeping the buffer outside the DSEG this way
+; (rather than a fixed DS inside it) is how viedit lays memory out and keeps
+; the DSEG itself small so L80 places it cleanly after the code.
+;============================================================
+        INCLUDE VI.INC
+        PUBLIC  BMDEND
+        CSEG
+BMDEND: DS      0               ; end-of-image marker
+        END

@@ -1,0 +1,1019 @@
+;============================================================
+; FILE:    VICMDOPS.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  operators d c y -- linewise + charwise + insert/replace handlers
+;------------------------------------------------------------
+; Split out of VICMD.MAC -- see DESIGN.md / build_vi.py link order.
+;============================================================
+        INCLUDE VI.INC
+        PUBLIC  CWSCAN, ENTINS, GOTOPOS, OPHANDLE, OPSET, VCBIGA
+        PUBLIC  VCBIGI, VCBIGO, VCBIGP, VC_A, VC_I, VC_O
+        PUBLIC  VC_P, VIINS, VIRPL
+        EXTRN   BDFLD, BSTEP, CHGD, CLS, CMDCNT, CNTGET
+        EXTRN   CURLN, CWTAB, DDLAST, DDLINES, DIRTY, DRTLINE
+        EXTRN   EDMODE, ERNGBIG, ESTEP, FASTCH, FASTN, FASTOP
+        EXTRN   FDELOK, FMULTI, FNBLNK, GBADVN, GBBAKN, GBCSOF
+        EXTRN   GBDELRT, GBGOTOL, GBINSRT, GBLDHW, GBMLNE, GBMLNS
+        EXTRN   GBMVDN, GBMVLT, GBMVRT, GBMVUP, GBPKRT, GBR2RG
+        EXTRN   GPTGT, INSMSG, LNCREM, LNOP, MKGET, MKTMP
+        EXTRN   MKTMP2, MVRTIL, NEDIT, NPUTLN, OPB, OPCHAR
+        EXTRN   OPEND, OPLO, OPLSHL, OPLSHR, OPN, OPSTART
+        EXTRN   OUTINSLN, OUTN16, OUTSTR, PENDOP, PKRTF, PTOPSV
+        EXTRN   PUTOFF, RCNT, SCREDAT, SCREDCL, SETDRTY, SETLINE
+        EXTRN   SHOWMOD, STATHOME, STATMSG, UB, UBEGD, UBEGI
+        EXTRN   UBS1, UDEL1, UINS1, UINSCL, UNDOLEN, URECPUT
+        EXTRN   URESET, UWP, VADJ, VCBIGS, WBIG, WSTEP
+        EXTRN   YANKLNS, YBUFP, YLEN, YNK1MSG, YNKMSG, YTYP
+        EXTRN   YWP
+        CSEG
+;============================================================
+; Operators: d / c / y followed by a motion (or a doubled key = linewise).
+;   PENDOP holds the operator char until the next key arrives here.
+;============================================================
+OPSET:
+        STA     PENDOP          ; A = 'd' / 'c' / 'y'
+        RET
+
+OPHANDLE:
+        ; A = PENDOP (operator); C = the motion / target key
+        STA     OPCHAR
+        XRA     A
+        STA     PENDOP          ; consume the pending operator
+        ; snapshot any count typed before the operator (e.g. 3dw, 2dd)
+        LHLD    CMDCNT
+        SHLD    RCNT
+        LXI     H,0
+        SHLD    CMDCNT
+        ; mark motions: 'm (linewise) and `m (charwise) range to a mark
+        MOV     A,C
+        CPI     27H
+        JZ      OPMK_LINE
+        CPI     60H
+        JZ      OPMK_CHAR
+        LDA     OPCHAR
+        CMP     C               ; doubled key (dd / yy / cc / >> / <<) -> linewise
+        JZ      OP_LINE
+        ; '>' / '<' support only the doubled (linewise) form; drop on any other key
+        CPI     '>'
+        JZ      OP_CANCEL
+        CPI     '<'
+        JZ      OP_CANCEL
+        ; cw / cW on a non-blank behave like ce / cE: a "change word" does not
+        ; include the trailing whitespace.  Substitute the motion key (w->e,
+        ; W->E) before scanning.  (On a blank, plain w is kept.)
+        LDA     OPCHAR
+        CPI     'c'
+        JNZ     OPH_GO
+        MOV     A,C
+        CPI     'w'
+        JZ      OPH_C2E
+        CPI     'W'
+        JNZ     OPH_GO
+OPH_C2E:
+        PUSH    B               ; GBPKRT clobbers C (the motion key) via R2HEAD
+        CALL    GBPKRT
+        CALL    CLS             ; class 0 = blank (WBIG-independent)
+        POP     B               ; restore C; A still = class
+        ORA     A
+        JZ      OPH_GO          ; on a blank -> keep w/W (C intact)
+        MOV     A,C
+        CPI     'w'
+        JNZ     OPH_CBW
+        MVI     C,'e'
+        JMP     OPH_GO
+OPH_CBW:
+        MVI     C,'E'
+OPH_GO:
+        ; --- charwise: capture [OPSTART, OPEND) over (count x) the motion ---
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    OPSTART
+        CALL    CNTGET          ; B = repeat count
+OPH_MV:
+        PUSH    B
+        CALL    OPMOVE          ; move per key C; CY set if unsupported
+        POP     B
+        JC      OP_CANCEL
+        DCR     B
+        JNZ     OPH_MV
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    OPEND
+        JMP     OPAPPLY
+OP_CANCEL:
+        RET                     ; unsupported motion: operator dropped
+
+; OPMK_CHAR - operator + `m : charwise range [cursor .. mark m).
+OPMK_CHAR:
+        CALL    GBCSOF
+        SHLD    OPSTART
+        CALL    MKGET           ; HL = mark offset; CY if invalid/unset
+        JC      OP_CANCEL
+        SHLD    OPEND
+        JMP     OPAPPLY
+
+; OPMK_LINE - operator + 'm : linewise over [min..max] of cursor/mark lines.
+; Position at the low line and reuse OP_LINE via RCNT = line count.
+OPMK_LINE:
+        CALL    MKGET
+        JC      OP_CANCEL
+        PUSH    H
+        CALL    CURLN
+        SHLD    MKTMP           ; curline
+        POP     H
+        CALL    GOTOPOS         ; cursor -> mark offset
+        CALL    CURLN
+        SHLD    MKTMP2          ; markline
+        LHLD    MKTMP
+        XCHG                    ; DE = curline
+        LHLD    MKTMP2          ; HL = markline
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D               ; markline - curline; CY if markline < curline
+        JNC     OPML_OK
+        ; swap so MKTMP = lo, MKTMP2 = hi
+        LHLD    MKTMP
+        XCHG
+        LHLD    MKTMP2
+        SHLD    MKTMP
+        XCHG
+        SHLD    MKTMP2
+OPML_OK:
+        LHLD    MKTMP
+        XCHG                    ; DE = lo
+        LHLD    MKTMP2          ; HL = hi
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = hi - lo
+        INX     B               ; count = hi-lo+1
+        LHLD    MKTMP           ; lo line
+        PUSH    B
+        CALL    GBGOTOL         ; cursor -> lo line
+        POP     H               ; HL = count
+        MOV     A,H
+        ORA     A
+        JNZ     OPL_BIG         ; > 255 lines -> too big
+        SHLD    RCNT
+        JMP     OP_LINE
+
+; OPL_BIG - a linewise/charwise range too big for the yank/undo buffer.
+OPL_BIG:
+        LXI     D,ERNGBIG
+        JMP     STATMSG         ; report; nothing was changed
+; LNCHK - B = line count.  CY set if those lines (from the cursor's line start)
+; total more than UBMAX bytes (won't fit the yank/undo buffer).  Cursor restored.
+LNCHK:
+        MOV     A,B
+        STA     LNCREM          ; lines to scan
+        CALL    GBCSOF
+        SHLD    MKTMP           ; save cursor offset
+        CALL    GBMLNS          ; to the line start
+        CALL    GBR2RG          ; HL = R2 head, DE = R2 end
+        LXI     B,0             ; BC = byte count
+LNC_LP:
+        MOV     A,L
+        CMP     E
+        JNZ     LNC_GO
+        MOV     A,H
+        CMP     D
+        JZ      LNC_OK
+LNC_GO:
+        INX     B               ; count this byte
+        MOV     A,C
+        SUI     0E9H            ; BC - (UBMAX+1)
+        MOV     A,B
+        SBI     03H
+        JNC     LNC_OVF
+        MOV     A,M
+        INX     H
+        CPI     LF
+        JNZ     LNC_LP
+        LDA     LNCREM
+        DCR     A
+        STA     LNCREM
+        JNZ     LNC_LP
+LNC_OK:
+        LHLD    MKTMP
+        CALL    GOTOPOS         ; restore cursor
+        ORA     A               ; CY clear = fits
+        RET
+LNC_OVF:
+        LHLD    MKTMP
+        CALL    GOTOPOS
+        STC                     ; CY set = too big
+        RET
+OP_LINE:
+        LDA     OPCHAR
+        CPI     '>'
+        JZ      OPLSHR         ; >> shift the line(s) right
+        CPI     '<'
+        JZ      OPLSHL         ; << shift left
+        CPI     'c'
+        JZ      VCBIGS         ; cc: change the line
+        ; y / dd buffer the whole range -> refuse (never truncate) if oversize
+        CALL    CNTGET          ; B = count
+        CALL    LNCHK           ; CY if the range exceeds the buffer
+        JC      OPL_BIG
+        LDA     OPCHAR
+        CPI     'y'
+        JZ      OPL_YANK        ; yy / Nyy: yank COUNT lines, cursor unchanged
+        ; dd: delete COUNT lines (all in one undo record + one linewise yank)
+        CALL    CNTGET          ; B = count
+        MOV     A,B
+        CPI     1
+        JNZ     OPL_MULTI       ; Ndd -> full redraw
+        ; single dd: use the VT100 ESC[M fast path, unless it is the last line
+        ; (which moves the cursor UP a row -> simpler to fully repaint).
+        CALL    DDLAST
+        ORA     A
+        JNZ     OPL_FULL
+        MVI     B,1
+        CALL    DDLINES
+        MVI     A,2             ; LNOP = delete-line (ESC[M + redraw bottom row)
+        STA     LNOP
+        RET
+OPL_FULL:
+        MVI     B,1
+        CALL    DDLINES
+        JMP     SETDRTY
+OPL_MULTI:
+        CALL    DDLINES         ; B = count: delete N lines, one record + yank
+        JMP     SETDRTY
+OPL_YANK:
+        CALL    CNTGET          ; B = count
+        CALL    YANKLNS         ; yank N lines (cursor restored)
+        JMP     YNKSTAT         ; 'N line(s) yanked' on the status row
+
+;------------------------------------------------------------
+; YNKSTAT - status row 'N line(s) yanked'.  N = LF count in YBUF[0..YLEN)
+; (the actual lines yanked, capped at EOF; YLINEFIX guarantees a trailing LF).
+; No redraw follows yy, so the message persists (like ^G).
+;------------------------------------------------------------
+YNKSTAT:
+        LHLD    YLEN
+        XCHG                    ; DE = bytes remaining
+        LHLD    YBUFP
+        LXI     B,0             ; BC = line count
+YNS_LP:
+        MOV     A,D
+        ORA     E
+        JZ      YNS_DN
+        MOV     A,M
+        CPI     LF
+        JNZ     YNS_NX
+        INX     B
+YNS_NX:
+        INX     H
+        DCX     D
+        JMP     YNS_LP
+YNS_DN:
+        PUSH    B               ; save count across STATCLR/GOTOXY (they clobber BC)
+        CALL    STATHOME        ; clear status row, home cursor to it
+        POP     H               ; HL = line count
+        PUSH    H
+        CALL    OUTN16
+        POP     H
+        MOV     A,H
+        ORA     A
+        JNZ     YNS_PL
+        MOV     A,L
+        CPI     1
+        JNZ     YNS_PL
+        LXI     D,YNK1MSG       ; ' line yanked'
+        JMP     OUTSTR
+YNS_PL:
+        LXI     D,YNKMSG        ; ' lines yanked'
+        JMP     OUTSTR
+
+; OPMOVE - move the cursor per the operator-motion key in C.
+; Exit: CY clear if the motion ran, CY set if it is unsupported.
+OPMOVE:
+        MOV     A,C
+        CPI     'w'
+        JZ      OPM_W
+        CPI     'W'
+        JZ      OPM_BW
+        CPI     'b'
+        JZ      OPM_B
+        CPI     'B'
+        JZ      OPM_BB
+        CPI     'e'
+        JZ      OPM_E
+        CPI     'E'
+        JZ      OPM_BE
+        CPI     '$'
+        JZ      OPM_DOL
+        CPI     '0'
+        JZ      OPM_0
+        CPI     'h'
+        JZ      OPM_H
+        CPI     'l'
+        JZ      OPM_L
+        CPI     '^'
+        JZ      OPM_CARET
+        STC
+        RET
+OPM_CARET:
+        CALL    GBMLNS          ; ^ : first non-blank of the line
+        CALL    FNBLNK
+        JMP     OPM_OK
+OPM_W:  XRA     A               ; cw/dw use word (alnum/_) boundaries
+        STA     WBIG
+        CALL    WSTEP
+        JMP     OPM_OK
+OPM_BW: MVI     A,1
+        STA     WBIG
+        CALL    WSTEP
+        JMP     OPM_OK
+OPM_B:  XRA     A
+        STA     WBIG
+        CALL    BSTEP
+        JMP     OPM_OK
+OPM_BB: MVI     A,1
+        STA     WBIG
+        CALL    BSTEP
+        JMP     OPM_OK
+OPM_E:  XRA     A
+        STA     WBIG
+        JMP     OPM_EE
+OPM_BE: MVI     A,1
+        STA     WBIG
+OPM_EE: CALL    ESTEP
+        CALL    GBMVRT          ; inclusive of the word-end char
+        JMP     OPM_OK
+OPM_DOL:CALL    GBMLNE          ; to the line break (delete through last char)
+        JMP     OPM_OK
+OPM_0:  CALL    GBMLNS
+        JMP     OPM_OK
+OPM_H:  CALL    GBMVLT
+        JMP     OPM_OK
+OPM_L:  CALL    GBMVRT
+OPM_OK: XRA     A               ; clear CY
+        RET
+
+; OPAPPLY - apply the operator (OPCHAR) over [OPSTART, OPEND).
+OPAPPLY:
+        LHLD    OPSTART
+        XCHG                    ; DE = OPSTART
+        LHLD    OPEND
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = OPEND - OPSTART
+        MOV     A,B
+        ORA     C
+        RZ                      ; empty range -> nothing
+        MOV     A,B
+        ORA     A
+        JP      OPA_POS         ; OPEND >= OPSTART
+        ; OPEND < OPSTART: lo = OPEND, n = OPSTART - OPEND
+        LHLD    OPEND
+        SHLD    OPLO
+        LHLD    OPSTART
+        XCHG                    ; DE = OPSTART
+        LHLD    OPEND
+        MOV     A,E
+        SUB     L
+        MOV     C,A
+        MOV     A,D
+        SBB     H
+        MOV     B,A             ; BC = n
+        JMP     OPA_GO
+OPA_POS:
+        LHLD    OPSTART
+        SHLD    OPLO
+        ; BC already = n
+OPA_GO:
+        MOV     H,B
+        MOV     L,C
+        SHLD    OPN
+        ; charwise buffer holds <=250 bytes -> error instead of truncating
+        MOV     A,H
+        ORA     A
+        JNZ     OPL_BIG
+        MOV     A,L
+        CPI     251
+        JNC     OPL_BIG
+        LHLD    OPLO
+        CALL    GOTOPOS         ; cursor to the low end of the range
+        ; charwise d/c VT100 redraw classification, decided BEFORE OPDELN (the
+        ; deleted text -- needed for the cell count, the tab check, and whether
+        ; the range spans a line break -- is gone afterwards).
+        XRA     A
+        STA     FDELOK
+        STA     FMULTI
+        LDA     OPCHAR
+        CPI     'y'
+        JZ      OPA_AFP         ; yank: no redraw classification needed
+        CALL    OPCLAS          ; sets FDELOK (+FASTN) and FMULTI
+OPA_AFP:
+        LDA     OPCHAR
+        CPI     'y'
+        JZ      OPA_YANK
+        CALL    OPDELN          ; d / c: delete (yanked) the range
+        LDA     OPCHAR
+        CPI     'c'
+        JZ      OPA_CHG
+        ; --- d{motion}: cheapest correct redraw (same paths as cw) ---
+        LDA     FMULTI
+        ORA     A
+        JNZ     SETDRTY         ; range spanned a line break -> full redraw
+        LDA     FDELOK
+        ORA     A
+        JZ      SETLINE         ; in-line, tab/backward -> whole current line
+        MVI     A,3
+        STA     FASTOP          ; ESC[NP delete fast path (SCRLNE -> SLN_DEL)
+        JMP     SETLINE         ; DRTLINE -> main loop calls SCRLNE
+OPA_CHG:
+        ; OPDELN recorded the deleted range; insert mode counts the inserted
+        ; bytes onto the SAME unified undo record (no URESET, no UBEGI) so
+        ; `u` reverses the whole change (delete + insert).
+        LDA     FMULTI
+        ORA     A
+        JNZ     OPA_CHGM        ; range spanned a line break -> full redraw
+        LDA     FDELOK
+        ORA     A
+        JZ      OPA_CHGF
+        MVI     A,3
+        STA     FASTOP          ; arm the ESC[P delete fast path (SCRLNE emits it)
+        CALL    SETLINE         ; DRTLINE -> main loop calls SCRLNE
+        JMP     ENTINS
+OPA_CHGF:
+        CALL    SETLINE         ; in-line, tab/backward -> full current-line redraw
+        JMP     ENTINS
+OPA_CHGM:
+        CALL    SETDRTY         ; lines merged -> full screen redraw, then insert
+        JMP     ENTINS
+
+;------------------------------------------------------------
+; OPCLAS - classify the charwise range [OPLO, OPLO+OPN) BEFORE the delete
+; (cursor at OPLO, OPN = bytes to delete, line still intact).  Sets two flags
+; the caller uses to pick the cheapest correct redraw:
+;   FMULTI = 1 if a line break (CR/LF) lies inside the range -- i.e. OPN exceeds
+;            the content bytes to this line's break, so the delete merges/removes
+;            lines and the caller must do a full-screen redraw.
+;   FDELOK = 1 (+ FASTN = OPN) if the delete can use the ESC[NP fast path: the
+;            range is in-line (not FMULTI); no TAB lies from the cursor to EOL
+;            (so display cells == bytes and a left shift won't re-stop a tab);
+;            the motion was FORWARD (OPLO == OPSTART, so the terminal cursor is
+;            already at OPLO); and OPN is in [1,255].
+; Both flags default to 0 (cleared by the caller).  Cursor unchanged.
+;------------------------------------------------------------
+OPCLAS:
+        CALL    CWSCAN          ; HL = content bytes to the break; A = TAB flag
+        PUSH    PSW             ; save the TAB-present flag
+        XCHG                    ; DE = bytes to EOL
+        LHLD    OPN             ; HL = OPN
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H               ; bytesToEOL - OPN; CY iff OPN > bytesToEOL
+        JNC     OPCL_IL         ; OPN <= bytesToEOL -> in-line
+        MVI     A,1
+        STA     FMULTI          ; range spans a line break -> full redraw
+OPCL_IL:
+        POP     PSW             ; A = TAB flag
+        ORA     A
+        RNZ                     ; a TAB in [cursor,EOL) -> no fast path
+        LDA     FMULTI
+        ORA     A
+        RNZ                     ; spans a break -> no fast path
+        LHLD    OPSTART         ; forward only: OPLO == OPSTART
+        XCHG
+        LHLD    OPLO
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        ORA     C
+        RNZ                     ; OPLO != OPSTART -> backward -> no fast path
+        LHLD    OPN
+        MOV     A,H
+        ORA     A
+        RNZ                     ; OPN > 255 -> no fast path
+        MOV     A,L
+        ORA     A
+        RZ                      ; nothing to delete
+        STA     FASTN
+        MVI     A,1
+        STA     FDELOK
+        RET
+
+;------------------------------------------------------------
+; CWSCAN - scan the current line from the cursor to EOL (no cursor move).
+; Exit: HL = content bytes to the line break; A = 1 if a TAB is in that span.
+;------------------------------------------------------------
+CWSCAN:
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG                    ; DE = GAPEN
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        DAD     D               ; HL = base+GAPEN = cursor (R2 head)
+        PUSH    H
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW
+        XCHG                    ; DE = BSIZE
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        DAD     D               ; HL = base+BSIZE = R2 end
+        XCHG                    ; DE = R2 end
+        POP     H               ; HL = scan ptr (cursor)
+        LXI     B,0             ; BC = byte count
+        XRA     A
+        STA     CWTAB
+CWS_LP:
+        MOV     A,L
+        CMP     E
+        JNZ     CWS_NE
+        MOV     A,H
+        CMP     D
+        JZ      CWS_DN          ; reached R2 end
+CWS_NE:
+        MOV     A,M
+        CPI     LF
+        JZ      CWS_DN
+        CPI     CR
+        JZ      CWS_DN
+        CPI     TAB
+        JNZ     CWS_NT
+        MVI     A,1
+        STA     CWTAB
+CWS_NT:
+        INX     H
+        INX     B
+        JMP     CWS_LP
+CWS_DN:
+        MOV     H,B
+        MOV     L,C             ; HL = bytes to EOL
+        LDA     CWTAB           ; A = tab flag
+        RET
+OPA_YANK:
+        CALL    OPDELN          ; yank+delete ...
+        CALL    INSYANK         ; ... then put it back (net: a pure yank)
+        LHLD    OPLO
+        CALL    GOTOPOS
+        XRA     A
+        STA     CHGD            ; a yank is not a change (don't record for `.`)
+        RET
+
+; OPDELN - from the cursor, yank OPN bytes into YBUF (charwise) and delete them.
+OPDELN:
+        CALL    UBEGD
+        MVI     A,1
+        STA     CHGD            ; operator delete modifies the buffer (for `.`)
+        XRA     A
+        STA     YTYP            ; YT_CHAR
+        LHLD    YBUFP
+        SHLD    YWP
+        LXI     H,0
+        SHLD    YLEN
+ODN_LP:
+        LHLD    OPN
+        MOV     A,H
+        ORA     L
+        RZ
+        DCX     H
+        SHLD    OPN
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        RZ                      ; safety
+        STA     OPB
+        LHLD    YLEN            ; store to YBUF only if there is room
+        MOV     A,H
+        ORA     A
+        JNZ     ODN_NS
+        MOV     A,L
+        CPI     250
+        JNC     ODN_NS
+        LHLD    YWP
+        LDA     OPB
+        MOV     M,A
+        INX     H
+        SHLD    YWP
+        LHLD    YLEN
+        INX     H
+        SHLD    YLEN
+ODN_NS:
+        ; also record for undo (UNDOBUF), then delete
+        LDA     OPB
+        STA     UB
+        LHLD    UNDOLEN
+        MOV     A,H
+        ORA     A
+        JNZ     ODN_DEL
+        MOV     A,L
+        CPI     250
+        JNC     ODN_DEL
+        LHLD    UWP
+        LDA     UB
+        MOV     M,A
+        INX     H
+        SHLD    UWP
+        LHLD    UNDOLEN
+        INX     H
+        SHLD    UNDOLEN
+ODN_DEL:
+        CALL    GBDELRT
+        JMP     ODN_LP
+
+;------------------------------------------------------------
+; INSYANK - insert YLEN bytes from YBUF at the cursor (forward).
+;------------------------------------------------------------
+INSYANK:
+        LHLD    YLEN
+        MOV     B,H
+        MOV     C,L
+        LHLD    YBUFP
+IY_LP:
+        MOV     A,B
+        ORA     C
+        RZ
+        MOV     A,M
+        PUSH    B
+        PUSH    H
+        CALL    GBINSRT
+        POP     H
+        POP     B
+        INX     H
+        DCX     B
+        JMP     IY_LP
+
+;------------------------------------------------------------
+; GOTOPOS - move the cursor to absolute byte offset HL.  Relocates the gap to
+; the target in ONE block move (GBADVN/GBBAKN) -- O(1) field updates + one
+; memmove rather than one GBMVRT/GBMVLT per byte.  The target is a raw byte
+; offset (BD_CSOFF semantics); callers pass valid cursor positions.
+;------------------------------------------------------------
+GOTOPOS:
+        SHLD    GPTGT
+        CALL    GBCSOF          ; HL = cursor byte offset
+        XCHG                    ; DE = current
+        LHLD    GPTGT           ; HL = target
+        MOV     A,L             ; BC = target - current  (signed)
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A
+        ORA     C
+        RZ                      ; already at target
+        MOV     A,B
+        ORA     A
+        JM      GP_BACK         ; target < current -> move left
+        JMP     GBADVN          ; BC = forward distance
+GP_BACK:
+        ; distance = current - target
+        CALL    GBCSOF          ; HL = cursor byte offset
+        XCHG                    ; DE = current
+        LHLD    GPTGT           ; HL = target
+        MOV     A,E
+        SUB     L
+        MOV     C,A
+        MOV     A,D
+        SBB     H
+        MOV     B,A             ; BC = current - target
+        JMP     GBBAKN
+
+;------------------------------------------------------------
+; p - put after.  Linewise: open a line below and insert.  Charwise: insert
+;     after the cursor char.
+;------------------------------------------------------------
+VC_P:
+        LDA     YTYP
+        ORA     A
+        JZ      VP_CHAR
+        ; linewise: position at the start of the next line (after the break)
+        CALL    GBMLNE
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      VP_NONL
+        CALL    GBMVRT          ; cross CR,LF -> next line start (or EOB)
+        JMP     VP_LINS
+VP_NONL:
+        MVI     A,CR            ; last line had no newline: add one
+        CALL    GBINSRT
+        MVI     A,LF
+        CALL    GBINSRT
+VP_LINS:
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    PUTOFF
+        CALL    URECPUT         ; undo: inserted YLEN bytes here
+        CALL    INSYANK
+        LHLD    PUTOFF
+        CALL    GOTOPOS         ; cursor at start of the put line
+        JMP     PUTREDR         ; O-style insert of the put line(s), no full blank
+VP_CHAR:
+        CALL    MVRTIL          ; move past the current char
+        CALL    URECPUT
+        CALL    INSYANK
+        JMP     PUTCHRD
+
+;------------------------------------------------------------
+; P - put before.  Linewise: insert above current line.  Charwise: at cursor.
+;------------------------------------------------------------
+VCBIGP:
+        LDA     YTYP
+        ORA     A
+        JZ      VBP_CHAR
+        CALL    GBMLNS          ; start of current line
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    PUTOFF
+        CALL    URECPUT
+        CALL    INSYANK
+        LHLD    PUTOFF
+        CALL    GOTOPOS
+        JMP     PUTREDR         ; O-style insert of the put line(s)
+VBP_CHAR:
+        CALL    URECPUT
+        CALL    INSYANK
+        JMP     PUTCHRD
+
+;------------------------------------------------------------
+; PUTCHRD - redraw after a charwise put.  If the pasted text held a line break
+; the line structure changed -> full redraw; otherwise just the current line.
+;------------------------------------------------------------
+PUTCHRD:
+        CALL    CNTYLN
+        ORA     A
+        JNZ     SETDRTY
+        JMP     SETLINE
+
+;------------------------------------------------------------
+; PUTREDR - redraw after a linewise put, O-style: insert the put lines (ESC[NL)
+; and draw them without a full-screen blank, UNLESS the viewport must scroll (or
+; HSCROL changes), in which case a full redraw is correct.  Cursor at PUTOFF.
+;------------------------------------------------------------
+PUTREDR:
+        CALL    CNTYLN          ; A = number of put lines
+        ORA     A
+        JZ      SETDRTY         ; defensive (nothing pasted)
+        STA     NPUTLN
+        MVI     A,BD_TOPLN
+        CALL    GBLDHW
+        SHLD    PTOPSV          ; snapshot the top line
+        CALL    VADJ            ; settle CSROW; may scroll / set DIRTY
+        LDA     DIRTY
+        ORA     A
+        JNZ     SETDRTY         ; VADJ wants a full redraw
+        MVI     A,BD_TOPLN
+        CALL    GBLDHW
+        XCHG                    ; DE = new TOPLN
+        LHLD    PTOPSV
+        MOV     A,L
+        CMP     E
+        JNZ     SETDRTY         ; viewport scrolled -> full redraw
+        MOV     A,H
+        CMP     D
+        JNZ     SETDRTY
+        ; no scroll: insert the blank lines and paint the put content
+        LDA     NPUTLN
+        CALL    PUTDRAW
+        XRA     A
+        STA     DRTLINE         ; lines already drawn; main loop just seats cursor
+        RET
+
+;------------------------------------------------------------
+; PUTDRAW - A = line count.  Insert that many blank screen lines at the cursor
+; row (O-style), draw the put lines into them (clamped to the edit area), and
+; restore the cursor to the first put line (PUTOFF).
+;------------------------------------------------------------
+PUTDRAW:
+        LDA     NPUTLN          ; open NPUTLN blank lines at the cursor row
+        MOV     B,A
+PUTD_INS:
+        PUSH    B
+        CALL    OUTINSLN        ; ESC[L : insert one line, push the rest down
+        POP     B
+        DCR     B
+        JNZ     PUTD_INS
+        LDA     NPUTLN
+        MOV     B,A             ; B = lines left to draw
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MOV     A,M
+        ADI     1
+        MOV     D,A             ; D = first put line's terminal row
+PUTD_LP:
+        LDA     NEDIT
+        CMP     D
+        JC      PUTD_DONE       ; row beyond the edit area -> stop
+        PUSH    B
+        PUSH    D
+        CALL    SCREDAT         ; draw the current line at row D
+        POP     D
+        POP     B
+        INR     D
+        PUSH    B
+        PUSH    D
+        CALL    GBMVDN          ; advance to the next put line
+        POP     D
+        POP     B
+        DCR     B
+        JNZ     PUTD_LP
+PUTD_DONE:
+        LHLD    PUTOFF
+        JMP     GOTOPOS         ; restore the cursor to the first put line
+
+;------------------------------------------------------------
+; CNTYLN - A = number of LF bytes in YBUF[0..YLEN) (= linewise put line count).
+;------------------------------------------------------------
+CNTYLN:
+        LHLD    YLEN
+        MOV     B,H
+        MOV     C,L
+        LHLD    YBUFP
+        MVI     E,0             ; E = LF count
+CYL_LP:
+        MOV     A,B
+        ORA     C
+        JZ      CYL_DN
+        MOV     A,M
+        CPI     LF
+        JNZ     CYL_NX
+        INR     E
+CYL_NX:
+        INX     H
+        DCX     B
+        JMP     CYL_LP
+CYL_DN:
+        MOV     A,E
+        RET
+
+;------------------------------------------------------------
+; Insert-mode entry points.
+;------------------------------------------------------------
+VC_I:                           ; insert before cursor
+        CALL    UBEGI
+        JMP     ENTINS
+VC_A:                           ; append after cursor
+        CALL    MVRTIL
+        CALL    UBEGI
+        JMP     ENTINS
+VCBIGA:                        ; append at end of line
+        CALL    GBMLNE
+        CALL    UBEGI
+        JMP     ENTINS
+VCBIGI:                        ; insert at start of line
+        CALL    GBMLNS
+        CALL    UBEGI
+        JMP     ENTINS
+VC_O:                           ; open line below
+        CALL    GBMLNE
+        CALL    UBEGI           ; record from before the new CR,LF
+        CALL    UINSCL          ; record CR,LF into the undo buffer
+        MVI     A,1
+        STA     LNOP            ; inserted a line: ESC[L fast path (or scroll)
+        JMP     ENTINS
+VCBIGO:                        ; open line above
+        CALL    GBMLNS
+        CALL    UBEGI
+        CALL    UINSCL          ; record CR,LF into the undo buffer
+        CALL    GBMVLT          ; back onto the new (empty) line
+        MVI     A,1
+        STA     LNOP            ; inserted a line: ESC[L fast path (or scroll)
+        JMP     ENTINS
+
+;------------------------------------------------------------
+; ENTINS - enter insert mode, show the mode indicator.
+;------------------------------------------------------------
+ENTINS:
+        MVI     A,EM_INS
+        STA     EDMODE
+        LXI     D,INSMSG
+        CALL    SHOWMOD
+        RET
+
+;============================================================
+; VIINS - insert-mode key handler.  B = type, C = char/action.
+;============================================================
+VIINS:
+        MOV     A,B
+        CPI     KT_ACT
+        JZ      VI_ACT
+        CPI     KT_CHAR
+        RNZ
+        MOV     A,C
+        CPI     CR
+        JZ      VI_CR
+        CPI     BS
+        JZ      VI_BS
+        CPI     DEL
+        JZ      VI_BS
+        ; insert the (printable or other) character.  A printable char arms the
+        ; incremental fast path (SCRLNE); control chars fall back to a redraw.
+        MOV     A,C
+        CPI     ' '
+        CNC     INSFAST
+        MOV     A,C
+        CALL    UINS1
+        JMP     SETLINE
+INSFAST:
+        MOV     A,C
+        STA     FASTCH
+        MVI     A,1
+        STA     FASTOP
+        RET
+VI_CR:
+        ; split the line: the text after the cursor moves to a new line below.
+        ; Use the same one-line-insert fast path as `o` instead of a full redraw.
+        ; At this point (before VADJ) BD_CSROW still holds the SPLIT line's screen
+        ; row, so the truncated upper half can be redrawn in place now; a later
+        ; one-line viewport scroll (if the cursor was on the bottom row) shifts
+        ; that freshly-drawn row along with the rest, so it stays correct.
+        CALL    UINSCL          ; record CR,LF into the undo buffer
+        CALL    GBMVUP          ; -> the upper half (still at BD_CSROW on screen)
+        CALL    SCREDCL         ; erase + redraw the now-truncated upper line
+        CALL    GBMVDN          ; -> back to the start of the lower line
+        MVI     A,1
+        STA     LNOP            ; lower half: ESC[L insert-line fast path (like o)
+        RET
+VI_BS:
+        CALL    UBS1
+        JMP     SETLINE
+VI_ACT:
+        MOV     A,C
+        CPI     ACT_ESC
+        RNZ                     ; ignore other actions while inserting
+        ; leave insert mode (vi steps left one), clear the indicator.  The line
+        ; is already current (each keystroke did DRTLINE), so only the cursor
+        ; needs to move -- no full redraw.
+        XRA     A
+        STA     EDMODE          ; EM_CMD
+        CALL    GBMVLT
+        LXI     D,0
+        JMP     SHOWMOD         ; clears the mode indicator, then returns
+
+;============================================================
+; VIRPL - replace (overwrite) mode handler.  B = type, C = char/action.
+;============================================================
+VIRPL:
+        MOV     A,B
+        CPI     KT_ACT
+        JZ      VR_ACT
+        CPI     KT_CHAR
+        RNZ
+        MOV     A,C
+        CPI     CR
+        JZ      VR_CR
+        CPI     BS
+        JZ      VR_BS
+        CPI     DEL
+        JZ      VR_BS
+        ; overwrite: delete the char under the cursor first unless at EOL
+        MOV     A,C
+        STA     FASTCH          ; typed char (memory copy survives clobbers)
+        PUSH    PSW             ; save the typed char for GBINSRT
+        CALL    GBPKRT          ; A = char under the cursor
+        CPI     0FFH
+        JZ      VR_INS
+        CPI     LF
+        JZ      VR_INS
+        CPI     CR
+        JZ      VR_INS
+        ; overwriting a real char: arm the in-place fast path before deleting
+        ; (typed printable, replaced char not a tab -> no width change).
+        MOV     B,A             ; B = char under cursor
+        LDA     FASTCH
+        CPI     ' '
+        JC      VR_DOOVR        ; control typed -> redraw
+        MOV     A,B
+        CPI     TAB
+        JZ      VR_DOOVR        ; replaced a tab -> redraw
+        MVI     A,2
+        STA     FASTOP
+VR_DOOVR:
+        CALL    UDEL1           ; not at EOL: overwrite (record the old char)
+        JMP     VR_PUT
+VR_INS:                         ; at EOL: pure insert (append) -> insert fast path
+        LDA     FASTCH
+        CPI     ' '
+        JC      VR_PUT
+        MVI     A,1
+        STA     FASTOP
+VR_PUT:
+        POP     PSW
+        CALL    UINS1           ; insert typed char, count onto the record
+        JMP     SETLINE
+VR_CR:
+        CALL    UINSCL          ; record CR,LF into the undo buffer
+        JMP     SETDRTY
+VR_BS:
+        CALL    URESET          ; can't un-record an overwrite on backspace ->
+                                ; disable undo for this R session (safe)
+        CALL    GBMVLT          ; step back over the last overwrite
+        JMP     SETLINE
+VR_ACT:
+        MOV     A,C
+        CPI     ACT_ESC
+        RNZ
+        XRA     A
+        STA     EDMODE          ; back to command mode
+        CALL    GBMVLT
+        LXI     D,0
+        JMP     SHOWMOD         ; clear indicator + return; cursor-only update
+
+        END

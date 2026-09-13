@@ -1,0 +1,367 @@
+;============================================================
+; FILE:    VIFILEIO.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  File load / save + input byte/line reader.  Verbatim (no CR xform).
+;------------------------------------------------------------
+; Lazy LOAD: read input through IRGETB (a buffered byte reader) into the
+; window, stopping after ~2 screens of lines AT A LINE BOUNDARY (so the
+; window engine always deals in whole lines) or at ^Z/EOF.  The reader is
+; left positioned so the slide engine (VIWIN) and the save tail continue
+; from exactly where the load stopped.
+;
+; STREAM SAVE (Stage A -- no slides yet): window R1+R2 then the unread input
+; tail.  VIWIN's slide-aware save replaces this in Stage C.
+;
+; File I/O uses BDOS; the console-only-BIOS rule does not apply here.
+;------------------------------------------------------------
+; EXPORTS:
+;   FIOPEN  INFCB -> resident buffer (oversize files refused up front)
+;   FISAVE  buffer -> OUTFCB
+;   INFCB OUTFCB
+;   IRGETB  -> A=byte, CY=EOF    (buffered input byte reader)
+;   INRDLN  HL=dst -> BC=len, CY=no-more-lines   (read one whole line)
+;============================================================
+        INCLUDE VI.INC
+
+        EXTRN   BDFLD, GBLDHW, GBSTHW, GBMVTOP
+
+        PUBLIC  FIOPEN, FISAVE, INFCB, OUTFCB, IRGETB, INRDLN, IRINIT
+
+        CSEG
+
+;============================================================
+; IRINIT - reset the input byte reader (INFCB already open).
+;============================================================
+IRINIT:
+        MVI     A,RECSIZ
+        STA     IRPOS           ; force a record read on first IRGETB
+        XRA     A
+        STA     IREOF
+        RET
+
+;============================================================
+; IRGETB - next input byte.  Exit: CY clear, A=byte; or CY set at EOF.
+;============================================================
+IRGETB:
+        LDA     IREOF
+        ORA     A
+        JNZ     IRG_EOF
+        LDA     IRPOS
+        CPI     RECSIZ
+        JNZ     IRG_HAVE
+        ; refill from the next record
+        PUSH    B
+        PUSH    H
+        LXI     D,IRBUF
+        MVI     C,BF_SETDMA
+        CALL    BDOS
+        LXI     D,INFCB
+        MVI     C,BF_FREAD
+        CALL    BDOS
+        POP     H
+        POP     B
+        ORA     A
+        JNZ     IRG_SEOF        ; FREAD nonzero -> EOF
+        XRA     A
+        STA     IRPOS
+IRG_HAVE:
+        LDA     IRPOS
+        MOV     E,A
+        MVI     D,0
+        LXI     H,IRBUF
+        DAD     D
+        MOV     C,M             ; C = byte
+        INR     A               ; A = IRPOS+1
+        STA     IRPOS
+        MOV     A,C
+        ORA     A               ; clear CY
+        RET
+IRG_SEOF:
+        MVI     A,1
+        STA     IREOF
+IRG_EOF:
+        STC
+        RET
+
+;============================================================
+; INRDLN - read one line into [HL].  Exit BC = byte count (incl. terminator
+; if any); CY set (and BC=0) when there are no more lines.  A line ends at
+; LF (kept), at ^Z/EOF, or at the LNMAX cap.
+;============================================================
+INRDLN:
+        LXI     B,0
+INRD_LP:
+        PUSH    B
+        PUSH    H
+        CALL    IRGETB
+        POP     H
+        POP     B
+        JC      INRD_EOF
+        CPI     CPMEOF
+        JZ      INRD_EOF
+        MOV     M,A
+        INX     H
+        INX     B
+        CPI     LF
+        JZ      INRD_DONE       ; line complete
+        ; cap check: continue while BC < LNMAX (16-bit)
+        MOV     A,C
+        SUI     LNMAX AND 0FFH
+        MOV     A,B
+        SBI     LNMAX SHR 8
+        JC      INRD_LP         ; BC < LNMAX -> keep reading
+INRD_DONE:
+        XRA     A               ; line ended (LF or cap): CY clear
+        RET
+INRD_EOF:
+        MOV     A,B
+        ORA     C
+        JZ      INRD_NONE
+        XRA     A               ; have a final (unterminated) line, CY clear
+        RET
+INRD_NONE:
+        STC
+        RET
+
+;============================================================
+; FIOPEN - load INFCB fully into the (freshly GBINIT'd) buffer via IRGETB.
+; RAM-only: the whole file lives resident.  Before loading, an up-front size
+; gate (BDOS FSIZE = fn 35) rejects any file that would not fit in the usable
+; buffer (BSIZE - MINGAP); such files are refused outright (paging to scratch
+; is unusably slow on real Altair hardware).  Cursor left at the top.
+;
+; Exit: A = 0 loaded OK (or a new/empty file); A = 1 file too large (not loaded).
+;============================================================
+FIOPEN:
+        XRA     A
+        STA     INFCB+FCB_CR
+        LXI     D,INFCB
+        MVI     C,BF_FOPEN
+        CALL    BDOS
+        CPI     0FFH
+        JZ      FIO_NEW
+        ;--- up-front size gate: reject files too big to hold resident ---------
+        ; FSIZE fills INFCB R0/R1/R2 with the file size in 128-byte records.
+        LXI     D,INFCB
+        MVI     C,BF_FSIZE
+        CALL    BDOS
+        LDA     INFCB+FCB_R2
+        ORA     A
+        JNZ     FIO_BIG         ; >= 16M records -> far too big
+        LDA     INFCB+FCB_R1
+        MOV     D,A
+        LDA     INFCB+FCB_R0
+        MOV     E,A             ; DE = file size in records
+        ; cap (records) = (BSIZE - MINGAP) >> 7
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW
+        LXI     B,0-MINGAP
+        DAD     B               ; HL = BSIZE - MINGAP = usable bytes
+        MVI     B,7             ; HL >>= 7  -> usable records
+FIO_SHR:
+        XRA     A               ; clear carry
+        MOV     A,H
+        RAR
+        MOV     H,A
+        MOV     A,L
+        RAR
+        MOV     L,A
+        DCR     B
+        JNZ     FIO_SHR
+        ; too big if records (DE) > cap (HL):  CY set on HL - DE
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JC      FIO_BIG
+        ;--- fits: load it fully resident -------------------------------------
+        XRA     A
+        STA     INFCB+FCB_CR    ; FSIZE may have touched random fields; reset CR
+        CALL    IRINIT
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        SHLD    FWPTR           ; write ptr = base
+FIO_RDL:
+        CALL    IRGETB
+        JC      FIO_EOF
+        CPI     CPMEOF
+        JZ      FIO_EOF
+        ; store byte at FWPTR
+        PUSH    PSW
+        LHLD    FWPTR
+        POP     PSW
+        MOV     M,A
+        INX     H
+        SHLD    FWPTR
+        JMP     FIO_RDL
+FIO_BIG:
+        MVI     A,1             ; signal: too large to edit in RAM
+        RET
+FIO_EOF:
+        ; GAPBG = TXEND = CSOFF = FWPTR - base
+        LHLD    FWPTR
+        XCHG
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        MOV     A,E
+        SUB     L
+        MOV     L,A
+        MOV     A,D
+        SBB     H
+        MOV     H,A
+        PUSH    H
+        MVI     A,BD_GAPBG
+        CALL    GBSTHW
+        POP     H
+        PUSH    H
+        MVI     A,BD_TXEND
+        CALL    GBSTHW
+        POP     H
+        MVI     A,BD_CSOFF
+        CALL    GBSTHW
+        CALL    GBMVTOP
+        MVI     A,BD_MODIF
+        CALL    BDFLD
+        MVI     M,0
+        XRA     A               ; A = 0: loaded OK
+        RET
+FIO_NEW:
+        XRA     A               ; A = 0: new/empty file is OK
+        RET
+
+;============================================================
+; FISAVE - straight buffer write.  The whole file is resident (RAM-only), so
+; the save is simply: window R1 ++ window R2 -> OUTFCB, then ^Z-pad the final
+; partial record and close.
+;============================================================
+FISAVE:
+        XRA     A
+        STA     OUTFCB+FCB_CR
+        STA     OPOS
+        LXI     D,OUTFCB
+        MVI     C,BF_FDEL
+        CALL    BDOS
+        LXI     D,OUTFCB
+        MVI     C,BF_FMAKE
+        CALL    BDOS
+        ; window R1
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        XCHG
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW
+        CALL    WRSEG
+        ; window R2
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        DAD     D
+        PUSH    H
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW
+        XCHG
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        MOV     A,E
+        SUB     L
+        MOV     C,A
+        MOV     A,D
+        SBB     H
+        MOV     B,A
+        POP     D
+        MOV     H,B
+        MOV     L,C
+        CALL    WRSEG
+        ; ^Z-pad the final partial record, then close
+        LDA     OPOS
+        ORA     A
+        JZ      FSV_CL
+FSV_PAD:
+        MVI     A,CPMEOF
+        CALL    PUTB
+        LDA     OPOS
+        ORA     A
+        JNZ     FSV_PAD
+FSV_CL:
+        LXI     D,OUTFCB
+        MVI     C,BF_FCLOSE
+        CALL    BDOS
+        LXI     D,INFCB
+        MVI     C,BF_FCLOSE
+        CALL    BDOS
+        RET
+
+;------------------------------------------------------------
+; WRSEG - write HL bytes from DE via PUTB.
+;------------------------------------------------------------
+WRSEG:
+        MOV     A,H
+        ORA     L
+        RZ
+        LDAX    D
+        PUSH    H
+        PUSH    D
+        CALL    PUTB
+        POP     D
+        POP     H
+        INX     D
+        DCX     H
+        JMP     WRSEG
+
+;------------------------------------------------------------
+; PUTB - buffer byte A to OBUF; auto-flush a full record.
+;------------------------------------------------------------
+PUTB:
+        PUSH    B
+        PUSH    H
+        MOV     C,A
+        LDA     OPOS
+        MOV     E,A
+        MVI     D,0
+        LXI     H,OBUF
+        DAD     D
+        MOV     M,C
+        LDA     OPOS
+        INR     A
+        STA     OPOS
+        CPI     RECSIZ
+        JNZ     PUTB_D
+        CALL    OFLUSH
+PUTB_D:
+        POP     H
+        POP     B
+        RET
+
+;------------------------------------------------------------
+; OFLUSH - write the OBUF record, reset OPOS.
+;------------------------------------------------------------
+OFLUSH:
+        PUSH    B
+        PUSH    D
+        PUSH    H
+        LXI     D,OBUF
+        MVI     C,BF_SETDMA
+        CALL    BDOS
+        LXI     D,OUTFCB
+        MVI     C,BF_FWRITE
+        CALL    BDOS
+        XRA     A
+        STA     OPOS
+        POP     H
+        POP     D
+        POP     B
+        RET
+
+        CSEG
+OPOS:   DB      0
+IRPOS:  DB      RECSIZ
+IREOF:  DB      0
+FWPTR:  DW      0
+INFCB:  DS      FCB_SIZ
+OUTFCB: DS      FCB_SIZ
+IRBUF:  DS      RECSIZ
+OBUF:   DS      RECSIZ
+
+        END

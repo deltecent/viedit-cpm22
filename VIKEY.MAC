@@ -1,0 +1,216 @@
+;============================================================
+; FILE:    VIKEY.MAC
+; PROJECT: VIEDIT (viedit/) -- vi-style CP/M editor
+; MODULE:  Key decoder, synchronous VT100 ESC sequence parser
+;------------------------------------------------------------
+; Ported verbatim from ../viedit/VEKEY.MAC (INCLUDE VI.INC; CSEG vars).
+;
+; GETKEY -- blocking key read with a VT100 ESC sequence decoder.
+;   Console I/O: direct BIOS via VISCREEN stubs BCONST / BCONIN.
+;     BCONST: A=FFH char ready, A=00H not ready (non-blocking)
+;     BCONIN: A=char (blocks until ready)
+;
+; GETKEY blocks until a char is available, then returns:
+;   B=KT_CHAR, C=byte    for any non-ESC byte (printable or control)
+;   B=KT_ACT,  C=ACT_xxx for a recognised ESC sequence or lone ESC
+;   B=KT_NONE, C=0       for an unrecognised ESC sequence (discarded)
+;
+; ESC sequence handling:
+;   idle:  got ESC -> poll up to ESCTMO times for a follow-up byte
+;          timeout -> ACT_ESC (lone ESC)
+;          '[' -> CSI state; 'O' -> SS3 state
+;          other -> ACT_ESC + save the byte in KPEND (returned next call)
+;   CSI:   next byte is a digit (param) or a final letter / '~'
+;   SS3:   one byte -> dispatch (cursor keys only)
+;
+; VT100 CSI table (ACT_xxx from VI.INC):
+;   A -> ACT_CURUP  B -> ACT_CURDN  C -> ACT_CURRT  D -> ACT_CURLT
+;   H -> ACT_LINST  F -> ACT_LINEN
+;   1~ -> ACT_LINST 2~ -> ACT_INS   3~ -> ACT_DEL   4~ -> ACT_LINEN
+;   5~ -> ACT_PGUP  6~ -> ACT_PGDN
+;
+; ESC + unknown byte: returns ACT_ESC for the ESC; the unknown byte is
+;   saved in KPEND and returned as KT_CHAR on the next GETKEY call.
+; GK_POLL uses HL as a 16-bit countdown (ESCTMO=500 > 255).
+;------------------------------------------------------------
+; EXPORTS: GETKEY     EXTRNS: BCONST, BCONIN (VISCREEN BIOS stubs)
+;============================================================
+        INCLUDE VI.INC
+
+        PUBLIC  GETKEY
+        EXTRN   BCONST, BCONIN
+
+        CSEG
+
+GETKEY:
+        ; Return any pending byte saved from ESC+unknown
+        LDA     KPEND
+        ORA     A
+        JNZ     GK_PEND
+
+        CALL    BCONIN          ; block for a char
+        CPI     ESC
+        JNZ     GK_CHAR
+
+        ;--- ESC: poll for sequence continuation ---
+        CALL    GK_POLL         ; A = next byte, 0 = timeout
+        ORA     A
+        JZ      GK_ESC_LN       ; timeout: standalone ESC
+        CPI     '['
+        JZ      GK_CSI
+        CPI     'O'
+        JZ      GK_SS3
+        ; unknown follow-on: ACT_ESC now, save the byte for next call
+        STA     KPEND
+GK_ESC_LN:
+        MVI     B,KT_ACT
+        MVI     C,ACT_ESC
+        RET
+
+        ;--- ESC [ sequence (CSI) ---
+GK_CSI:
+        MVI     A,0
+        STA     KPARAM
+        CALL    GK_POLL
+        ORA     A
+        JZ      GK_NONE
+        CPI     '0'
+        JC      GK_CSIFIN
+        CPI     '9'+1
+        JNC     GK_CSIFIN
+        ; single digit parameter: save and read the final byte
+        SUI     '0'
+        STA     KPARAM
+        CALL    GK_POLL
+        ORA     A
+        JZ      GK_NONE
+GK_CSIFIN:
+        CPI     'A'
+        JZ      GK_CURUP
+        CPI     'B'
+        JZ      GK_CURDN
+        CPI     'C'
+        JZ      GK_CURRT
+        CPI     'D'
+        JZ      GK_CURLT
+        CPI     'H'
+        JZ      GK_LINST
+        CPI     'F'
+        JZ      GK_LINEN
+        CPI     '~'
+        JNZ     GK_NONE
+        ; '~': dispatch on KPARAM
+        LDA     KPARAM
+        CPI     1
+        JZ      GK_LINST        ; ESC[1~ = Home
+        CPI     2
+        JZ      GK_INS          ; ESC[2~ = Insert
+        CPI     3
+        JZ      GK_DEL          ; ESC[3~ = Delete
+        CPI     4
+        JZ      GK_LINEN        ; ESC[4~ = End
+        CPI     5
+        JZ      GK_PGUP         ; ESC[5~ = PgUp
+        CPI     6
+        JZ      GK_PGDN         ; ESC[6~ = PgDn
+        JMP     GK_NONE
+
+        ;--- ESC O sequence (SS3) ---
+GK_SS3:
+        CALL    GK_POLL
+        ORA     A
+        JZ      GK_NONE
+        CPI     'A'
+        JZ      GK_CURUP
+        CPI     'B'
+        JZ      GK_CURDN
+        CPI     'C'
+        JZ      GK_CURRT
+        CPI     'D'
+        JZ      GK_CURLT
+        JMP     GK_NONE
+
+        ;--- ACT_xxx return paths ---
+GK_CURUP:
+        MVI     C,ACT_CURUP
+        JMP     GK_ACT
+GK_CURDN:
+        MVI     C,ACT_CURDN
+        JMP     GK_ACT
+GK_CURRT:
+        MVI     C,ACT_CURRT
+        JMP     GK_ACT
+GK_CURLT:
+        MVI     C,ACT_CURLT
+        JMP     GK_ACT
+GK_LINST:
+        MVI     C,ACT_LINST
+        JMP     GK_ACT
+GK_LINEN:
+        MVI     C,ACT_LINEN
+        JMP     GK_ACT
+GK_INS:
+        MVI     C,ACT_INS
+        JMP     GK_ACT
+GK_DEL:
+        MVI     C,ACT_DEL
+        JMP     GK_ACT
+GK_PGUP:
+        MVI     C,ACT_PGUP
+        JMP     GK_ACT
+GK_PGDN:
+        MVI     C,ACT_PGDN
+GK_ACT:
+        MVI     B,KT_ACT
+        RET
+
+GK_PEND:
+        MOV     C,A
+        MVI     A,0
+        STA     KPEND
+        MVI     B,KT_CHAR
+        RET
+
+GK_CHAR:
+        MOV     C,A
+        MVI     B,KT_CHAR
+        RET
+
+GK_NONE:
+        MVI     B,KT_NONE
+        MVI     C,0
+        RET
+
+;------------------------------------------------------------
+; GK_POLL - poll up to ESCTMO times for one console byte.
+; Exit: A = byte read; A = 0 on timeout (NUL also treated as timeout).
+;------------------------------------------------------------
+; HL is the 16-bit countdown.  BIOS CONST/CONIN have no register contract
+; (this BIOS clobbers HL), so HL is saved across each call -- otherwise the
+; countdown is destroyed and a lone ESC spins forever.
+GK_POLL:
+        LXI     H,ESCTMO
+GKP_LP:
+        MOV     A,H
+        ORA     L
+        JZ      GKP_TO
+        DCX     H
+        PUSH    H
+        CALL    BCONST
+        POP     H
+        ORA     A
+        JZ      GKP_LP
+        PUSH    H
+        CALL    BCONIN
+        POP     H
+        ORA     A
+        RNZ
+GKP_TO:
+        XRA     A
+        RET
+
+        CSEG
+KPARAM: DB      0               ; CSI parameter digit accumulator
+KPEND:  DB      0               ; pending char from ESC+unknown
+
+        END

@@ -1,0 +1,853 @@
+;============================================================
+; FILE:    VICMDEXC.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  ex command line -- parse, dispatch, :r :w :e, :stat
+;------------------------------------------------------------
+; Split out of VICMD.MAC -- see DESIGN.md / build_vi.py link order.
+;============================================================
+        INCLUDE VI.INC
+        PUBLIC  DOSAVE, EXKW, EXMSG, EX_FIN, EX_STAT, GBCSOF
+        PUBLIC  ISEOL, PGSDLT, PKEOL, PKRTF, SBHLDE, STATHOME
+        PUBLIC  UINSCL, VC_EX
+        EXTRN   AUTOSCR, BCONIN, BDFLD, BLDTS, DGM_BLT, DGM_BUF
+        EXTRN   DGM_FREE, DGM_LNS, DIRTY, EBADCMD, EFNPTR, EMODF
+        EXTRN   ENOFILE, ENOTFND, ERDONLY, ETOOBIG, EWANTF, EXBUF
+        EXTRN   EXLEN, EX_S, EX_SUB, FCBSV, FISAVE, GBINSRT
+        EXTRN   GBLDHW, GBMLNE, GBMVRT, GBNLNS, GBPKRT, GOTOPOS
+        EXTRN   GOTOXY, GSIZMSG, HELPSC, INFCB, IRGETB, IRINIT
+        EXTRN   ISRNGC, NSTAT, OUTCHR, OUTFCB, OUTN16, OUTSTR
+        EXTRN   PGTOP, RDONLY, RDPOS, REINIT, RMODSV, RNEED
+        EXTRN   SCRDELTA, SCRDRAW, STATCLR, STATMSG, SVERR, SVWRTG
+        EXTRN   SVWRTN, UINS1, VADJ, VC_CTRLG, VIQUIT, WWANTQ
+        CSEG
+;============================================================
+; VC_EX - ex command line.  Read ':...' on the status row, then execute.
+;============================================================
+VC_EX:
+        CALL    STATHOME        ; clear status row, home cursor to it
+        MVI     A,':'
+        CALL    OUTCHR
+        LXI     H,EXBUF
+        MVI     C,0             ; C = count
+EX_RD:
+        PUSH    B
+        PUSH    H
+        CALL    BCONIN
+        POP     H
+        POP     B
+        CPI     CR
+        JZ      EX_DO
+        CPI     BS
+        JZ      EX_BS
+        CPI     DEL
+        JZ      EX_BS
+        CPI     ESC
+        JZ      EX_CAN
+        ; store + echo (cap at EXMAX)
+        MOV     B,A
+        MOV     A,C
+        CPI     EXMAX
+        JNC     EX_FULL         ; full: bell, ignore
+        MOV     A,B
+        MOV     M,A
+        INX     H
+        INR     C
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        JMP     EX_RD
+EX_FULL:
+        MVI     A,BEL
+        CALL    OUTCHR
+        JMP     EX_RD
+EX_BS:
+        MOV     A,C
+        ORA     A
+        JZ      EX_CAN          ; BS past the prompt cancels ex mode (vi)
+        DCX     H
+        DCR     C
+        PUSH    B               ; OUTCHR clobbers B,C,H,L -- save the count/ptr
+        PUSH    H
+        MVI     A,BS
+        CALL    OUTCHR
+        MVI     A,' '
+        CALL    OUTCHR
+        MVI     A,BS
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        JMP     EX_RD
+EX_CAN:
+        JMP     STATCLR         ; clear the ':' prompt; cursor-only update
+EX_DO:
+        MOV     A,C
+        STA     EXLEN
+        ; NUL-terminate EXBUF so the filename parsers can stop on the end
+        MVI     D,0
+        MOV     E,A
+        LXI     H,EXBUF
+        DAD     D
+        MVI     M,0
+        CALL    STATCLR
+        ; parse EXBUF[0]
+        LDA     EXLEN
+        ORA     A
+        JZ      EX_FIN          ; empty ':' -> nothing
+        LDA     EXBUF
+        CALL    ISRNGC          ; leading line-address? (digit . $ % ,)
+        JZ      EX_SUB          ; ranged ex command -> substitute engine
+        LDA     EXBUF
+        CPI     'q'
+        JZ      EX_Q
+        CPI     'w'
+        JZ      EX_W
+        CPI     'r'             ; :r filename -> read a file in below the cursor
+        JZ      EX_R
+        CPI     'e'             ; :e filename -> edit (load) a different file
+        JZ      EX_E
+        CPI     'x'
+        JZ      EX_WQ
+        CPI     'h'             ; :h / :help -> help overlay
+        JZ      EX_HELP
+        CPI     's'             ; :s.../:%s... substitute, or :stat (disambiguated)
+        JZ      EX_S
+        ; unknown
+        LXI     D,EBADCMD
+        JMP     EXMSG
+EX_HELP:
+        CALL    HELPSC          ; paints help, waits for a key, raises DIRTY
+        JMP     EX_FIN          ; main loop repaints via DIRTY
+
+;------------------------------------------------------------
+; EX_R - ':r filename' : read a file in below the current line (vi).
+;------------------------------------------------------------
+EX_R:
+        LXI     H,EXBUF+1       ; past the 'r'
+        CALL    SKIPWS
+        ORA     A
+        JZ      EXR_NONM        ; no filename given
+        ; Remember the modified flag.  When the buffer has no current filename,
+        ; reading a file in must not by itself mark it modified (there is no file
+        ; it is out of sync with, so :q should not warn); we restore it below.
+        ; A named buffer keeps the insert's modified mark, so :q still protects
+        ; the read-in text.
+        MVI     A,BD_MODIF
+        CALL    BDFLD
+        MOV     A,M
+        STA     RMODSV
+        ; the byte reader works through INFCB, so swap the named file in and
+        ; restore the real INFCB afterwards (the original file is fully resident).
+        LXI     H,INFCB
+        LXI     D,FCBSV
+        CALL    CPFCB           ; FCBSV = INFCB
+        LXI     H,EXBUF+1
+        CALL    SKIPWS
+        LXI     D,INFCB
+        CALL    PARSEFN         ; INFCB = parsed name
+        CALL    DORDF           ; A = 0 ok / 1 not found / 2 won't fit
+        PUSH    PSW
+        LXI     H,FCBSV
+        LXI     D,INFCB
+        CALL    CPFCB           ; restore the real INFCB
+        POP     PSW
+        CPI     1
+        JZ      EXR_NF
+        CPI     2
+        JZ      EXR_BIG
+        ; read succeeded.  If the buffer is unnamed (BD_FNAME name byte is 0,
+        ; as set at startup with no file), restore the pre-read modified flag so
+        ; :q does not warn about text that merely came in from disk.  :r never
+        ; touches BD_FNAME, so this test is still valid after the read.
+        MVI     A,BD_FNAME
+        CALL    BDFLD
+        INX     H               ; HL -> first name char (skip drive byte)
+        MOV     A,M
+        CPI     ' '
+        JZ      EXR_RSTM
+        ORA     A
+        JNZ     EXR_DON         ; named buffer -> leave it marked modified
+EXR_RSTM:
+        MVI     A,BD_MODIF
+        CALL    BDFLD           ; HL = &BD_MODIF
+        LDA     RMODSV
+        MOV     M,A             ; restore the pre-read modified flag
+EXR_DON:
+        MVI     A,1
+        STA     DIRTY           ; new text inserted -> repaint the edit area
+        JMP     EX_FIN
+EXR_NF:
+        LXI     D,ENOTFND       ; 'File not found'
+        JMP     EXMSG
+EXR_BIG:
+        LXI     D,ETOOBIG       ; 'File too large'  (nothing was inserted)
+        JMP     EXMSG
+EXR_NONM:
+        LXI     D,ENOFILE       ; 'No file name'
+        JMP     EXMSG
+
+;------------------------------------------------------------
+; EX_E - ':e[!] filename' : discard the buffer and load a different file.
+; Refuses if the buffer has unsaved changes unless '!' is given.
+;------------------------------------------------------------
+EX_E:
+        LXI     H,EXBUF+1       ; past the 'e'
+        XRA     A
+        STA     EWANTF
+        MOV     A,M
+        CPI     '!'             ; :e! -> discard unsaved changes
+        JNZ     EE_NOB
+        MVI     A,1
+        STA     EWANTF
+        INX     H
+EE_NOB:
+        CALL    SKIPWS
+        ORA     A
+        JZ      EE_NONM         ; no filename given
+        SHLD    EFNPTR          ; remember the filename pointer
+        LDA     EWANTF
+        ORA     A
+        JNZ     EE_LOAD         ; forced -> skip the modified guard
+        MVI     A,BD_MODIF
+        CALL    BDFLD
+        MOV     A,M
+        ORA     A
+        JNZ     EE_MODF
+EE_LOAD:
+        ; Size-check the target on a TEMP fcb BEFORE discarding the buffer, so a
+        ; too-large file is refused with the current file left intact (mirrors
+        ; FIOPEN's gate: too big if records > (BD_BSIZE - MINGAP) >> 7).
+        LHLD    EFNPTR
+        LXI     D,FCBSV
+        CALL    PARSEFN
+        XRA     A
+        STA     FCBSV+FCB_CR
+        LXI     D,FCBSV
+        MVI     C,BF_FOPEN
+        CALL    BDOS
+        CPI     0FFH
+        JZ      EE_FITS         ; not on disk -> new/empty file, always fits
+        LXI     D,FCBSV
+        MVI     C,BF_FSIZE
+        CALL    BDOS
+        LXI     D,FCBSV         ; close now; REINIT's FIOPEN reopens
+        MVI     C,BF_FCLOSE
+        CALL    BDOS
+        LDA     FCBSV+FCB_R2
+        ORA     A
+        JNZ     EE_TOBIG        ; >= 16M records -> far too big
+        LDA     FCBSV+FCB_R1
+        MOV     D,A
+        LDA     FCBSV+FCB_R0
+        MOV     E,A             ; DE = file size in records
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW
+        LXI     B,0-MINGAP
+        DAD     B               ; HL = BSIZE - MINGAP = usable bytes
+        MVI     B,7
+EE_SHR:
+        XRA     A               ; clear carry
+        MOV     A,H
+        RAR
+        MOV     H,A
+        MOV     A,L
+        RAR
+        MOV     L,A
+        DCR     B
+        JNZ     EE_SHR          ; HL = usable records
+        MOV     A,L             ; too big if cap (HL) < file (DE): CY on HL - DE
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JC      EE_TOBIG
+EE_FITS:
+        ; commit: build INFCB, OUTFCB and BD_FNAME from the typed name, then load
+        LHLD    EFNPTR
+        LXI     D,INFCB
+        CALL    PARSEFN
+        LHLD    EFNPTR
+        LXI     D,OUTFCB
+        CALL    PARSEFN
+        MVI     A,BD_FNAME
+        CALL    BDFLD
+        XCHG                    ; DE = &BD_FNAME
+        LXI     H,OUTFCB        ; copy drive+name+ext (12 bytes)
+        MVI     B,12
+EE_CPN:
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     EE_CPN
+        CALL    REINIT          ; fits -> loads the new file (A = 0)
+        ; repaint the new buffer (cursor is at 0,0) and leave a status line that
+        ; survives -- no DIRTY, so the main loop will not repaint over it.
+        CALL    VADJ
+        CALL    AUTOSCR
+        CALL    SCRDRAW
+        CALL    STEDIT          ; '"NAME" NNNL, NNNB'
+        JMP     EX_FIN
+EE_TOBIG:
+        ; refused: nothing was committed, so the current buffer/view stay intact
+        LXI     D,ETOOBIG
+        JMP     EXMSG
+EE_MODF:
+        LXI     D,EMODF
+        JMP     EXMSG
+EE_NONM:
+        ; :e with no filename -> if a file is loaded, show the ^G status line;
+        ; only report "No file name" when no file has ever been named.
+        MVI     A,BD_FNAME+1    ; first name char (0 = unnamed, as zeroed at start)
+        CALL    BDFLD
+        MOV     A,M
+        ORA     A
+        JZ      EE_NONM2
+        CALL    VC_CTRLG        ; file loaded -> "NAME" [readonly] line N of M col C
+        JMP     EX_FIN
+EE_NONM2:
+        LXI     D,ENOFILE
+        JMP     EXMSG
+
+;------------------------------------------------------------
+; STNAMQ - STATCLR, then print '"NAME" ' (OUTFCB's filename) on the status row.
+;------------------------------------------------------------
+STNAMQ:
+        CALL    STATHOME        ; clear status row, home cursor to it
+        MVI     A,'"'
+        CALL    OUTCHR
+        CALL    PRSVNM
+        MVI     A,'"'
+        CALL    OUTCHR
+        MVI     A,' '
+        JMP     OUTCHR
+
+;------------------------------------------------------------
+; STCNT - print 'NNNL, NNNB': line count (GBNLNS) and byte count (BD_TXEND).
+;------------------------------------------------------------
+STCNT:
+        CALL    GBNLNS
+        JNC     STC_OK
+        LXI     H,0
+STC_OK:
+        CALL    OUTN16
+        MVI     A,'L'
+        CALL    OUTCHR
+        LXI     D,GSIZMSG       ; ', '
+        CALL    OUTSTR
+        MVI     A,BD_TXEND
+        CALL    GBLDHW
+        CALL    OUTN16
+        MVI     A,'B'
+        JMP     OUTCHR
+
+;------------------------------------------------------------
+; STSAVE - vi-style save status (name from OUTFCB):
+;   A != 0  -> '"NAME" writing NNNL, NNNB'   (before the slow write)
+;   A == 0  -> '"NAME" NNNL, NNNB written'    (on completion)
+;------------------------------------------------------------
+STSAVE:
+        PUSH    PSW
+        CALL    STNAMQ
+        POP     PSW
+        ORA     A
+        JZ      STSV_A
+        LXI     D,SVWRTG        ; 'writing '
+        CALL    OUTSTR
+        JMP     STCNT
+STSV_A:
+        CALL    STCNT
+        LXI     D,SVWRTN        ; ' written'
+        JMP     OUTSTR
+
+;------------------------------------------------------------
+; STEDIT - ':e' loaded-file status: '"NAME" NNNL, NNNB'.
+;------------------------------------------------------------
+STEDIT:
+        CALL    STNAMQ
+        JMP     STCNT
+
+;------------------------------------------------------------
+; PRSVNM - print OUTFCB's filename as NAME.EXT (trailing spaces trimmed; the
+; '.' is omitted when there is no extension).
+;------------------------------------------------------------
+PRSVNM:
+        LXI     H,OUTFCB+FCB_FN
+        MVI     B,8
+PSV_N:
+        MOV     A,M
+        CPI     ' '
+        JZ      PSV_NE
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     PSV_N
+PSV_NE:
+        LXI     H,OUTFCB+FCB_FT
+        MOV     A,M
+        CPI     ' '
+        RZ                      ; no extension
+        MVI     A,'.'
+        CALL    OUTCHR
+        LXI     H,OUTFCB+FCB_FT
+        MVI     B,3
+PSV_X:
+        MOV     A,M
+        CPI     ' '
+        RZ
+        PUSH    B
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JNZ     PSV_X
+        RET
+
+;------------------------------------------------------------
+; DORDF - read the file in INFCB into the buffer, on the line below the cursor.
+; An up-front FSIZE gate (like FIOPEN) refuses a file that would not fit in the
+; free gap, so nothing is ever partially inserted.  GBINSRT marks the buffer
+; modified and invalidates the line caches.  The cursor is left on the first
+; byte read in.  Exit: A = 0 ok / 1 not found / 2 won't fit.
+;------------------------------------------------------------
+DORDF:
+        XRA     A
+        STA     INFCB+FCB_CR
+        LXI     D,INFCB
+        MVI     C,BF_FOPEN
+        CALL    BDOS
+        CPI     0FFH
+        JZ      DRF_NF
+        ; size gate: FSIZE -> file size in 128-byte records (INFCB R0/R1/R2)
+        LXI     D,INFCB
+        MVI     C,BF_FSIZE
+        CALL    BDOS
+        LDA     INFCB+FCB_R2
+        ORA     A
+        JNZ     DRF_BIG         ; >= 16M records -> far too big
+        LDA     INFCB+FCB_R1
+        MOV     D,A
+        LDA     INFCB+FCB_R0
+        MOV     E,A
+        XCHG
+        SHLD    RNEED           ; RNEED = file size in records
+        ; cap (records) = (GAPEN - GAPBG) >> 7  = free gap bytes / 128
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG                    ; DE = GAPEN
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = GAPBG
+        MOV     A,E
+        SUB     L
+        MOV     L,A
+        MOV     A,D
+        SBB     H
+        MOV     H,A             ; HL = GAPEN - GAPBG = free gap bytes
+        MVI     B,7
+DRF_SH:
+        ORA     A               ; clear carry
+        MOV     A,H
+        RAR
+        MOV     H,A
+        MOV     A,L
+        RAR
+        MOV     L,A
+        DCR     B
+        JNZ     DRF_SH          ; HL = free records
+        XCHG                    ; DE = free records
+        LHLD    RNEED           ; HL = needed records
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H               ; free - needed; CY if needed > free
+        JC      DRF_BIG
+        ; FSIZE perturbs the random fields -> reset CR before the sequential read
+        XRA     A
+        STA     INFCB+FCB_CR
+        ; position the gap at the start of the line below the cursor
+        CALL    RPOS
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    RDPOS           ; remember the insertion start (restore cursor)
+        CALL    IRINIT
+DRF_RL:
+        CALL    IRGETB
+        JC      DRF_OK          ; EOF
+        CPI     CPMEOF
+        JZ      DRF_OK          ; ^Z ends a CP/M text file
+        CALL    GBINSRT
+        CPI     0FFH
+        JZ      DRF_OK          ; gap full (defensive: the size gate should prevent)
+        JMP     DRF_RL
+DRF_OK:
+        LXI     D,INFCB
+        MVI     C,BF_FCLOSE
+        CALL    BDOS
+        LHLD    RDPOS
+        CALL    GOTOPOS         ; cursor -> first byte read in
+        XRA     A
+        RET
+DRF_BIG:
+        LXI     D,INFCB
+        MVI     C,BF_FCLOSE
+        CALL    BDOS
+        MVI     A,2
+        RET
+DRF_NF:
+        MVI     A,1
+        RET
+
+;------------------------------------------------------------
+; RPOS - move the gap to the start of the line BELOW the cursor (where :r
+; inserts).  Crosses this line's CR,LF; at the last line with no trailing
+; newline it appends one so the read-in text starts on a fresh line.
+;------------------------------------------------------------
+RPOS:
+        CALL    GBMLNE          ; cursor -> this line's break (or EOB)
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      RPOSEB          ; end of buffer -> last line, no newline
+        CALL    GBMVRT          ; cross CR,LF -> start of the next line
+        RET
+RPOSEB:
+        MVI     A,CR
+        CALL    GBINSRT
+        MVI     A,LF
+        CALL    GBINSRT
+        RET
+
+;------------------------------------------------------------
+; SKIPWS - advance HL past spaces.  Exit: A = first non-space byte (0 at end).
+;------------------------------------------------------------
+SKIPWS:
+        MOV     A,M
+        CPI     ' '
+        RNZ
+        INX     H
+        JMP     SKIPWS
+
+;------------------------------------------------------------
+; CPFCB - copy FCB_SIZ bytes from [HL] to [DE].
+;------------------------------------------------------------
+CPFCB:
+        MVI     B,FCB_SIZ
+CPF_L:
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     CPF_L
+        RET
+
+;------------------------------------------------------------
+; UPCASE - fold A to upper case if it is 'a'..'z'.
+;------------------------------------------------------------
+UPCASE:
+        CPI     'a'
+        RC
+        CPI     'z'+1
+        RNC
+        SUI     20H
+        RET
+
+;------------------------------------------------------------
+; PFEND - Z set if A is a filename terminator (NUL or space).  Preserves A.
+;------------------------------------------------------------
+PFEND:
+        CPI     0
+        RZ
+        CPI     ' '
+        RET
+
+;------------------------------------------------------------
+; PARSEFN - parse "[d:]NAME[.EXT]" at [HL] into the FCB at [DE].
+; Letters upcased; NAME (<=8) and EXT (<=3) space-padded; extra chars dropped;
+; EX,S1,S2,RC zeroed.  Terminated by NUL or space.  (FCB_CR is set by the
+; caller before I/O.)  Clobbers all registers.
+;------------------------------------------------------------
+PARSEFN:
+        PUSH    D               ; FCB base
+        ; drive: a "d:" prefix sets 1..16, else 0 (current)
+        INX     H
+        MOV     A,M             ; second char
+        DCX     H
+        CPI     ':'
+        JNZ     PF_ND
+        MOV     A,M
+        CALL    UPCASE
+        SUI     '@'             ; 'A'->1, 'B'->2, ...
+        INX     H
+        INX     H
+        JMP     PF_DS
+PF_ND:
+        XRA     A
+PF_DS:
+        POP     D               ; DE = FCB base
+        STAX    D               ; FCB_DR
+        INX     D               ; -> FCB_FN
+        MVI     B,8
+        CALL    PFFLD           ; name (8)
+        MOV     A,M
+        CPI     '.'
+        JNZ     PF_NOE
+        INX     H               ; skip the '.'
+PF_NOE:
+        MVI     B,3
+        CALL    PFFLD           ; ext (3); DE now at FCB_EX
+        XRA     A
+        STAX    D               ; EX
+        INX     D
+        STAX    D               ; S1
+        INX     D
+        STAX    D               ; S2
+        INX     D
+        STAX    D               ; RC
+        RET
+
+;------------------------------------------------------------
+; PFFLD - fill a B-wide FCB field at [DE] from [HL], upcasing, until a
+; terminator or '.'; space-pad the rest; drop overflow source chars.
+; Exit: HL at the terminator or '.', DE past the field.
+;------------------------------------------------------------
+PFFLD:
+        MOV     A,M
+        CALL    PFEND
+        JZ      PFF_PAD
+        CPI     '.'
+        JZ      PFF_PAD
+        CALL    UPCASE
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     PFFLD
+PFF_OV:                         ; field full: skip any remaining name/ext chars
+        MOV     A,M
+        CALL    PFEND
+        RZ
+        CPI     '.'
+        RZ
+        INX     H
+        JMP     PFF_OV
+PFF_PAD:
+        MOV     A,B
+        ORA     A
+        RZ
+        MVI     A,' '
+        STAX    D
+        INX     D
+        DCR     B
+        JMP     PFF_PAD
+
+;------------------------------------------------------------
+; EXKW - compare the typed ex line (EXBUF) against a NUL-terminated keyword.
+; Entry: HL = keyword address.  Exit: Z set if EXBUF starts with the keyword.
+; Clobbers A, B, D, E, H, L.
+;------------------------------------------------------------
+EXKW:
+        LXI     D,EXBUF
+EXKW_LP:
+        MOV     A,M             ; keyword char
+        ORA     A
+        RZ                      ; reached NUL -> full match (Z set)
+        LDAX    D               ; typed char
+        CMP     M               ; typed vs keyword
+        RNZ                     ; mismatch (Z clear)
+        INX     H
+        INX     D
+        JMP     EXKW_LP
+
+;------------------------------------------------------------
+; EX_STAT - ':stat' diagnostics on the status row.  Now that editing is
+; RAM-only, the old paging fields (paged=/before=) are always 0 and the
+; line/col are already on ^G, so :stat reports what is still useful for
+; verifying the build and the buffer:
+;   built <TS>  buf=<resident bytes>  free=<gap bytes>  lines=<total>
+; <TS> is the assembly timestamp (BLDTS, regenerated by build_vi.py every
+; build) so the running binary can be confirmed at a glance.  Ex commands
+; skip the redraw (EX_FIN), so the message survives until the next update.
+;------------------------------------------------------------
+EX_STAT:
+        CALL    STATCLR         ; position at status row col 1, clear it
+        LXI     D,DGM_BLT       ; 'built '
+        CALL    OUTSTR
+        LXI     D,BLDTS         ; assembly timestamp (INCLUDE VIBLD.INC)
+        CALL    OUTSTR
+        LXI     D,DGM_BUF       ; '  buf='   (resident text bytes)
+        CALL    OUTSTR
+        MVI     A,BD_TXEND
+        CALL    GBLDHW          ; HL = TXEND
+        CALL    OUTN16
+        LXI     D,DGM_FREE      ; ' free='   (= BD_BSIZE - BD_TXEND = the gap)
+        CALL    OUTSTR
+        MVI     A,BD_TXEND
+        CALL    GBLDHW
+        XCHG                    ; DE = TXEND
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW          ; HL = BSIZE
+        CALL    SBHLDE          ; HL = HL - DE
+        CALL    OUTN16
+        LXI     D,DGM_LNS       ; ' lines='  (total line count)
+        CALL    OUTSTR
+        CALL    GBNLNS          ; HL = total lines; CY set if unknown
+        JC      EXST_FIN
+        CALL    OUTN16
+EXST_FIN:
+        JMP     EX_FIN
+EX_Q:
+        ; q!  -> unconditional quit
+        LDA     EXLEN
+        CPI     2
+        JC      EX_QCHK
+        LDA     EXBUF+1
+        CPI     '!'
+        JZ      VIQUIT
+EX_QCHK:
+        ; refuse if modified
+        MVI     A,BD_MODIF
+        CALL    BDFLD
+        MOV     A,M
+        ORA     A
+        JZ      VIQUIT
+        LXI     D,EMODF
+        JMP     EXMSG
+EX_W:
+        ; :w | :wq | :w filename | :wq filename
+        LXI     H,EXBUF+1       ; past the 'w'
+        XRA     A
+        STA     WWANTQ
+        MOV     A,M
+        CPI     'q'             ; optional 'q' suffix (wq)
+        JNZ     EW_NOQ
+        MVI     A,1
+        STA     WWANTQ
+        INX     H               ; skip 'q'
+EW_NOQ:
+        CALL    SKIPWS          ; HL -> argument; A = first char (0 if none)
+        ORA     A
+        JZ      EW_CUR          ; no filename -> save the current target
+        ; --- :w filename : write the buffer to a named file ---
+        ; FISAVE (RAM-only) reads R1/R2 directly, so the cursor is preserved; we
+        ; only need to swap OUTFCB to the named file and restore it after.
+        PUSH    H               ; save the filename pointer
+        LXI     H,OUTFCB
+        LXI     D,FCBSV
+        CALL    CPFCB           ; FCBSV = OUTFCB  (save the real target)
+        POP     H               ; HL = filename
+        LXI     D,OUTFCB
+        CALL    PARSEFN         ; OUTFCB = parsed name (the save message reads it)
+        MVI     A,1
+        CALL    STSAVE          ; '"NAME" writing NNNL, NNNB'
+        CALL    FISAVE          ; write the buffer to OUTFCB; A = 0 ok
+        STA     SVERR
+        XRA     A
+        CALL    STSAVE          ; '"NAME" NNNL, NNNB written'
+        LXI     H,FCBSV         ; save-as does NOT clear the modified flag (vi)
+        LXI     D,OUTFCB
+        CALL    CPFCB           ; restore the real OUTFCB
+        JMP     EW_QCHK
+EW_CUR:
+        CALL    DOSAVE
+EW_QCHK:
+        ; quit afterwards only for :wq, and only if the save succeeded
+        LDA     WWANTQ
+        ORA     A
+        JZ      EX_FIN
+        LDA     SVERR
+        ORA     A
+        JZ      VIQUIT
+        JMP     EX_FIN
+EX_WQ:
+        CALL    DOSAVE
+        LDA     SVERR
+        ORA     A
+        JZ      VIQUIT
+EXMSG:  CALL    STATMSG         ; DE = message; fall through to EX_FIN (RET)
+EX_FIN:
+        ; ex commands here don't change the edit area, so no full redraw -- that
+        ; would erase the status message just written (e.g. "File is read only").
+        ; STATCLR already cleared the ':' prompt; the cursor returns via CURPOS.
+        RET
+
+;------------------------------------------------------------
+; Small shared helpers (factored from repeated inline sequences to shrink the
+; image; each adds one CALL/RET of overhead -- a deliberate size-for-speed
+; trade).  None changes the register contract of the code it replaced.
+;------------------------------------------------------------
+GBCSOF: MVI     A,BD_CSOFF      ; HL = current cursor byte offset
+        CALL    GBLDHW
+        RET
+STATHOME:                       ; clear the status row and home the cursor to it
+        CALL    STATCLR
+        LDA     NSTAT
+        MOV     D,A
+        MVI     E,1
+        CALL    GOTOXY
+        RET
+PKEOL:  CALL    GBPKRT          ; A = byte right of the cursor, then fall through
+ISEOL:  CPI     0FFH            ; Z set if A is a line end (EOF / LF / CR); A kept
+        RZ
+        CPI     LF
+        RZ
+        CPI     CR
+        RET
+PKRTF:  CALL    GBPKRT          ; A = byte right of the cursor
+        CPI     0FFH            ; Z set if at end of buffer (0FFH)
+        RET
+PGSDLT: LHLD    PGTOP           ; SCRDELTA between PGTOP and the current top line
+        XCHG
+        MVI     A,BD_TOPLN
+        CALL    GBLDHW
+        CALL    SCRDELTA
+        RET
+UINSCL: MVI     A,CR            ; record CR,LF into the undo buffer (UINS1)
+        CALL    UINS1
+        MVI     A,LF
+        CALL    UINS1
+        RET
+SBHLDE: MOV     A,L             ; HL = HL - DE  (flags = result, as the inline form)
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A
+        RET
+
+;------------------------------------------------------------
+; DOSAVE - write the file (FISAVE on the current name).  Honors RDONLY.
+; Leaves SVERR = 0 ok / 1 failed.
+;------------------------------------------------------------
+DOSAVE:
+        LDA     RDONLY
+        ORA     A
+        JNZ     DS_RO
+        ; "writing" banner first -- the real write is slow on an Altair (the sim
+        ; is instant, so it is immediately overwritten by the "written" line).
+        MVI     A,1
+        CALL    STSAVE          ; '"NAME" writing NNNL, NNNB'
+        ; FISAVE (RAM-only) reads R1/R2 directly: the cursor/window are untouched,
+        ; so no repaint is needed and the status line survives.
+        CALL    FISAVE          ; A = 0 ok (per VIFILEIO)
+        STA     SVERR
+        ; the current file is now on disk -> clear the modified flag (so :q / :e
+        ; do not warn about unsaved changes).
+        MVI     A,BD_MODIF
+        CALL    BDFLD
+        MVI     M,0
+        XRA     A
+        CALL    STSAVE          ; '"NAME" NNNL, NNNB written'
+        RET
+DS_RO:
+        MVI     A,1
+        STA     SVERR
+        LXI     D,ERDONLY
+        CALL    STATMSG
+        RET
+
+        END

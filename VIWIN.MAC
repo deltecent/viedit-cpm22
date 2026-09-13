@@ -1,0 +1,653 @@
+;============================================================
+; FILE:    VIWIN.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  Line-navigation primitives over the resident gap buffer (VIBUF).
+;------------------------------------------------------------
+; RAM-ONLY: the whole file lives resident in the gap buffer (oversize files are
+; refused up front by VIFILEIO/FIOPEN).  There is no window, no slide, no scratch
+; file -- the cursor line within the screen window IS its absolute file line.
+; This module is pure in-RAM line moves and absolute-line positioning.
+;------------------------------------------------------------
+; EXPORTS: WININIT; GBMVDN GBMVUP GBPGDN GBPGUP GBGOTOL (line navigation);
+;          CURLN CURWLN CURCOL CURDCO (cursor line/column); GBNLNS (total
+;          lines, cached); NLNVAL (state).
+;============================================================
+        INCLUDE VI.INC
+
+        EXTRN   GBPKRT, GBPKLT, GBMVRT, GBMVLT, GBLDHW
+        EXTRN   GBSTHW, GBMVTOP
+        EXTRN   GBMLNS, GBMLNE
+
+        PUBLIC  WININIT
+        PUBLIC  GBMVDN, GBMVUP, CURLN, CURWLN, CURCOL, CURDCO
+        PUBLIC  GBPGDN, GBPGUP, GBGOTOL
+        PUBLIC  GBNLNS, NLNVAL
+
+        CSEG
+
+;============================================================
+; WININIT - reset the line-position caches (call once after FIOPEN).
+;============================================================
+WININIT:
+        XRA     A
+        STA     CLNVAL          ; invalidate the CURLN cache
+        STA     NLNVAL          ; invalidate the total-line-count cache
+        RET
+
+;============================================================
+; GBMVDN - move cursor to the START of the next line (column 0).
+; Exit: A=0 moved; A=1 already on the last line of the file (cursor unchanged).
+;============================================================
+GBMVDN:
+        ; remember the cursor offset so we can restore on a no-move
+        MVI     A,BD_CSOFF
+        CALL    GBLDHW
+        SHLD    NAVSAV
+        CALL    GBMLNE          ; cursor -> just before this line's break
+        CALL    GBPKRT          ; A = break byte (CR / LF) or FF at EOB
+        CPI     0FFH
+        JZ      GBMVDN_E        ; no terminator -> last line of file
+        CALL    GBMVRT          ; cross CR,LF (or bare LF) atomically
+        CALL    GBPKRT
+        CPI     0FFH
+        JZ      GBMVDN_E        ; crossed the final terminator -> at EOB, no next
+        XRA     A               ; landed on a real next line
+        RET
+GBMVDN_E:
+        ; restore the saved cursor offset (no move)
+        CALL    NAVRST
+        MVI     A,1
+        RET
+
+;============================================================
+; GBMVUP - move cursor to the START of the previous line (column 0).
+; Exit: A=0 moved; A=1 already on the first line of the file.
+;============================================================
+GBMVUP:
+        MVI     A,BD_CSOFF
+        CALL    GBLDHW
+        SHLD    NAVSAV
+        CALL    GBMLNS          ; cursor -> start of current line
+        CALL    GBPKLT          ; A = byte before (prev line's LF) or FF at BOB
+        CPI     0FFH
+        JZ      GBMVUP_E        ; first line of file -> no move
+        ; cross the break back, then go to that line's start
+        CALL    GBMVLT          ; cross LF (and CR) -> end of previous line
+        CALL    GBMLNS          ; -> start of previous line
+        XRA     A
+        RET
+GBMVUP_E:
+        CALL    NAVRST
+        MVI     A,1
+        RET
+
+;------------------------------------------------------------
+; NAVRST - restore the cursor to the offset saved in NAVSAV, by moving left
+; or right one position at a time until BD_CSOFF == NAVSAV.
+;------------------------------------------------------------
+NAVRST:
+        MVI     A,BD_CSOFF
+        CALL    GBLDHW          ; HL = current CSOFF
+        XCHG                    ; DE = current
+        LHLD    NAVSAV          ; HL = target
+        ; compare
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        ORA     C
+        RZ                      ; equal -> done
+        ; if target > current move right, else left
+        MOV     A,H
+        SUB     D
+        JNZ     NR_HI
+        MOV     A,L
+        SUB     E
+NR_HI:
+        JNC     NR_RT           ; target >= current
+        CALL    GBMVLT
+        JMP     NAVRST
+NR_RT:
+        CALL    GBMVRT
+        JMP     NAVRST
+
+;============================================================
+; CURLN  -> HL = absolute current line (0-based) = LFs in R1 (base[0,GAPBG)).
+;
+; A full scan of base[0,GAPBG) is O(bytes-before-cursor), paid on EVERY call
+; (VADJ calls it once per keystroke).  An incremental cache avoids it: keep
+; (gapbg, gapen, curln) and update
+; by scanning only the bytes that crossed the gap since the last call --
+;   * gapbg grew: the new R1 bytes are base[old_gapbg, gapbg); count + add.
+;     This is correct no matter how we got there (move-right and/or insert), as
+;     R1 = base[0,gapbg) is always valid content.
+;   * gapbg shrank by a PURE gap shift (gapen shrank by the same amount = a
+;     left move, no edit): the bytes that left R1 are now at the R2 head
+;     base[gapen, gapen+d); count + subtract.
+;   * gapbg unchanged: R1 unchanged -> curln unchanged.
+;   * any other shrink (a delete): fall back to a full scan.
+; Windowed files always full-scan (a slide rewrites the buffer).  WININIT
+; invalidates the cache (CLNVAL=0).
+;============================================================
+CURLN:
+        LDA     CLNVAL
+        ORA     A
+        JZ      CLNFULL         ; cache cold
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = cur gapbg
+        SHLD    CLNTMP
+        XCHG                    ; DE = cur gapbg
+        LHLD    CLNGBG          ; HL = cached gapbg
+        MOV     A,E
+        SUB     L
+        MOV     C,A
+        MOV     A,D
+        SBB     H
+        MOV     B,A             ; BC = cur - cached  (signed)
+        ORA     C
+        JZ      CLNRET          ; cur == cached -> curln unchanged
+        MOV     A,B
+        ORA     A
+        JM      CLNLEFT         ; cur < cached
+        ; cur > cached: add LFs in base[cached_gapbg, cur_gapbg)
+        PUSH    B               ; count
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        XCHG                    ; DE = base
+        LHLD    CLNGBG
+        DAD     D               ; HL = base + cached_gapbg
+        POP     B               ; BC = count
+        CALL    CLNCNT          ; DE = LF count
+        LHLD    CLNCUR
+        DAD     D
+        SHLD    CLNCUR
+        JMP     CLNUPD
+CLNLEFT:
+        ; safe only if the gap merely shifted left (a move): cached_gapen -
+        ; cur_gapen == cached_gapbg - cur_gapbg.  Else fall back to a full scan.
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW          ; HL = cur gapen
+        XCHG                    ; DE = cur gapen
+        LHLD    CLNGEN
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = cached_gapen - cur_gapen
+        LHLD    CLNGBG
+        XCHG                    ; DE = cached gapbg
+        LHLD    CLNTMP          ; HL = cur gapbg
+        MOV     A,E
+        SUB     L
+        MOV     L,A
+        MOV     A,D
+        SBB     H
+        MOV     H,A             ; HL = cached_gapbg - cur_gapbg = d
+        MOV     A,L
+        CMP     C
+        JNZ     CLNFULL
+        MOV     A,H
+        CMP     B
+        JNZ     CLNFULL         ; gap size changed (a delete) -> full scan
+        ; pure left move by d: subtract LFs now at the R2 head base[cur_gapen, +d)
+        PUSH    H               ; d (count)
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        XCHG                    ; DE = cur gapen
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        DAD     D               ; HL = base + cur_gapen
+        POP     B               ; BC = d
+        CALL    CLNCNT          ; DE = LF count
+        LHLD    CLNCUR
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A
+        SHLD    CLNCUR
+CLNUPD:
+        LHLD    CLNTMP
+        SHLD    CLNGBG
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        SHLD    CLNGEN
+CLNRET:
+        LHLD    CLNCUR
+        RET
+CLNFULL:
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW
+        XCHG                    ; DE = GAPBG (remaining count)
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW          ; HL = base (scan ptr)
+        LXI     B,0             ; BC = LF count
+CLN_LP:
+        MOV     A,D
+        ORA     E
+        JZ      CLN_DN
+        MOV     A,M
+        CPI     LF
+        JNZ     CLN_NX
+        INX     B
+CLN_NX:
+        INX     H
+        DCX     D
+        JMP     CLN_LP
+CLN_DN:
+        MOV     H,B
+        MOV     L,C             ; HL = curln = LF count
+        SHLD    CLNCUR
+        MVI     A,1
+        STA     CLNVAL
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW
+        SHLD    CLNGBG
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        SHLD    CLNGEN
+        LHLD    CLNCUR
+        RET
+
+; CLNCNT - count LF bytes in [HL, HL+BC).  Exit: DE = count.  Clobbers A,B,C,H,L.
+CLNCNT:
+        LXI     D,0
+CLC_LP:
+        MOV     A,B
+        ORA     C
+        RZ
+        MOV     A,M
+        CPI     LF
+        JNZ     CLC_NX
+        INX     D
+CLC_NX:
+        INX     H
+        DCX     B
+        JMP     CLC_LP
+
+;============================================================
+; GBNLNS -> total line count of the file (1-based), for ^G display (D4: total
+; computed lazily and cached).  Cached in NLNCNT; NLNVAL=1 when valid.  SETMOD
+; (VIBUF, the single mutation chokepoint) clears NLNVAL on every edit, and
+; WININIT clears it on load -- so the cache cannot go stale.
+;
+; The whole file is in RAM, so total = (LFs in R1+R2), plus one if the final
+; logical byte is not an LF (an unterminated last line); the empty buffer counts
+; as 1 line.
+;
+; Exit: CY clear + HL = total (>=1).  (The CY-set "unknown" case is a vestige of
+; the removed windowing engine and never occurs now.)
+;============================================================
+GBNLNS:
+        LDA     NLNVAL
+        ORA     A
+        JNZ     GNL_HIT         ; cache still valid
+        ; --- LFs in R1 = base[0, GAPBG) ---
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW          ; HL = base
+        PUSH    H
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = GAPBG (R1 length)
+        MOV     B,H
+        MOV     C,L             ; BC = R1 length
+        POP     H               ; HL = base
+        CALL    CLNCNT          ; DE = LFs in R1
+        XCHG                    ; HL = LFs in R1
+        SHLD    NLNCNT
+        ; --- LFs in R2 = base[GAPEN, BSIZE) ---
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW          ; HL = GAPEN
+        XCHG                    ; DE = GAPEN
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW          ; HL = base
+        DAD     D               ; HL = base + GAPEN (R2 start)
+        PUSH    H               ; save R2 start
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW          ; HL = BSIZE
+        MOV     A,L
+        SUB     E               ; (BSIZE - GAPEN) lo  (DE still = GAPEN)
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = R2 length
+        POP     H               ; HL = R2 start
+        CALL    CLNCNT          ; DE = LFs in R2
+        LHLD    NLNCNT
+        DAD     D               ; HL = total LFs (R1 + R2)
+        SHLD    NLNCNT
+        ; --- final-line adjustment ---
+        MVI     A,BD_TXEND
+        CALL    GBLDHW          ; HL = TXEND
+        MOV     A,H
+        ORA     L
+        JNZ     GNL_NE
+        LXI     H,1             ; empty buffer = 1 line
+        SHLD    NLNCNT
+        JMP     GNL_SET
+GNL_NE:
+        ; last logical byte: R2's last if R2 non-empty, else R1's last.
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW          ; HL = GAPEN
+        XCHG                    ; DE = GAPEN
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW          ; HL = BSIZE
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        ORA     C               ; (BSIZE - GAPEN) == 0 ?
+        JZ      GNL_R1L         ; R2 empty -> last byte is in R1
+        ; R2 non-empty: last byte = base[BSIZE - 1]
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW          ; HL = base
+        XCHG                    ; DE = base
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW          ; HL = BSIZE
+        DAD     D               ; HL = base + BSIZE
+        DCX     H               ; HL = base + BSIZE - 1
+        JMP     GNL_LB
+GNL_R1L:
+        ; R2 empty and TXEND>0 -> R1 non-empty: last byte = base[GAPBG - 1]
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW          ; HL = base
+        XCHG                    ; DE = base
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = GAPBG
+        DAD     D               ; HL = base + GAPBG
+        DCX     H               ; HL = base + GAPBG - 1
+GNL_LB:
+        MOV     A,M             ; A = final logical byte
+        CPI     LF
+        JZ      GNL_SET         ; ends with LF -> total = LF count
+        LHLD    NLNCNT
+        INX     H               ; final unterminated line
+        SHLD    NLNCNT
+GNL_SET:
+        MVI     A,1
+        STA     NLNVAL
+GNL_HIT:
+        LHLD    NLNCNT
+        ORA     A               ; clear carry: known
+        RET
+
+;============================================================
+; CURWLN -> HL = window line of the cursor.  RAM-only: nothing is spilled, so the
+; window line equals the absolute file line (CURLN).  Kept as a named entry for
+; VADJ and the page handlers.
+;============================================================
+CURWLN:
+        JMP     CURLN
+
+;============================================================
+; CURCOL -> HL = column (content bytes on the current line before the cursor).
+;============================================================
+CURCOL:
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = GAPBG
+        XCHG                    ; DE = GAPBG (remaining)
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW          ; HL = base
+        DAD     D               ; HL = base+GAPBG (one past R1 end)
+        LXI     B,0             ; BC = column
+CCO_LP:
+        MOV     A,D
+        ORA     E
+        JZ      CCO_DN          ; consumed all of R1 -> BOB
+        DCX     H
+        DCX     D
+        MOV     A,M
+        CPI     LF
+        JZ      CCO_DN
+        INX     B
+        JMP     CCO_LP
+CCO_DN:
+        MOV     H,B
+        MOV     L,C
+        RET
+
+;============================================================
+; CURDCO -> HL = DISPLAY column of the cursor: like CURCOL but TABs expand to
+; the next multiple of TABWID.  Needs a left-to-right walk (a tab's width
+; depends on the columns before it), so it finds the line start, then advances
+; to the cursor accumulating the visual column.
+;============================================================
+CURDCO:
+        MVI     A,BD_GAPBG
+        CALL    GBLDHW          ; HL = GAPBG
+        XCHG                    ; DE = GAPBG (R1 byte count, backward budget)
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW          ; HL = base
+        DAD     D               ; HL = base+GAPBG = cursor (R1 end, exclusive)
+        SHLD    CDCEND          ; remember cursor position
+        ; --- backward to the start of the current line ---
+CDC_B:
+        MOV     A,D
+        ORA     E
+        JZ      CDC_FS          ; consumed all of R1 -> HL is at base = line start
+        DCX     H
+        DCX     D
+        MOV     A,M
+        CPI     LF
+        JNZ     CDC_B
+        INX     H               ; step past the LF -> line start
+CDC_FS:
+        ; --- forward from line start (HL) to CDCEND, accumulating col in BC ---
+        LXI     B,0             ; BC = display column
+CDC_F:
+        XCHG                    ; DE = scan ptr
+        LHLD    CDCEND
+        MOV     A,L
+        CMP     E
+        JNZ     CDC_NE
+        MOV     A,H
+        CMP     D
+        JZ      CDC_DN          ; scan ptr == cursor -> done
+CDC_NE:
+        XCHG                    ; HL = scan ptr back
+        MOV     A,M
+        CPI     TAB
+        JZ      CDC_TAB
+        INX     B               ; ordinary char: one column
+        JMP     CDC_NX
+CDC_TAB:
+        ; advance to the next TABWID stop: emit columns until (col MOD TABWID)==0
+CDC_TS:
+        INX     B
+        MOV     A,C
+        ANI     TABWID-1        ; col MOD TABWID (TABWID is a power of two)
+        JNZ     CDC_TS
+CDC_NX:
+        INX     H
+        JMP     CDC_F
+CDC_DN:
+        ; HL already = CDCEND; return BC as the column
+        MOV     H,B
+        MOV     L,C
+        RET
+
+;============================================================
+; GBPGDN - move the cursor down B lines (B>0).  Stops early at end of file.
+; Exit: A = number of lines NOT moved (0 = full page achieved).
+;============================================================
+GBPGDN:
+        MOV     A,B
+        ORA     A
+        RZ
+GPD_LP:
+        PUSH    B
+        CALL    GBMVDN
+        POP     B
+        ORA     A
+        JNZ     GPD_END         ; hit end of file
+        DCR     B
+        JNZ     GPD_LP
+        XRA     A
+        RET
+GPD_END:
+        MOV     A,B             ; lines remaining (not moved)
+        RET
+
+;============================================================
+; GBPGUP - move the cursor up B lines (B>0).  Stops early at top of file.
+; Exit: A = number of lines NOT moved.
+;============================================================
+GBPGUP:
+        MOV     A,B
+        ORA     A
+        RZ
+GPU_LP:
+        PUSH    B
+        CALL    GBMVUP
+        POP     B
+        ORA     A
+        JNZ     GPU_END
+        DCR     B
+        JNZ     GPU_LP
+        XRA     A
+        RET
+GPU_END:
+        MOV     A,B
+        RET
+
+;============================================================
+; GBGOTOL - move the cursor to absolute line HL (0-based), repositioning the
+; window as needed.  Clamps at the top / last line of the file.
+;============================================================
+GBGOTOL:
+        SHLD    GOLTGT
+        ; Preserve TOPLN across GBMVTOP: GBMVTOP zeroes TOPLN/CSROW/CSCOL (it is
+        ; the literal go-to-top primitive), but here it is only an internal step
+        ; to make the text contiguous.  We restore the caller's TOPLN on exit so
+        ; the main loop's VADJ sees the real previous viewport and repaints only
+        ; when the jump actually scrolls (CSROW/CSCOL are recomputed by VADJ).
+        MVI     A,BD_TOPLN
+        CALL    GBLDHW
+        SHLD    GOLTOP
+        ; RAM-only: the whole file is resident, so jump straight to the target
+        ; line with a single block move + a tight linefeed scan.
+        ; move the gap to offset 0; all text is now contiguous in R2
+        CALL    GBMVTOP
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW
+        XCHG                    ; DE = base
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW
+        DAD     D               ; HL = base + GAPEN = R2 start
+        SHLD    GOLSRC
+        MVI     A,BD_BSIZE
+        CALL    GBLDHW
+        DAD     D               ; HL = base + BSIZE = R2 end
+        SHLD    GOLEND
+        ; GOLLST tracks the start of the current line, so an over-EOF target
+        ; (e.g. bare G passes 0FFFFH) clamps to the last line without a slow
+        ; walk.  Matches GBMVDN: a trailing LF does NOT make an empty last line.
+        LHLD    GOLSRC
+        SHLD    GOLLST
+        ; scan: HL = scan ptr, DE = R2 end, BC = lines to skip (= target)
+        LHLD    GOLEND
+        XCHG                    ; DE = end
+        LHLD    GOLTGT
+        MOV     B,H
+        MOV     C,L             ; BC = target line (0-based)
+        LHLD    GOLSRC          ; HL = scan ptr
+GOLF_LP:
+        MOV     A,B
+        ORA     C
+        JZ      GOLF_HIT        ; skipped target LFs -> HL at line start
+        MOV     A,H
+        CMP     D
+        JNZ     GOLF_RD
+        MOV     A,L
+        CMP     E
+        JZ      GOLF_CLAMP      ; hit EOF before target -> land on last line
+GOLF_RD:
+        MOV     A,M
+        INX     H
+        CPI     LF
+        JNZ     GOLF_LP
+        DCX     B               ; crossed a line break
+        ; advance the line start to HL, unless that LF was the final byte
+        ; (then the current line, ending in this LF, stays the last line)
+        MOV     A,H
+        CMP     D
+        JNZ     GOLF_ADV
+        MOV     A,L
+        CMP     E
+        JZ      GOLF_LP         ; LF was the last byte -> keep GOLLST
+GOLF_ADV:
+        SHLD    GOLLST
+        JMP     GOLF_LP
+GOLF_CLAMP:
+        LHLD    GOLLST          ; HL = start of the last line
+GOLF_HIT:
+        ; bytes to move the gap forward = (scan ptr) - GOLSRC
+        XCHG                    ; DE = hit ptr
+        LHLD    GOLSRC
+        MOV     A,E
+        SUB     L
+        MOV     C,A
+        MOV     A,D
+        SBB     H
+        MOV     B,A             ; BC = D
+        MOV     H,B
+        MOV     L,C
+        SHLD    GOLREM          ; GOLREM = D (= new GAPBG / CSOFF)
+        MOV     A,B
+        ORA     C
+        JZ      GOL_DONE        ; target is line 0 -> already at top, done
+        ; block-copy D bytes  src=GOLSRC (base+GAPEN) -> dst=base (dst<src, safe)
+        MVI     A,BD_BSTAR
+        CALL    GBLDHW          ; HL = base = dst
+        XCHG                    ; DE = dst
+        LHLD    GOLSRC          ; HL = src
+GOLF_CP:
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCX     B
+        MOV     A,B
+        ORA     C
+        JNZ     GOLF_CP
+        ; commit gap: GAPBG = D, CSOFF = D, GAPEN = oldGAPEN + D
+        LHLD    GOLREM
+        MVI     A,BD_GAPBG
+        CALL    GBSTHW
+        LHLD    GOLREM
+        MVI     A,BD_CSOFF
+        CALL    GBSTHW
+        MVI     A,BD_GAPEN
+        CALL    GBLDHW          ; HL = oldGAPEN
+        XCHG
+        LHLD    GOLREM
+        DAD     D               ; HL = oldGAPEN + D
+        MVI     A,BD_GAPEN
+        CALL    GBSTHW
+GOL_DONE:
+        LHLD    GOLTOP          ; restore the caller's TOPLN (GBMVTOP zeroed it)
+        MVI     A,BD_TOPLN
+        CALL    GBSTHW
+        RET
+
+        CSEG
+GOLTOP:  DW     0               ; GBGOTOL: saved TOPLN (preserved across GBMVTOP)
+CDCEND:  DW     0               ; CURDCO: cursor position (forward-scan target)
+CLNVAL:  DB     0               ; CURLN cache: 1 = valid (resident files only)
+CLNGBG:  DW     0               ; CURLN cache: cached gapbg
+CLNGEN:  DW     0               ; CURLN cache: cached gapen
+CLNCUR:  DW     0               ; CURLN cache: cached curln value
+CLNTMP:  DW     0               ; CURLN: current gapbg scratch
+NLNVAL:  DB     0               ; GBNLNS cache: 1 = NLNCNT valid (cleared by SETMOD)
+NLNCNT:  DW     0               ; GBNLNS cache: total line count
+NAVSAV:  DW     0               ; saved cursor offset for no-move restore
+GOLTGT:  DW     0               ; GBGOTOL target line
+GOLSRC:  DW     0               ; GBGOTOL fast path: R2 start (base+GAPEN)
+GOLEND:  DW     0               ; GBGOTOL fast path: R2 end (base+BSIZE)
+GOLREM:  DW     0               ; GBGOTOL fast path: bytes to move the gap
+GOLLST:  DW     0               ; GBGOTOL fast path: start of current line (clamp)
+
+        END

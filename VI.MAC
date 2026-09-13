@@ -1,0 +1,1154 @@
+;============================================================
+; FILE:    VI.MAC
+; PROJECT: VIEDIT (viedit/) -- produces VIEDIT.COM
+; MODULE:  Entry, TPA sizing, main loop, mode dispatch, editor-state globals.
+;------------------------------------------------------------
+; Memory layout (single CSEG, like the test stubs -- the DSEG/GAPBUF idiom
+; was unreliable here, see STATUS.md):
+;   0100H .. BMDEND      code + static data (BMDEND from VIEND, linked last)
+;   BMDEND .. TPATOP-STKRESV   gap buffer (window)
+;   top STKRESV bytes    stack (SP = CCP's TPATOP-2)
+;
+; The BIOS console stubs and all screen geometry live in VISCREEN (PUBLIC),
+; so VI.MAC does not patch page zero or own NROWS/NCOLS.
+;
+; Vertical scrolling: VADJ recomputes the cursor's window line, slides
+; BD_TOPLN to keep it on screen, sets BD_CSROW/BD_CSCOL for CURPOS, and raises
+; DIRTY when the viewport scrolls.  This is the vertical analogue of AUTOSCR
+; (horizontal) and subsumes viedit's SVTOPLN/CHKSCRL save-and-compare.
+;============================================================
+        INCLUDE VI.INC
+
+        PUBLIC  CURBDP, BDESC0
+        PUBLIC  EDMODE, CMDCNT, PENDOP
+        PUBLIC  GOALCOL, VADJ, TPATOP, VIQUIT, LNOP, SCRDELTA
+        PUBLIC  REINIT          ; VICMD :e -- reload the buffer from INFCB
+
+        EXTRN   BMDEND          ; VIEND -- top of binary image
+        EXTRN   GBINIT, GBLDHW, GBSTHW, BDFLD
+        EXTRN   GBPKRT          ; VIBUF -- byte at the cursor (tab cursor render)
+        EXTRN   FIOPEN, INFCB, OUTFCB   ; VIFILEIO
+        EXTRN   WININIT         ; VIWIN -- reset line caches after open
+        EXTRN   CURWLN          ; VIWIN -- cursor window line (= CURLN, RAM-only)
+        EXTRN   CURDCO          ; VIWIN -- current display column (tab-aware)
+        EXTRN   SCRDRAW, SCREDCL, AUTOSCR, CURPOS, STSTART
+        EXTRN   SCRLUPN, SCRLDNN ; VISCREEN -- N-line VT100 viewport scroll
+        EXTRN   OUTBOTLN, OUTDLBL  ; VISCREEN -- bottom-row / below-cursor redraw
+        EXTRN   OUTINSLN, OUTDELLN ; VISCREEN -- VT100 insert/delete line
+        EXTRN   DIRTY, DRTLINE, SCRLNE, FASTOP
+        EXTRN   NROWS, NCOLS, NEDIT, NSTAT, NEDITM, NEDITP, NCOLSM, NCOLSP
+        EXTRN   RDONLY
+        EXTRN   GETKEY          ; VIKEY
+        EXTRN   BCONST, BCONIN  ; VISCREEN BIOS stubs (DSR size probe)
+        EXTRN   VICMD, VIINS, VIRPL     ; VICMD.MAC
+        EXTRN   UNDOBP, YBUFP   ; VICMD scratch pointers (UNDOBUF/YBUF past image)
+        EXTRN   REPACT, CHGD, RECRST, REPCOMMIT ; VISCREEN -- `.` repeat
+
+STKRESV EQU     512             ; bytes reserved at TPA top for the stack
+SCRPAD  EQU     2048            ; UNDOBUF(1024)+YBUF(1024) live here, just past
+                                ; BMDEND -> kept out of the .COM image
+
+        CSEG
+        ORG     0100H
+
+VIMAIN:
+        ;--- save the command tail before any BDOS dir op clobbers 0080H ---
+        LXI     H,CMDTAIL
+        LXI     D,CMDSAV
+        MVI     B,128
+VM_CS:  MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     VM_CS
+
+        ;--- TPA top = BDOSENT - 0806H  (LHLD 0006H = 0B606H here) ---
+        LHLD    0006H
+        LXI     D,0F7FAH         ; -0806H
+        DAD     D
+        SHLD    TPATOP
+
+        ;--- activate the one buffer descriptor ---
+        LXI     H,BDESC0
+        SHLD    CURBDP
+
+        ;--- UNDOBUF/YBUF live just past the image (out of the .COM),
+        ;    below the gap buffer which now starts at BMDEND+SCRPAD ---
+        LXI     H,BMDEND
+        SHLD    UNDOBP          ; UNDOBUF = BMDEND
+        LXI     H,BMDEND+1024
+        SHLD    YBUFP           ; YBUF = BMDEND + 1024
+
+        ;--- capacity = TPATOP - BMDEND - STKRESV  (BC) ---
+        LHLD    TPATOP
+        LXI     D,STKRESV
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A             ; HL = TPATOP - STKRESV
+        LXI     D,BMDEND+SCRPAD
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = capacity
+        ; minimum-memory check
+        MOV     A,B
+        CPI     MINMEM/256
+        JC      VM_NOMEM
+        ; GBINIT(HL=desc, DE=base, BC=capacity)
+        LXI     H,BDESC0
+        LXI     D,BMDEND+SCRPAD
+        CALL    GBINIT
+
+        ;--- configure screen geometry before any drawing ---
+        ; VIEDIT.CFG (lines=/columns=) first, then /Ln /Cn /R switches override.
+        CALL    CFGREAD
+        CALL    CMDPARSE
+        CALL    VTSIZE           ; auto-detect rows/cols for any dim not set above
+
+        ;--- clear screen before loading ---
+        LXI     H,CLRHOME
+        CALL    PRSTR0
+
+        ;--- parse the saved command tail's first filename (DFTFCB at 005C) ---
+        LDA     DFTFCB+FCB_FN
+        CPI     ' '
+        JZ      VM_NOFIL
+        ORA     A
+        JZ      VM_NOFIL
+        ; build INFCB and OUTFCB from DFTFCB; copy the name to BD_FNAME
+        LXI     D,INFCB
+        CALL    FILLFCB
+        LXI     D,OUTFCB
+        CALL    FILLFCB
+        CALL    SETFNM           ; BD_FNAME = DFTFCB[0..11]
+        CALL    FIOPEN
+        ; RAM-only: FIOPEN returns A=1 if the file is too large to hold resident
+        ; (paging to scratch is unusably slow on a real Altair).  Refuse it.
+        ORA     A
+        JNZ     VM_TOOBIG
+        CALL    WININIT          ; reset line caches
+        JMP     VM_READY
+VM_NOFIL:
+        ; zero BD_FNAME so PRFNAM shows nothing
+        MVI     A,BD_FNAME
+        CALL    BDFLD
+        MVI     B,12
+        XRA     A
+VM_ZF:  MOV     M,A
+        INX     H
+        DCR     B
+        JNZ     VM_ZF
+        CALL    WININIT
+
+VM_READY:
+        CALL    VADJ
+        CALL    AUTOSCR
+        CALL    SCRDRAW
+        CALL    STSTART          ; startup status line
+
+;------------------------------------------------------------
+; MAIN LOOP -- VADJ -> AUTOSCR -> dirty check -> CURPOS -> GETKEY -> dispatch
+;------------------------------------------------------------
+MAINLP:
+        CALL    VADJ            ; vertical: TOPLN/CSROW/CSCOL, DIRTY on scroll
+        CALL    AUTOSCR         ; horizontal: HSCROL, DIRTY on h-scroll
+
+        LDA     DIRTY
+        ORA     A
+        JNZ     ML_FULL
+        LDA     SCRL1
+        ORA     A
+        JNZ     ML_SCRL
+        LDA     LNOP
+        ORA     A
+        JNZ     ML_LNOP
+        LDA     DRTLINE
+        ORA     A
+        JNZ     ML_LINE
+        JMP     ML_CURS
+ML_FULL:
+        CALL    SCRDRAW         ; clears DIRTY + DRTLINE
+        XRA     A
+        STA     SCRL1           ; a full redraw supersedes scroll / line-op
+        STA     LNOP
+        JMP     ML_CURS
+ML_SCRL:
+        ; VT100 viewport scroll: A = SCRL1 = signed line delta, magnitude <=
+        ; NEDIT (+N = scrolled down N, -N = scrolled up N).  Scroll the terminal
+        ; and redraw only the N newly-exposed rows.
+        MOV     B,A
+        ORA     A
+        JM      ML_SCUP         ; negative -> scrolled up
+        CALL    SCRLDNN         ; A = N (down): delete N at top, draw N at bottom
+        JMP     ML_SCEND
+ML_SCUP:
+        MOV     A,B
+        CMA
+        INR     A               ; A = -B = magnitude of the up-scroll
+        CALL    SCRLUPN         ; insert N at top, draw N at top
+ML_SCEND:
+        XRA     A
+        STA     SCRL1
+        STA     LNOP            ; the scroll subsumes any pending line-op
+        STA     DRTLINE         ; the scroll already redrew the exposed rows
+        JMP     ML_CURS
+ML_LNOP:
+        ; structural one-line change (no scroll): A = LNOP
+        ;   1 = inserted a line (o/O): ESC[L at the cursor row + draw it
+        ;   2 = deleted a line (dd):   ESC[M at the cursor row + draw new bottom
+        ;   3 = joined lines (J):      redraw cursor line, ESC[M below + new bottom
+        CPI     2
+        JZ      ML_LNDD
+        CPI     3
+        JZ      ML_LNJ
+        CALL    OUTINSLN        ; LNOP == 1
+        CALL    SCREDCL
+        JMP     ML_LNX
+ML_LNDD:
+        CALL    OUTDELLN
+        CALL    OUTBOTLN        ; redraw the line scrolled into the bottom row
+        JMP     ML_LNX
+ML_LNJ:
+        CALL    SCREDCL         ; cursor line is now the joined (longer) line
+        CALL    OUTDLBL        ; delete the screen line below the cursor
+        CALL    OUTBOTLN
+ML_LNX:
+        XRA     A
+        STA     LNOP
+        STA     DRTLINE
+        JMP     ML_CURS
+ML_LINE:
+        CALL    SCRLNE          ; A=1 if emitted incrementally (cursor already OK)
+        PUSH    PSW
+        XRA     A
+        STA     DRTLINE
+        POP     PSW
+        ORA     A
+        JNZ     ML_CURNP        ; fast path: skip the redundant CURPOS
+ML_CURS:
+        XRA     A
+        STA     FASTOP          ; consume the fast-path request
+        CALL    CURPOS
+        JMP     ML_AREC
+ML_CURNP:
+        XRA     A
+        STA     FASTOP          ; consume the fast-path request (no CURPOS needed)
+ML_AREC:
+        ; record-reset at the start of a command-mode command (for `.`).
+        ; Skip mid-command continuations: replaying, not in command mode, an
+        ; operator is pending (dd/dw), or a count is being entered (2dd).
+        LDA     REPACT
+        ORA     A
+        JNZ     ML_GETK
+        LDA     EDMODE
+        ORA     A               ; EM_CMD == 0
+        JNZ     ML_GETK
+        LDA     PENDOP
+        ORA     A
+        JNZ     ML_GETK
+        LHLD    CMDCNT
+        MOV     A,H
+        ORA     L
+        JNZ     ML_GETK
+        CALL    RECRST
+        XRA     A
+        STA     CHGD
+ML_GETK:
+        CALL    GETKEY          ; B = KT_xxx, C = char / action
+
+        LDA     EDMODE
+        CPI     EM_INS
+        JZ      ML_INS
+        CPI     EM_RPL
+        JZ      ML_RPL
+        CALL    VICMD
+        JMP     ML_AFTER
+ML_INS:
+        CALL    VIINS
+        JMP     ML_AFTER
+ML_RPL:
+        CALL    VIRPL
+        JMP     ML_AFTER
+ML_AFTER:
+        ; commit the recorded keystrokes once a change completes in command mode
+        LDA     REPACT
+        ORA     A
+        JNZ     MAINLP          ; not while replaying
+        LDA     EDMODE
+        ORA     A
+        JNZ     MAINLP          ; still mid insert/visual/etc
+        LDA     CHGD
+        ORA     A
+        JZ      MAINLP
+        CALL    REPCOMMIT
+        JMP     MAINLP
+
+VM_NOMEM:
+        LXI     H,NOMEM
+        CALL    PRSTR0
+        JMP     VIQUIT
+
+;--- file does not fit in RAM: report and return to CP/M (no scratch created) ---
+VM_TOOBIG:
+        LXI     H,TOOBIGM
+        CALL    PRSTR0
+        JMP     WBOOT
+
+;============================================================
+; VIQUIT - exit to CP/M.  All quit paths (here and in VICMD) route through this.
+; (RAM-only: no scratch files to clean up.)
+;============================================================
+VIQUIT:
+        LXI     H,RSTRGN        ; reset scroll region to full screen on exit,
+        CALL    PRSTR0          ; saving/restoring the cursor (ESC[r homes it)
+        JMP     WBOOT
+RSTRGN:  DB     ESC,'7',ESC,'[','r',ESC,'8',NUL
+
+;============================================================
+; VADJ - vertical viewport adjust.  Recompute BD_CSCOL (= column) and the
+; cursor's window line; slide BD_TOPLN so the cursor stays in rows [0,NEDIT);
+; set BD_CSROW; raise DIRTY if BD_TOPLN changed.
+;============================================================
+VADJ:
+        ; BD_CSCOL = display column (CURDCO: tab-aware, so the hardware cursor
+        ; and HSCROL track the on-screen position, not the raw byte index).
+        ; CURDCO returns the column where the cursor's char BEGINS; when that
+        ; char is a TAB, vi renders the cursor on the tab's LAST cell (so a
+        ; tab-indented line shows the cursor just before the first visible
+        ; char).  GOALCOL is unaffected -- it is taken from CURDCO directly.
+        ; EXCEPTION: in insert/replace mode the cursor marks the insertion
+        ; point (where the NEXT typed char lands), so it must sit on the tab's
+        ; FIRST cell.  Otherwise typing into the gap a tab opened (e.g. after
+        ; `cw` between two tabs) would leave the cursor stranded at the tab stop
+        ; while the inserted chars fill in to its left.  Skip the tab-end shift
+        ; unless we are in command mode (EDMODE == EM_CMD == 0).
+        CALL    CURDCO          ; HL = display column (start of the cursor char)
+        MOV     A,L
+        STA     CSCSAV
+        LDA     EDMODE
+        ORA     A               ; EM_CMD == 0 ?
+        JNZ     VADJ_CS         ; insert/replace -> render at the start column
+        CALL    GBPKRT          ; A = byte at the cursor
+        CPI     TAB
+        JNZ     VADJ_CS         ; not a tab -> render at the start column
+        LDA     CSCSAV
+        ANI     TABWID-1        ; col MOD TABWID
+        MOV     B,A
+        MVI     A,TABWID
+        SUB     B               ; A = TABWID - col%TABWID = cells the tab spans
+        DCR     A               ; -> offset of the tab's LAST cell
+        MOV     B,A
+        LDA     CSCSAV
+        ADD     B               ; col + (TABWID - col%TABWID - 1)
+        STA     CSCSAV
+VADJ_CS:
+        LDA     CSCSAV
+        PUSH    PSW
+        MVI     A,BD_CSCOL
+        CALL    BDFLD
+        POP     PSW
+        MOV     M,A
+
+        ; winline = absolute cursor line (16-bit; can exceed 255 for big files)
+        CALL    CURWLN          ; HL = winline
+        SHLD    VWINLN
+
+        ; old top
+        MVI     A,BD_TOPLN
+        CALL    GBLDHW          ; HL = TOPLN
+        SHLD    VTOPSV
+        ; if winline < top: new top = winline
+        XCHG                    ; DE = top
+        LHLD    VWINLN          ; HL = winline
+        MOV     A,L             ; winline - top
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JNC     VADJ_HI         ; winline >= top
+        LHLD    VWINLN
+        SHLD    VTOPNW          ; scrolled up: top = winline
+        JMP     VADJ_SET
+VADJ_HI:
+        ; bottom = top + NEDIT ; if winline >= bottom: top = winline - NEDIT + 1
+        MVI     A,BD_TOPLN
+        CALL    GBLDHW          ; HL = top
+        XCHG                    ; DE = top
+        LDA     NEDIT
+        MOV     L,A
+        MVI     H,0
+        DAD     D               ; HL = top + NEDIT  (= bottom)
+        XCHG                    ; DE = bottom
+        LHLD    VWINLN
+        MOV     A,L             ; winline - bottom
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JC      VADJ_KEEP       ; winline < bottom -> on screen
+        ; top = winline - NEDITM
+        LHLD    VWINLN
+        LDA     NEDITM
+        MOV     E,A
+        MVI     D,0
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBI     0
+        MOV     H,A
+        SHLD    VTOPNW
+        JMP     VADJ_SET
+VADJ_KEEP:
+        LHLD    VTOPSV
+        SHLD    VTOPNW
+VADJ_SET:
+        ; store new TOPLN
+        LHLD    VTOPNW
+        MVI     A,BD_TOPLN
+        CALL    GBSTHW
+        ; BD_CSROW = winline - top  (small: 0..NEDIT-1)
+        LHLD    VTOPNW
+        XCHG                    ; DE = top
+        LHLD    VWINLN
+        MOV     A,L
+        SUB     E               ; low byte difference (CSROW fits a byte)
+        PUSH    PSW
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        POP     PSW
+        MOV     M,A
+        ; viewport scroll handling.  delta = new TOPLN - old TOPLN.
+        ;   delta == 0          -> no scroll
+        ;   1 <= |delta| <= NEDIT -> SCRL1 = signed delta; the main loop scrolls
+        ;                          the terminal that many lines (ESC[<n>L/M) and
+        ;                          redraws only the |delta| newly-exposed rows
+        ;   |delta| > NEDIT      -> no overlap to keep; full redraw (DIRTY)
+        LHLD    VTOPSV
+        XCHG                    ; DE = old top
+        LHLD    VTOPNW          ; HL = new top
+        JMP     SCRDELTA
+
+;============================================================
+; SCRDELTA - record the scroll needed to move the viewport from old TOPLN (DE)
+; to new TOPLN (HL).  delta = new - old:
+;   delta == 0          -> no scroll
+;   1 <= |delta| <= NEDIT -> SCRL1 = signed delta (the main loop scrolls the
+;                          terminal that many lines and redraws only the exposed
+;                          rows)
+;   |delta| > NEDIT      -> full redraw (DIRTY) -- no overlap worth keeping
+; Used by VADJ (cursor-driven scroll) and by the ^F/^B page commands, which set
+; TOPLN explicitly and pass their own old/new tops.
+;============================================================
+SCRDELTA:
+        MOV     A,L
+        SUB     E
+        MOV     C,A             ; C = low byte of delta (signed when |delta|<256)
+        MOV     A,H
+        SBB     D               ; A = high byte of delta
+        JZ      SD_POS          ; high byte 0 -> delta is 0 or +1..+255
+        CPI     0FFH
+        JNZ     SD_DRTY         ; high byte not 0/FF -> |delta| > 255 -> full
+        ; negative delta: magnitude = -(signed low byte C)
+        XRA     A
+        SUB     C               ; A = 0 - C = magnitude
+        JZ      SD_DRTY         ; C == 0 -> delta == -256 -> full redraw
+        MOV     B,A             ; B = magnitude
+        LDA     NEDIT
+        CMP     B               ; NEDIT - magnitude; CY if NEDIT < magnitude
+        JC      SD_DRTY         ; scrolled more than a screen -> full redraw
+        MOV     A,C             ; signed low byte (negative) -> SCRL1
+        STA     SCRL1
+        RET
+SD_POS:
+        MOV     A,C
+        ORA     A
+        RZ                      ; delta == 0: no scroll
+        MOV     B,A             ; B = magnitude (positive delta)
+        LDA     NEDIT
+        CMP     B               ; CY if NEDIT < delta
+        JC      SD_DRTY         ; scrolled more than a screen -> full redraw
+        MOV     A,C             ; +N -> SCRL1
+        STA     SCRL1
+        RET
+SD_DRTY:
+        MVI     A,1
+        STA     DIRTY
+        RET
+
+;------------------------------------------------------------
+; REINIT - re-initialize the gap buffer and load the file currently in INFCB.
+; Used by :e (the caller has already filled INFCB/OUTFCB/BD_FNAME).  Same
+; capacity calc + load as cold start.  Exit: A = 0 loaded ok / A = 1 too large.
+;------------------------------------------------------------
+REINIT:
+        ; capacity = TPATOP - BMDEND - STKRESV  (BC)
+        LHLD    TPATOP
+        LXI     D,STKRESV
+        MOV     A,L
+        SUB     E
+        MOV     L,A
+        MOV     A,H
+        SBB     D
+        MOV     H,A             ; HL = TPATOP - STKRESV
+        LXI     D,BMDEND+SCRPAD
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        MOV     B,A             ; BC = capacity
+        LXI     H,BDESC0
+        LXI     D,BMDEND+SCRPAD
+        CALL    GBINIT          ; reset descriptor (cursor/TOPLN/MODIF = 0)
+        CALL    FIOPEN          ; load INFCB; A = 1 if too large to hold resident
+        PUSH    PSW
+        CALL    WININIT         ; reset the line caches
+        POP     PSW
+        RET
+
+;------------------------------------------------------------
+; FILLFCB - DE = dst FCB.  Copy DFTFCB[0..11] (drive+name+ext) and zero the
+; control fields (EX,S1,S2,RC) so FOPEN matches extent 0.
+;------------------------------------------------------------
+FILLFCB:
+        LXI     H,DFTFCB
+        MVI     B,12
+FF_CP:  MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     FF_CP
+        XRA     A               ; EX, S1, S2, RC
+        STAX    D
+        INX     D
+        STAX    D
+        INX     D
+        STAX    D
+        INX     D
+        STAX    D
+        RET
+
+;------------------------------------------------------------
+; SETFNM - copy DFTFCB[0..11] into BD_FNAME (drive + name8 + ext3).
+;------------------------------------------------------------
+SETFNM:
+        MVI     A,BD_FNAME
+        CALL    BDFLD           ; HL = &BD_FNAME
+        XCHG                    ; DE = &BD_FNAME
+        LXI     H,DFTFCB
+        MVI     B,12
+SFN_L:  MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     SFN_L
+        RET
+
+;------------------------------------------------------------
+; PRSTR0 - print NUL-terminated string at HL via BDOS-independent OUTCHR.
+;------------------------------------------------------------
+PRSTR0:
+        MOV     A,M
+        ORA     A
+        RZ
+        PUSH    H
+        CALL    OUTCH1
+        POP     H
+        INX     H
+        JMP     PRSTR0
+OUTCH1:
+        ; tail to VISCREEN's CONOUT via page zero (avoid extra EXTRN churn)
+        MOV     C,A
+        LHLD    1
+        LXI     D,9
+        DAD     D
+        PCHL
+
+;============================================================
+; SCREEN GEOMETRY CONFIG (ported from viedit/VE.MAC)
+; The geometry vars (NROWS/NCOLS/derived) live PUBLIC in VISCREEN; VI.MAC reads
+; VIEDIT.CFG and the /Ln /Cn /R switches and writes them, then recomputes the
+; derived values.  Geometry may only ENLARGE past the 80x24 minimum.
+;============================================================
+CFGBSZ  EQU     256             ; config read buffer (2 records)
+MINROWS EQU     24
+MAXROWS EQU     200             ; rows back no fixed array (only a redraw bound);
+                                ; cap is just byte-safe headroom below 255
+MINCOLS EQU     80
+MAXCCOL EQU     132             ; LINEBUF/DSPBUF are DS MAXCOLS+1; 132 fits
+VTSTMO  EQU     20000           ; BCONST polls awaiting a DSR reply before giving up
+
+CFGREAD:
+        ; zero the read buffer
+        LXI     H,CFGBUF
+        LXI     B,CFGBSZ
+CFGZ:   MVI     M,0
+        INX     H
+        DCX     B
+        MOV     A,B
+        ORA     C
+        JNZ     CFGZ
+        ; build the FCB from the template, zero the control fields
+        LXI     H,CFGNAM
+        LXI     D,CFGFCB
+        MVI     B,12
+CFGCP:  MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCR     B
+        JNZ     CFGCP
+        MVI     B,FCB_SIZ-12
+        XRA     A
+CFGZF:  STAX    D
+        INX     D
+        DCR     B
+        JNZ     CFGZF
+        ; open VIEDIT.CFG
+        LXI     D,CFGFCB
+        MVI     C,BF_FOPEN
+        CALL    BDOS
+        INR     A
+        RZ                      ; 0FFH -> not found: keep defaults (no recompute needed)
+        XRA     A
+        STA     CFGFCB+FCB_CR
+        ; read up to CFGBSZ bytes into CFGBUF
+        LXI     H,CFGBUF
+        SHLD    CFGDMA
+        MVI     B,CFGBSZ/RECSIZ
+CFGRD:
+        PUSH    B
+        LHLD    CFGDMA
+        XCHG
+        MVI     C,BF_SETDMA
+        CALL    BDOS
+        LXI     D,CFGFCB
+        MVI     C,BF_FREAD
+        CALL    BDOS
+        POP     B
+        ORA     A
+        JNZ     CFGCL           ; EOF/error
+        LHLD    CFGDMA
+        LXI     D,RECSIZ
+        DAD     D
+        SHLD    CFGDMA
+        DCR     B
+        JNZ     CFGRD
+CFGCL:
+        ; restore default DMA and close
+        LXI     D,CMDTAIL
+        MVI     C,BF_SETDMA
+        CALL    BDOS
+        LXI     D,CFGFCB
+        MVI     C,BF_FCLOSE
+        CALL    BDOS
+        ; parse the buffer line by line
+        LXI     H,CFGBUF
+CFGLN:
+        MOV     A,M
+        ORA     A
+        JZ      CFGRCAL
+        CPI     CPMEOF
+        JZ      CFGRCAL
+CFGSK:  MOV     A,M             ; skip leading blanks
+        CPI     ' '
+        JZ      CFGSKA
+        CPI     TAB
+        JZ      CFGSKA
+        JMP     CFGKW
+CFGSKA: INX     H
+        JMP     CFGSK
+CFGKW:
+        MOV     A,M             ; tolerate an optional ':' / 'set' prefix
+        CPI     ':'
+        JNZ     CFGKW1
+        INX     H
+CFGKW1:
+        LXI     D,KWSET
+        CALL    MATCHKW
+        JC      CFGKW2
+CFGKWS: MOV     A,M             ; skip spaces after 'set'
+        CPI     ' '
+        JZ      CFGKWSA
+        CPI     TAB
+        JZ      CFGKWSA
+        JMP     CFGKW2
+CFGKWSA:INX     H
+        JMP     CFGKWS
+CFGKW2:
+        LXI     D,KWLINES
+        CALL    MATCHKW
+        JNC     CFGSETR
+        LXI     D,KWCOLS
+        CALL    MATCHKW
+        JNC     CFGSETC
+        JMP     CFGNXT
+CFGSETR:
+        CALL    CFGPVAL
+        JC      CFGNXT
+        PUSH    H
+        LHLD    CFGVAL
+        MVI     B,MINROWS
+        MVI     C,MAXROWS
+        CALL    CLAMPB
+        STA     NROWS
+        LDA     GEOSET          ; mark rows specified -> suppress autodetect
+        ORI     1
+        STA     GEOSET
+        POP     H
+        JMP     CFGNXT
+CFGSETC:
+        CALL    CFGPVAL
+        JC      CFGNXT
+        PUSH    H
+        LHLD    CFGVAL
+        MVI     B,MINCOLS
+        MVI     C,MAXCCOL
+        CALL    CLAMPB
+        STA     NCOLS
+        LDA     GEOSET          ; mark cols specified -> suppress autodetect
+        ORI     2
+        STA     GEOSET
+        POP     H
+        JMP     CFGNXT
+CFGNXT:
+        MOV     A,M
+        ORA     A
+        JZ      CFGRCAL
+        CPI     CPMEOF
+        JZ      CFGRCAL
+        INX     H
+        CPI     CR
+        JZ      CFGEOL
+        CPI     LF
+        JZ      CFGEOL
+        JMP     CFGNXT
+CFGEOL:
+        MOV     A,M             ; consume any CR/LF run
+        CPI     CR
+        JZ      CFGEOLA
+        CPI     LF
+        JZ      CFGEOLA
+        JMP     CFGLN
+CFGEOLA:INX     H
+        JMP     CFGEOL
+
+;------------------------------------------------------------
+; CFGRCAL - recompute derived geometry from NROWS / NCOLS.
+;   NSTAT = NEDITP = NROWS ; NEDIT = NROWS-1 ; NEDITM = NEDIT-1
+;   NCOLSM = NCOLS-1 ; NCOLSP = NCOLS+1
+;------------------------------------------------------------
+CFGRCAL:
+        LDA     NROWS
+        STA     NSTAT
+        STA     NEDITP
+        DCR     A
+        STA     NEDIT
+        DCR     A
+        STA     NEDITM
+        LDA     NCOLS
+        DCR     A
+        STA     NCOLSM
+        LDA     NCOLS
+        INR     A
+        STA     NCOLSP
+        RET
+
+;------------------------------------------------------------
+; CFGPVAL - parse "= number" at (HL) into CFGVAL.  CY set on missing '='.
+;------------------------------------------------------------
+CFGPVAL:
+CPV_S1: MOV     A,M
+        CPI     ' '
+        JZ      CPV_A1
+        CPI     TAB
+        JZ      CPV_A1
+        JMP     CPV_EQ
+CPV_A1: INX     H
+        JMP     CPV_S1
+CPV_EQ: CPI     '='
+        JNZ     CPV_BAD
+        INX     H
+CPV_S2: MOV     A,M
+        CPI     ' '
+        JZ      CPV_A2
+        CPI     TAB
+        JZ      CPV_A2
+        JMP     CPV_NUM
+CPV_A2: INX     H
+        JMP     CPV_S2
+CPV_NUM:
+        SHLD    CFGPTR
+        LXI     H,0
+CPV_DL:
+        PUSH    H
+        LHLD    CFGPTR
+        MOV     A,M
+        POP     H
+        CPI     '0'
+        JC      CPV_FIN
+        CPI     '9'+1
+        JNC     CPV_FIN
+        SUI     '0'
+        MOV     C,A
+        DAD     H
+        PUSH    H
+        DAD     H
+        DAD     H
+        POP     D
+        DAD     D
+        MVI     B,0
+        DAD     B
+        PUSH    H
+        LHLD    CFGPTR
+        INX     H
+        SHLD    CFGPTR
+        POP     H
+        JMP     CPV_DL
+CPV_FIN:
+        SHLD    CFGVAL
+        LHLD    CFGPTR
+        ORA     A               ; clear carry
+        RET
+CPV_BAD:
+        STC
+        RET
+
+;------------------------------------------------------------
+; CLAMPB - clamp 16-bit HL to [B..C]; result byte in A.
+;------------------------------------------------------------
+CLAMPB:
+        MOV     A,H
+        ORA     A
+        JNZ     CLB_MAX
+        MOV     A,L
+        CMP     B
+        JC      CLB_MIN
+        MOV     A,C
+        CMP     L
+        JC      CLB_MAX
+        MOV     A,L
+        RET
+CLB_MIN:
+        MOV     A,B
+        RET
+CLB_MAX:
+        MOV     A,C
+        RET
+
+;------------------------------------------------------------
+; MATCHKW - match NUL-term uppercase keyword (DE) at text (HL), case-insens.
+;   Match: CY clear, HL advanced.  No match: CY set, HL unchanged.
+;------------------------------------------------------------
+MATCHKW:
+        PUSH    H
+MKW_LP: LDAX    D
+        ORA     A
+        JZ      MKW_YES
+        MOV     B,A
+        MOV     A,M
+        CALL    TOUPPER
+        CMP     B
+        JNZ     MKW_NO
+        INX     H
+        INX     D
+        JMP     MKW_LP
+MKW_YES:
+        POP     B               ; discard saved HL (keep advanced)
+        ORA     A
+        RET
+MKW_NO:
+        POP     H
+        STC
+        RET
+
+TOUPPER:
+        CPI     'a'
+        RC
+        CPI     'z'+1
+        RNC
+        SUI     20H
+        RET
+
+;============================================================
+; CMDPARSE - scan the saved command tail for /Ln /Cn /R switches.
+;============================================================
+CMDPARSE:
+        LDA     CMDSAV          ; B = tail length
+        MOV     B,A
+        LXI     H,CMDSAV+1
+CMP_LP:
+        MOV     A,B
+        ORA     A
+        JZ      CMP_DN
+        MOV     A,M
+        CPI     '/'
+        JZ      CMP_SW
+        INX     H
+        DCR     B
+        JMP     CMP_LP
+CMP_SW:
+        INX     H               ; consume '/'
+        DCR     B
+        MOV     A,B
+        ORA     A
+        JZ      CMP_DN
+        MOV     A,M
+        CALL    TOUPPER
+        CPI     'R'
+        JZ      CMP_RO
+        CPI     'L'
+        JZ      CMP_L
+        CPI     'C'
+        JZ      CMP_C
+        JMP     CMP_LP
+CMP_RO:
+        MVI     A,1
+        STA     RDONLY
+        INX     H
+        DCR     B
+        JMP     CMP_LP
+CMP_L:
+        INX     H               ; consume 'L'
+        DCR     B
+        CALL    CMPNUM
+        PUSH    H
+        PUSH    B
+        MOV     L,A
+        MVI     H,0
+        MVI     B,MINROWS
+        MVI     C,MAXROWS
+        CALL    CLAMPB
+        STA     NROWS
+        LDA     GEOSET          ; /Ln given -> suppress row autodetect
+        ORI     1
+        STA     GEOSET
+        POP     B
+        POP     H
+        JMP     CMP_LP
+CMP_C:
+        INX     H               ; consume 'C'
+        DCR     B
+        CALL    CMPNUM
+        PUSH    H
+        PUSH    B
+        MOV     L,A
+        MVI     H,0
+        MVI     B,MINCOLS
+        MVI     C,MAXCCOL
+        CALL    CLAMPB
+        STA     NCOLS
+        LDA     GEOSET          ; /Cn given -> suppress col autodetect
+        ORI     2
+        STA     GEOSET
+        POP     B
+        POP     H
+        JMP     CMP_LP
+CMP_DN:
+        JMP     CFGRCAL         ; recompute derived geometry
+
+;------------------------------------------------------------
+; CMPNUM - parse decimal digits at (HL), up to B chars.  A = value (byte).
+;------------------------------------------------------------
+CMPNUM:
+        MVI     C,0
+CMN_LP:
+        MOV     A,B
+        ORA     A
+        JZ      CMN_FIN
+        MOV     A,M
+        CPI     '0'
+        JC      CMN_FIN
+        CPI     '9'+1
+        JNC     CMN_FIN
+        SUI     '0'
+        MOV     D,A
+        MOV     A,C
+        ADD     A
+        MOV     E,A
+        ADD     A
+        ADD     A
+        ADD     E
+        ADD     D
+        MOV     C,A
+        INX     H
+        DCR     B
+        JMP     CMN_LP
+CMN_FIN:
+        MOV     A,C
+        RET
+
+;============================================================
+; VTSIZE - auto-detect terminal size via the VT100 DSR cursor-position report.
+;
+; Runs after CFGREAD + CMDPARSE.  GEOSET bit0/bit1 record whether rows/cols were
+; given explicitly (config file or /Ln /Cn); this fills only the dims NOT set.
+; Parks the cursor far off-screen (ESC[999;999H -> the terminal clamps it to the
+; bottom-right corner) then queries with ESC[6n; the terminal answers
+;   ESC [ <rows> ; <cols> R
+; whose numbers ARE the screen size.  A terminal without DSR sends nothing, so
+; every read is bounded by VTSTMO BCONST polls; on timeout or any malformed byte
+; we abandon the probe and keep the existing values (defaults 24x80, or whatever
+; was already set).  Falls through to CFGRCAL to recompute derived geometry
+; either way, so VIMAIN gets a consistent screen description regardless.
+;
+; The reply bytes are fully consumed here, so none leak into the first GETKEY.
+;============================================================
+VTSIZE:
+        LDA     GEOSET
+        CPI     3               ; both rows AND cols specified?
+        JZ      CFGRCAL         ; nothing to detect; just recompute & return
+        LXI     H,VTQRY         ; park cursor + emit ESC[6n
+        CALL    PRSTR0
+        CALL    VTGETB          ; expect ESC
+        JC      CFGRCAL
+        CPI     ESC
+        JNZ     CFGRCAL
+        CALL    VTGETB          ; expect '['
+        JC      CFGRCAL
+        CPI     '['
+        JNZ     CFGRCAL
+        CALL    VTNUM           ; rows -> VTACC, A = terminator
+        JC      CFGRCAL
+        CPI     ';'
+        JNZ     CFGRCAL
+        LHLD    VTACC
+        SHLD    VTRSAV          ; hold rows while we parse cols
+        CALL    VTNUM           ; cols -> VTACC, A = terminator
+        JC      CFGRCAL
+        CPI     'R'
+        JNZ     CFGRCAL
+        ;--- valid reply; apply each parsed value to its dim if unset ---
+        LDA     GEOSET
+        ANI     1               ; rows already set?
+        JNZ     VTS_COLS
+        LHLD    VTRSAV
+        MVI     B,MINROWS
+        MVI     C,MAXROWS
+        CALL    CLAMPB
+        STA     NROWS
+VTS_COLS:
+        LDA     GEOSET
+        ANI     2               ; cols already set?
+        JNZ     VTS_DONE
+        LHLD    VTACC
+        MVI     B,MINCOLS
+        MVI     C,MAXCCOL
+        CALL    CLAMPB
+        STA     NCOLS
+VTS_DONE:
+        JMP     CFGRCAL         ; recompute derived geometry from new NROWS/NCOLS
+
+;------------------------------------------------------------
+; VTGETB - read one console byte, bounded by VTSTMO BCONST polls.
+;   Exit: CY clear, A = byte read; or CY set on timeout.
+;   Clobbers all regs (BIOS CONST/CONIN have no register contract); the 16-bit
+;   countdown lives in HL and is saved across each BIOS call (cf. VIKEY GK_POLL).
+;------------------------------------------------------------
+VTGETB:
+        LXI     H,VTSTMO
+VTG_LP:
+        MOV     A,H
+        ORA     L
+        JZ      VTG_TO
+        DCX     H
+        PUSH    H
+        CALL    BCONST
+        POP     H
+        ORA     A
+        JZ      VTG_LP
+        PUSH    H
+        CALL    BCONIN
+        POP     H
+        ORA     A               ; CY clear; A = byte
+        RET
+VTG_TO:
+        STC
+        RET
+
+;------------------------------------------------------------
+; VTNUM - read a run of decimal digits from the console into VTACC (DW).
+;   Reads via VTGETB until a non-digit (or timeout).  The running value lives in
+;   VTACC (memory) because VTGETB clobbers every register between digits.
+;   Exit: VTACC = value; A = the terminating non-digit; CY clear.
+;         CY set (propagated) on a read timeout.
+;------------------------------------------------------------
+VTNUM:
+        LXI     H,0
+        SHLD    VTACC
+VTN_LP:
+        CALL    VTGETB
+        RC                      ; timeout -> CY, let caller bail
+        CPI     '0'
+        JC      VTN_FIN
+        CPI     '9'+1
+        JNC     VTN_FIN
+        SUI     '0'
+        STA     VTDIG           ; stash digit; HL math below clobbers A
+        LHLD    VTACC
+        DAD     H               ; *2
+        PUSH    H
+        DAD     H               ; *4
+        DAD     H               ; *8
+        POP     D               ; DE = value*2
+        DAD     D               ; *10
+        LDA     VTDIG
+        MOV     E,A
+        MVI     D,0
+        DAD     D               ; + digit
+        SHLD    VTACC
+        JMP     VTN_LP
+VTN_FIN:
+        ORA     A               ; clear CY; A = terminator char (non-zero)
+        RET
+
+        CSEG
+;--- editor-state globals (EXTRNed by VICMD / VIEX) ---
+CURBDP:  DW     BDESC0          ; active descriptor pointer
+EDMODE:  DB     EM_CMD
+CMDCNT:  DW     0               ; count prefix (0 = none)
+PENDOP:  DB     0               ; pending operator (d/c/y), 0 = none
+GOALCOL: DB     0               ; sticky goal column for j/k
+
+TPATOP:  DW     0
+VWINLN:  DW     0               ; VADJ: cursor window line (16-bit)
+VTOPSV:  DW     0               ; VADJ: old TOPLN
+CSCSAV:  DB     0               ; VADJ: cursor display column (tab-end adjusted)
+VTOPNW:  DW     0               ; VADJ: new TOPLN
+SCRL1:   DB     0               ; scroll pending: signed delta, +N down / -N up / 0 none
+LNOP:    DB     0               ; structural 1-line change: 1=ins(o/O) 2=del(dd) 3=join(J)
+
+NOMEM:   DB     'Not enough memory',CR,LF,NUL
+TOOBIGM: DB     'File too large to edit in available memory',CR,LF,NUL
+CLRHOME: DB     ESC,'[','2','J',ESC,'[','H',NUL
+
+BDESC0:  DS     BD_SIZE
+CMDSAV:  DS     128             ; saved command tail
+
+; --- VIEDIT.CFG reader state ---
+CFGNAM:  DB     0,'VIEDIT  ','CFG'   ; FCB template (drive + name8 + ext3)
+KWSET:   DB     'SET',0
+KWLINES: DB     'LINES',0
+KWCOLS:  DB     'COLUMNS',0
+CFGVAL:  DW     0
+CFGPTR:  DW     0
+CFGDMA:  DW     0
+CFGFCB:  DS     FCB_SIZ
+CFGBUF:  DS     256             ; CFGBSZ
+
+; --- VT100 DSR size-probe state ---
+GEOSET:  DB     0               ; bit0 = rows set, bit1 = cols set (suppress probe)
+VTACC:   DW     0               ; VTNUM running value
+VTRSAV:  DW     0               ; parsed rows held while parsing cols
+VTDIG:   DB     0               ; VTNUM current digit (kept across HL math)
+VTQRY:   DB     ESC,'[','9','9','9',';','9','9','9','H'  ; park cursor bottom-right
+         DB     ESC,'[','6','n',NUL                      ; DSR cursor-position query
+
+        END     VIMAIN

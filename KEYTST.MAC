@@ -1,0 +1,108 @@
+;============================================================
+; FILE:    KEYTST.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  Phase-3 key-decoder test stub.
+;------------------------------------------------------------
+; Drives VIKEY's GETKEY so a Python driver can feed raw key bytes and read
+; back the decoded (type, code) pair.
+;
+; Provides the BIOS console stubs VIKEY needs (BCONST/BCONIN) directly, so
+; the link set is just KEYTST + VIKEY + VIEND.
+;
+; PROTOCOL (driver sends a command byte; 'K' is followed by the key bytes
+; to decode, already queued in the console input):
+;   'K' <key bytes...>   GETKEY -> <type:2hex><code:2hex> CR LF
+;   'X'                  exit to CP/M
+;
+; A ready sentinel (SOH = 01H) is emitted before each input wait, so the
+; driver can run until it appears (robust against spurious "idle" stops).
+;============================================================
+        INCLUDE VI.INC
+
+        EXTRN   GETKEY
+        PUBLIC  BCONIN, BCONST
+
+        CSEG
+        ORG     0100H
+
+START:
+        LXI     SP,STACK
+MAINLP:
+        MVI     A,01H           ; ready sentinel
+        CALL    PUTCH
+        CALL    BCONIN          ; command byte
+        CPI     'K'
+        JZ      DOKEY
+        CPI     'X'
+        JZ      WBOOT
+        JMP     MAINLP
+
+DOKEY:
+        CALL    GETKEY          ; B = type, C = code
+        MOV     A,B
+        CALL    PUTHEX
+        MOV     A,C
+        CALL    PUTHEX
+        MVI     A,CR
+        CALL    PUTCH
+        MVI     A,LF
+        CALL    PUTCH
+        JMP     MAINLP
+
+;------------------------------------------------------------
+; BIOS console stubs (direct, no register contract -> callers save regs).
+; Warm-boot vector at 0001H = BIOS WBOOT slot; CONST=+3, CONIN=+6, CONOUT=+9.
+;------------------------------------------------------------
+BCONST:                         ; -> A=FFH ready / 00H not ready
+        LHLD    1
+        LXI     D,3
+        DAD     D
+        PCHL
+BCONIN:                         ; -> A = char (blocks)
+        LHLD    1
+        LXI     D,6
+        DAD     D
+        PCHL
+BCONOUT:                        ; C = char
+        LHLD    1
+        LXI     D,9
+        DAD     D
+        PCHL
+
+PUTCH:                          ; A = char (preserves A)
+        PUSH    PSW
+        PUSH    B
+        PUSH    D
+        PUSH    H
+        MOV     C,A
+        CALL    BCONOUT
+        POP     H
+        POP     D
+        POP     B
+        POP     PSW
+        RET
+
+PUTHEX:                         ; output A as 2 hex digits
+        PUSH    PSW
+        RRC
+        RRC
+        RRC
+        RRC
+        CALL    PUTNIB
+        POP     PSW
+        CALL    PUTNIB
+        RET
+PUTNIB:
+        ANI     0FH
+        CPI     10
+        JC      PNIB_D
+        ADI     'A'-10
+        JMP     PUTCH
+PNIB_D:
+        ADI     '0'
+        JMP     PUTCH
+
+        DS      256
+STACK:
+
+        END     START

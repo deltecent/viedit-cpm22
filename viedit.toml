@@ -1,0 +1,21 @@
+# VIEDIT machine for altairsim -- build (build_vi.py) and smoke test (smoke_vi.py).
+#
+# A DELTA on the built-in `default` machine, which already IS the CP/M Altair:
+# front panel, 8080 (flat out), 88-2SIO console at 0x10, 88-DCDD disk controller
+# `dsk0` at 0x08 with four drives, the `hostbridge` card `hb0` at 0xB0 (R/W/HDIR
+# talk to it, rooted at altairsim's working directory), 56K RAM, and the DBL boot
+# PROM at FF00.  See altairsim's machines/default.toml for the full base.
+#
+# The disk is NOT named here: the driver (mcpdrive.py) MOUNTs the working image
+# onto dsk0:drive0 at runtime, so one machine file serves the single build image
+# and the smoke test's many per-editor images alike.  Boot is `RUN FF00` (the DBL
+# PROM), issued by the driver -- under --mcp a machine's `startup` is not run, so
+# nothing blocks before the driver has control.
+#
+# The 8 MB CPM22-8MB-56K-VIEDIT.DSK image sizes the same 88-DCDD card to `fdc8mb`
+# automatically (2048 tracks x 32 sectors of 137-byte hard sectors) -- there is no
+# separate 8 MB controller to fit.
+
+[machine]
+name = "viedit"
+base = "default"

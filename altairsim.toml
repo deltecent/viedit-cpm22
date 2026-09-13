@@ -1,0 +1,38 @@
+# VIEDIT interactive machine for altairsim.
+#
+# This is the file `altairsim` loads when you run it with NO machine argument in
+# this directory, so a person can just:
+#
+#     cd viedit-cpm22
+#     altairsim                 # boots CP/M off the VIEDIT disk, lands at A0>
+#     A0>VIEDIT TEST.TXT        # run the editor
+#     A0>SUBMIT VIEDIT          # or rebuild VIEDIT from the on-disk sources
+#
+# It is a DELTA on altairsim's built-in `default` machine (front panel, 8080,
+# 88-2SIO console at 0x10, 88-DCDD `dsk0` at 0x08 with four drives, hostbridge
+# `hb0` at 0xB0, 56K RAM, DBL boot PROM at FF00) -- so all it adds is the disk in
+# drive 0 and the boot keystroke.
+#
+# The BUILD and SMOKE-TEST scripts do NOT use this file: they drive altairsim
+# over MCP with viedit.toml and MOUNT their working image at runtime (build_vi.py
+# on this same disk, smoke_vi.py on per-editor copies).  See CLAUDE.md.
+
+[machine]
+name = "viedit"
+base = "default"
+
+# THE BOOT PROM IS THE BOOT COMMAND (there is no BOOT verb): DBL at FF00 loads the
+# CP/M image and jumps into the BIOS.  Run interactively this auto-boots to A0>;
+# under `--mcp` the startup is parked and the driver issues RUN FF00 itself.
+# NOTE: `startup` is a [machine] key -- it must come BEFORE any [[board]] block,
+# or TOML reads it as a key of the last table (the drive) and rejects it.
+startup = ["RUN FF00"]
+
+# The 8 MB image sizes the base's 88-DCDD to `fdc8mb` automatically; `id` with no
+# `type` puts the disk in the drive the base already fits (no second controller).
+[[board]]
+id = "dsk0"
+
+  [[board.drive]]
+  unit  = 0
+  mount = "CPM22-8MB-56K-VIEDIT.DSK"

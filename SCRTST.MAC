@@ -1,0 +1,277 @@
+;============================================================
+; FILE:    SCRTST.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  Phase-2 screen-engine test stub.
+;------------------------------------------------------------
+; Drives VISCREEN (SCRDRAW / SCREDCL / AUTOSCR / CURPOS / GBGETLN) over a
+; console protocol so a Python driver can render the VT100 output through
+; a terminal emulator and compare it to an oracle.  It also lets the
+; driver inspect GBGETLN directly and set the cursor / TOPLN / HSCROL.
+;
+; Console input is direct BIOS CONIN (7-bit, parity-masked by the BIOS).
+; Console output is VISCREEN's BCONOUT (direct BIOS CONOUT).
+;
+; PROTOCOL (driver sends a command byte; some take argument bytes):
+;   '0'              GBINIT (empty buffer)
+;   'F' <11 name>    GBINIT + FIOPEN(name) + cursor to top
+;   'I' <byte>       GBINSRT(byte)
+;   'R'              GBMVRT
+;   'L'              GBMVLT
+;   'C' <row> <col>  set BD_CSROW=row, BD_CSCOL=col
+;   'T' <lo> <hi>    set BD_TOPLN = hi*256+lo
+;   'H' <byte>       set HSCROL = byte
+;   'h'              print HSCROL as <2 hex> CR LF
+;   'A'              AUTOSCR
+;   'D'              SCRDRAW
+;   'E'              SCREDCL ; CURPOS
+;   'G'              GBGETLN -> <count:2hex><bytes:2hex each> CR LF
+;   'X'              exit to CP/M
+;============================================================
+        INCLUDE VI.INC
+
+        EXTRN   GBINIT, GBINSRT, GBMVRT, GBMVLT, GBGETLN
+        EXTRN   BDFLD, GBSTHW
+        EXTRN   FIOPEN, INFCB
+        EXTRN   SCRDRAW, SCREDCL, AUTOSCR, CURPOS
+        EXTRN   HSCROL, OUTCHR, BCONIN
+
+        PUBLIC  CURBDP, BDESC0
+
+BUFSIZ  EQU     8192
+
+        CSEG
+        ORG     0100H
+
+START:
+        LXI     SP,STACK
+        CALL    DORST
+MAINLP:
+        ; Emit a ready sentinel (SOH = 01H) before blocking for input.  The
+        ; driver runs until it sees this byte, so a file-I/O command can never
+        ; be cut off mid-operation by a spurious "idle" (DESIGN section 7).
+        ; 01H is < 0x20, so the VT100 emulator ignores it in screen output.
+        MVI     A,01H
+        CALL    PUTCH
+        CALL    GETCH
+        CPI     '0'
+        JZ      DORST
+        CPI     'F'
+        JZ      DOLOAD
+        CPI     'I'
+        JZ      DOINS
+        CPI     'R'
+        JZ      DOMVR
+        CPI     'L'
+        JZ      DOMVL
+        CPI     'C'
+        JZ      DOCUR
+        CPI     'T'
+        JZ      DOTOP
+        CPI     'H'
+        JZ      DOHSET
+        CPI     'h'
+        JZ      DOHGET
+        CPI     'A'
+        JZ      DOAUTO
+        CPI     'D'
+        JZ      DODRAW
+        CPI     'E'
+        JZ      DOEDCL
+        CPI     'G'
+        JZ      DOGETL
+        CPI     'X'
+        JZ      WBOOT
+        JMP     MAINLP
+
+DORST:
+        LXI     H,BDESC0
+        LXI     D,BUF
+        LXI     B,BUFSIZ
+        CALL    GBINIT
+        JMP     MAINLP
+
+DOLOAD:
+        LXI     H,BDESC0
+        LXI     D,BUF
+        LXI     B,BUFSIZ
+        CALL    GBINIT
+        LXI     H,INFCB
+        CALL    RDNAME
+        CALL    FIOPEN          ; loads file; cursor left at top (g=0)
+        JMP     MAINLP
+
+DOINS:
+        CALL    GETCH
+        CALL    GBINSRT
+        JMP     MAINLP
+
+DOMVR:  CALL    GBMVRT
+        JMP     MAINLP
+DOMVL:  CALL    GBMVLT
+        JMP     MAINLP
+
+;--- 'C' <row> <col>: set cursor screen row/col ---
+DOCUR:
+        CALL    GETCH           ; row
+        PUSH    PSW
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        POP     PSW
+        MOV     M,A
+        CALL    GETCH           ; col
+        PUSH    PSW
+        MVI     A,BD_CSCOL
+        CALL    BDFLD
+        POP     PSW
+        MOV     M,A
+        JMP     MAINLP
+
+;--- 'T' <lo> <hi>: set BD_TOPLN ---
+DOTOP:
+        CALL    GETCH           ; lo
+        MOV     C,A
+        CALL    GETCH           ; hi
+        MOV     B,A
+        MOV     H,B
+        MOV     L,C             ; HL = hi*256+lo
+        MVI     A,BD_TOPLN
+        CALL    GBSTHW
+        JMP     MAINLP
+
+;--- 'H' <byte>: set HSCROL ---
+DOHSET:
+        CALL    GETCH
+        STA     HSCROL
+        JMP     MAINLP
+
+;--- 'h': print HSCROL ---
+DOHGET:
+        LDA     HSCROL
+        CALL    PUTHEX
+        CALL    PUTCRLF
+        JMP     MAINLP
+
+DOAUTO: CALL    AUTOSCR
+        JMP     MAINLP
+DODRAW: CALL    SCRDRAW
+        JMP     MAINLP
+DOEDCL: CALL    SCREDCL
+        CALL    CURPOS
+        JMP     MAINLP
+
+;--- 'G': GBGETLN dump ---
+DOGETL:
+        LXI     D,GLBUF
+        MVI     B,MAXCOLS
+        CALL    GBGETLN         ; B = count
+        MOV     A,B
+        STA     GLCNT
+        CALL    PUTHEX          ; count byte
+        LDA     GLCNT
+        MOV     B,A
+        LXI     H,GLBUF
+DGL_LP:
+        MOV     A,B
+        ORA     A
+        JZ      DGL_DN
+        MOV     A,M
+        PUSH    B
+        PUSH    H
+        CALL    PUTHEX
+        POP     H
+        POP     B
+        INX     H
+        DCR     B
+        JMP     DGL_LP
+DGL_DN:
+        CALL    PUTCRLF
+        JMP     MAINLP
+
+;--- RDNAME: HL=FCB; drive=0, read 11 name+ext bytes into FCB+1 ---
+RDNAME:
+        MVI     M,0
+        INX     H
+        MVI     B,11
+RDN_L:
+        PUSH    H
+        PUSH    B
+        CALL    GETCH
+        POP     B
+        POP     H
+        MOV     M,A
+        INX     H
+        DCR     B
+        JNZ     RDN_L
+        ; HL = FCB+12; zero EX,S1,S2,RC so FOPEN matches extent 0.  Without
+        ; this, an uninitialised EX makes BDOS search a phantom extent and
+        ; return "not found" (the intermittent load failures we chased).
+        MVI     M,0
+        INX     H
+        MVI     M,0
+        INX     H
+        MVI     M,0
+        INX     H
+        MVI     M,0
+        RET
+
+;------------------------------------------------------------
+; Console primitives
+;------------------------------------------------------------
+GETCH:                          ; -> A = char (blocks)
+        PUSH    B
+        PUSH    D
+        PUSH    H
+        CALL    BCONIN
+        POP     H
+        POP     D
+        POP     B
+        RET
+
+PUTCH:                          ; A = char to output (preserves A)
+        PUSH    PSW
+        PUSH    B
+        PUSH    D
+        PUSH    H
+        CALL    OUTCHR
+        POP     H
+        POP     D
+        POP     B
+        POP     PSW
+        RET
+
+PUTHEX:                         ; output A as 2 hex digits
+        PUSH    PSW
+        RRC
+        RRC
+        RRC
+        RRC
+        CALL    PUTNIB
+        POP     PSW
+        CALL    PUTNIB
+        RET
+PUTNIB:
+        ANI     0FH
+        CPI     10
+        JC      PNIB_D
+        ADI     'A'-10
+        JMP     PUTCH
+PNIB_D:
+        ADI     '0'
+        JMP     PUTCH
+
+PUTCRLF:
+        MVI     A,CR
+        CALL    PUTCH
+        MVI     A,LF
+        JMP     PUTCH
+
+        CSEG
+CURBDP: DW      0
+BDESC0:  DS      BD_SIZE
+GLBUF:  DS      MAXCOLS+1
+GLCNT:  DB      0
+        DS      1024
+STACK:
+BUF:    DS      BUFSIZ
+
+        END     START

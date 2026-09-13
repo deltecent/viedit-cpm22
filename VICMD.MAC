@@ -1,0 +1,1212 @@
+;============================================================
+; FILE:    VICMD.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  Command-mode + insert-mode key handlers (Phase 4 starter).
+;------------------------------------------------------------
+; Entry points (called by VI.MAC's main loop with B=KT_xxx, C=char/action):
+;   VICMD  -- command mode dispatch
+;   VIINS  -- insert mode handler
+;
+; Motions are wired through the boundary-transparent buffer/window primitives
+; (GBMVLT/RT/UP/DN, GBPGDN/UP, GBGOTOL).  This is the starter set; the full
+; VECMD port (operators, yank/put, undo, f/F/t/T, %, search) follows.
+;============================================================
+        INCLUDE VI.INC
+
+        PUBLIC  BSTEP, CLS, DDLAST, DDLINES, ESTEP, FNBLNK
+        PUBLIC  MVRTIL, VCBIGB, VCBIGC, VCBIGD, VCBIGE, VCBIGS
+        PUBLIC  VCBIGW, VC_0, VC_B, VC_CARET, VC_CTRLG, VC_E
+        PUBLIC  VC_EOL, VC_GG, VC_H, VC_HFDN, VC_HFUP, VC_HIGH
+        PUBLIC  VC_J, VC_JOIN, VC_K, VC_L, VC_LOWL, VC_MIDL
+        PUBLIC  VC_PGDN, VC_PGUP, VC_R, VC_RCH, VC_REDR, VC_S
+        PUBLIC  VC_TILDE, VC_W, VC_X, VICMD, WSTEP, YANKLNS
+
+        EXTRN   CURBDP, EDMODE, GOALCOL, CMDCNT, PENDOP
+        EXTRN   BDFLD
+        EXTRN   GBMVLT, GBMVRT, GBMLNS, GBMLNE, GBPKRT, GBPKLT, PKRT2, MV1RT
+        EXTRN   GBMVDN, GBMVUP, GBPGDN, GBPGUP, GBGOTOL, CURCOL, CURLN, CURWLN
+        EXTRN   GBNLNS          ; total line count (lazy, cached)
+        EXTRN   CURDCO          ; VIWIN -- current display column (tab-aware)
+        EXTRN   GBINSRT, GBDELRT, GBDLFT, GBLDHW, GBSTHW, GBGETLN
+        EXTRN   GBADVN, GBBAKN, GBR2RG  ; VIBUF -- bulk cursor advance/retreat + R2 range
+        EXTRN   FISAVE, RDONLY
+        EXTRN   INFCB, OUTFCB, IRINIT, IRGETB   ; VIFILEIO -- :r / :w file
+        EXTRN   REINIT          ; VI.MAC -- :e reload buffer from INFCB
+        EXTRN   VADJ, AUTOSCR, SCRDRAW          ; redraw the new buffer after :e
+        EXTRN   SCRDELTA         ; VI.MAC -- old/new TOPLN -> scroll or full redraw
+        EXTRN   SCREDCL          ; VISCREEN -- redraw the current line in place
+        EXTRN   SCREDAT, OUTINSLN    ; VISCREEN -- multi-line put redraw (O-style)
+        EXTRN   DIRTY, DRTLINE, NEDIT, NSTAT, NEDITM
+        EXTRN   FASTOP, FASTCH, FASTN  ; VISCREEN -- incremental char-emit fast path
+        EXTRN   OUTCHR, OUTSTR, OUTN16, PRFNAM
+        EXTRN   GOTOXY, STATCLR, STATMSG, SHOWMOD, BCONIN
+        EXTRN   GETKEY, CHGD, REPGO, REPMORE     ; `.` repeat
+        EXTRN   VIQUIT          ; VI.MAC -- clean-quit to CP/M
+        EXTRN   LNOP            ; VI.MAC -- structural 1-line change flag
+        EXTRN   HELPSC          ; VISCREEN -- full-screen help overlay
+        EXTRN   ACTTAB, CMDTAB, CNTGET, CWSCAN, DDLCNT, DOSAVE
+        EXTRN   ENTINS, GBCSOF, GCLR, GCOLMSG, GMSG, GOFMSG
+        EXTRN   GOTOPOS, GPEND, GROMSG, GSIZMSG, HFN, HMLBOT
+        EXTRN   HMLLST, HMLTOP, ISEOL, OPHANDLE, OPSET, PGREQ
+        EXTRN   PGSDLT, PGSVCO, PGSVLN, PGTOP, PKEOL, PKRTF
+        EXTRN   RCNT, REPMSG, REPN, SETDRTY, SETGOAL, SETLINE
+        EXTRN   STATHOME, SVERR, UBEGD, UDEL1, UINS1, UNDOBP
+        EXTRN   UNDOLEN, VADVG, VJCUR, VJLONGM, VJSAV, VSCAN
+        EXTRN   WBIG, WCLS, XCNT, YBUFP, YLEN, YLNEND
+        EXTRN   YLNSAV, YLNSCN, YTYP, YWP, ZPEND
+
+        CSEG
+
+;============================================================
+; VICMD - command-mode dispatch.  B = key type, C = char/action.
+;============================================================
+VICMD:
+        MOV     A,B
+        CPI     KT_ACT
+        JZ      VC_ACT
+        CPI     KT_CHAR
+        RNZ                     ; KT_NONE: ignore
+        MOV     A,C
+        ; --- count prefix: digits accumulate into CMDCNT ---
+        ; '1'..'9' always; '0' is a digit only when a count is in progress
+        ; (otherwise '0' is the line-start motion).
+        CPI     '0'
+        JC      VC_NODIG
+        CPI     '9'+1
+        JNC     VC_NODIG
+        CPI     '0'
+        JNZ     VC_ACC
+        LHLD    CMDCNT
+        MOV     A,H
+        ORA     L
+        JZ      VC_NODIG        ; bare '0' -> line-start command
+VC_ACC:
+        LHLD    CMDCNT          ; CMDCNT = CMDCNT*10 + (digit)
+        DAD     H               ; x2
+        MOV     D,H
+        MOV     E,L
+        DAD     H               ; x4
+        DAD     H               ; x8
+        DAD     D               ; x8 + x2 = x10
+        MOV     A,C
+        SUI     '0'
+        MOV     E,A
+        MVI     D,0
+        DAD     D
+        SHLD    CMDCNT
+        RET
+VC_NODIG:
+        ; if an operator (d/c/y) is pending, this key is its motion / target
+        LDA     PENDOP
+        ORA     A
+        JNZ     OPHANDLE
+        MOV     A,C
+        ; 'g' / 'Z' use double-key latches (gg / ZZ)
+        CPI     'g'
+        JZ      VC_G
+        CPI     'Z'
+        JZ      VC_Z
+        ; otherwise clear both double-key latches
+        PUSH    PSW
+        XRA     A
+        STA     GPEND
+        STA     ZPEND
+        POP     PSW
+        ; d / c / y begin an operator (await a motion or a doubled key)
+        CPI     'd'
+        JZ      OPSET
+        CPI     'y'
+        JZ      OPSET
+        CPI     'c'
+        JZ      OPSET
+        CPI     '>'             ; >> shift right (line operator)
+        JZ      OPSET
+        CPI     '<'             ; << shift left
+        JZ      OPSET
+        ; terminal command: snapshot the count into RCNT, reset CMDCNT
+        PUSH    PSW
+        LHLD    CMDCNT
+        SHLD    RCNT
+        LXI     H,0
+        SHLD    CMDCNT
+        POP     PSW
+        LXI     H,CMDTAB
+        JMP     VSCAN           ; table dispatch (miss -> RET = ignore)
+
+;------------------------------------------------------------
+; Action keys (arrows / Home / End / PgUp / PgDn) -> motions.
+;------------------------------------------------------------
+VC_ACT:
+        MOV     A,C
+        LXI     H,ACTTAB
+        JMP     VSCAN
+
+;------------------------------------------------------------
+; Horizontal / line motions (reset the goal column).
+;------------------------------------------------------------
+VC_H:   CALL    CNTGET          ; B = repeat count
+        LXI     H,HSTEP         ; left, but never off the start of the line
+        CALL    REPN
+        JMP     GCLR
+VC_L:   CALL    CNTGET
+        LXI     H,LSTEP
+        CALL    REPN
+        JMP     GCLR
+; LSTEP - move right one, but command-mode cursor stays on the last char.
+LSTEP:
+        CALL    GBPKRT          ; (never lands on the line break)
+        CALL    ISEOL           ; return if A is a line end (EOF/LF/CR)
+        RZ
+        CALL    PKRT2           ; advance only if the NEXT byte is content too
+        CALL    ISEOL           ; return if A is a line end (EOF/LF/CR)
+        RZ
+        JMP     GBMVRT
+VC_0:   CALL    GBMLNS
+        JMP     GCLR
+VC_EOL:                         ; $ -> land ON the last char, not past it
+        CALL    GBMLNE          ; cursor on the line break (or EOB)
+        CALL    GBPKLT
+        CPI     0FFH
+        JZ      VC_EOLD         ; empty buffer / BOB
+        CPI     LF
+        JZ      VC_EOLD         ; empty line
+        CALL    GBMVLT          ; step back onto the last content char
+VC_EOLD:
+        ; vi '$' is sticky: set the goal column past the end of any line (0FFH)
+        ; so j/k ride each line's end (VADVG clamps to the last char).  SETGOAL
+        ; keeps the max, so it survives j/k; any horizontal/word motion calls
+        ; GCLR, which resets the goal to the real column and ends the stickiness.
+        MVI     A,0FFH
+        STA     GOALCOL
+        RET
+
+; MVRTIL - move right one char if the cursor is on content (lands on the break
+; at EOL).  Used by 'a' (append after the current char).
+MVRTIL:
+        CALL    PKEOL           ; peek right; return if at line end
+        RZ
+        JMP     GBMVRT
+
+;------------------------------------------------------------
+; Vertical motions (sticky goal column).
+;------------------------------------------------------------
+VC_J:   CALL    SETGOAL
+        CALL    CNTGET
+        LXI     H,GBMVDN
+        CALL    REPN
+        JMP     VADVG
+VC_K:   CALL    SETGOAL
+        CALL    CNTGET
+        LXI     H,GBMVUP
+        CALL    REPN
+        JMP     VADVG
+
+; Page moves: let VADJ raise DIRTY only if the viewport actually scrolled, so a
+; page at the top/bottom edge (no move) does not repaint the whole screen.
+;
+; ^F / ^B are vim full-page scrolls (the half-page ^D/^U below are different):
+;   ^F: scroll the window FORWARD by NEDIT-2 (two lines of overlap) and put the
+;       cursor on the TOP row of the new view.  No-op if the last line is already
+;       visible (nothing below the bottom row to scroll into).
+;   ^B: scroll the window BACK by NEDIT-2 and put the cursor on the BOTTOM row.
+;       No-op if the first file line is already at the top.
+; The window top moves a fixed amount regardless of where the cursor sat.  All
+; positioning is by absolute line through GBGOTOL; TOPLN is then derived from the
+; cursor's RESULTING line.  VADJ leaves TOPLN alone afterwards because the cursor
+; is already on screen.
+VC_PGDN:
+        ; save the cursor (line+col) so we can undo the probe if we can't scroll
+        CALL    CURLN
+        SHLD    PGSVLN
+        CALL    CURCOL
+        MOV     A,L
+        STA     PGSVCO
+        CALL    ABSTOP          ; HL = abs top line
+        SHLD    PGTOP
+        ; probe one line past the bottom row (abs top + NEDIT)
+        LDA     NEDIT
+        MOV     E,A
+        MVI     D,0
+        DAD     D               ; HL = abs top + NEDIT
+        SHLD    PGREQ
+        CALL    GBGOTOL
+        CALL    CURLN           ; HL = line actually reached
+        XCHG
+        LHLD    PGREQ
+        MOV     A,L
+        CMP     E
+        JNZ     VPD_NOSC        ; clamped short -> last line visible -> no scroll
+        MOV     A,H
+        CMP     D
+        JNZ     VPD_NOSC
+        ; scroll: new top = abs top + (NEDIT-2); cursor lands there, at row 0
+        LHLD    PGTOP
+        LDA     NEDIT
+        SUI     2
+        MOV     E,A
+        MVI     D,0
+        DAD     D
+        CALL    GBGOTOL
+        ; TOPLN = winline (cursor at the top row)
+        CALL    CURWLN
+        MVI     A,BD_TOPLN
+        CALL    GBSTHW
+        CALL    GCLR
+        ; scroll the terminal from old top (PGTOP) to new top (NEDIT-2 lines of
+        ; overlap stay on screen); VADJ then sees the cursor already on the new
+        ; view (delta 0) and leaves SCRL1 alone.
+        JMP     PGSDLT          ; SCRDELTA from PGTOP (tail)
+VPD_NOSC:
+        CALL    PGREST          ; undo the probe move; leave the screen alone
+        JMP     GCLR
+VC_PGUP:
+        ; if abs top is 0 we are at the first file line -> no-op
+        CALL    ABSTOP          ; HL = abs top line
+        MOV     A,H
+        ORA     L
+        JZ      VPU_NOSC
+        SHLD    PGTOP           ; remember old top for the scroll delta
+        ; new top abs = max(0, abs top - (NEDIT-2))
+        LDA     NEDIT
+        SUI     2
+        MOV     C,A
+        MOV     A,L
+        SUB     C
+        MOV     L,A
+        MOV     A,H
+        SBI     0               ; H = H - borrow (16-bit subtract of C from HL)
+        MOV     H,A
+        JNC     VPU_OK
+        LXI     H,0
+VPU_OK:
+        ; cursor target = new top abs + (NEDIT-1)  (bottom row); clamps at EOF
+        LDA     NEDITM
+        MOV     E,A
+        MVI     D,0
+        DAD     D
+        CALL    GBGOTOL
+        ; TOPLN = winline - (NEDIT-1), clamped >= 0
+        CALL    CURWLN          ; HL = winline
+        LDA     NEDITM
+        MOV     C,A
+        MOV     A,L
+        SUB     C
+        MOV     L,A
+        MOV     A,H
+        SBI     0               ; H = H - borrow (16-bit subtract of C from HL)
+        MOV     H,A
+        JNC     VPU_T
+        LXI     H,0
+VPU_T:
+        MVI     A,BD_TOPLN
+        CALL    GBSTHW
+        CALL    GCLR
+        ; scroll up from old top (PGTOP) to the new top instead of repainting
+        JMP     PGSDLT          ; SCRDELTA from PGTOP (tail)
+VPU_NOSC:
+        JMP     GCLR            ; cursor never moved; nothing to restore
+;------------------------------------------------------------
+; PGREST - restore the cursor to (PGSVLN, PGSVCO) after a ^F probe that did not
+; scroll.  Line-based.
+;------------------------------------------------------------
+; ABSTOP -> HL = absolute top-of-window line.  RAM-only: nothing is spilled, so
+; the window top IS the absolute top line (BD_TOPLN).
+ABSTOP:
+        MVI     A,BD_TOPLN
+        JMP     GBLDHW
+PGREST:
+        LHLD    PGSVLN
+        CALL    GBGOTOL
+        LDA     PGSVCO
+        ORA     A
+        RZ
+        MOV     B,A
+PGR_LP:
+        CALL    GBMVRT
+        DCR     B
+        JNZ     PGR_LP
+        RET
+; ^D / ^U - vim half-page scroll.  Unlike a plain cursor move, the WINDOW
+; always scrolls by NEDIT/2 lines (clamped at the file ends), carrying the
+; cursor with it so it keeps its screen row.  Near a file end the window scrolls
+; as far as it can while the cursor still moves the full half page (so it ends
+; nearer that end) -- matching vim.  TOPLN is set explicitly, then SCRDELTA
+; turns the old->new top move into a terminal scroll (the cursor is already on
+; the new view, so the main-loop VADJ sees delta 0 and leaves SCRL1 alone).
+VC_HFDN:
+        CALL    ABSTOP          ; HL = old top
+        SHLD    PGTOP
+        LDA     NEDIT
+        ORA     A
+        RAR                     ; A = NEDIT/2
+        STA     HFN
+        MOV     B,A
+        CALL    GBPGDN          ; cursor down a half page (clamped at last line)
+        ; maxtop = max(0, total lines - NEDIT)
+        CALL    GBNLNS          ; HL = total line count
+        LDA     NEDIT
+        MOV     E,A
+        MVI     D,0
+        MOV     A,L
+        SUB     E
+        MOV     E,A
+        MOV     A,H
+        SBI     0
+        MOV     D,A             ; DE = lines - NEDIT
+        JNC     HFD_MX
+        LXI     D,0             ; fewer lines than a screen -> maxtop 0
+HFD_MX:
+        ; candidate new top = old top + NEDIT/2
+        LHLD    PGTOP
+        LDA     HFN
+        MOV     C,A
+        MVI     B,0
+        DAD     B               ; HL = old top + NEDIT/2
+        ; new top = min(candidate, maxtop)
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H               ; maxtop - candidate; CY if maxtop < candidate
+        JNC     HFD_SET
+        XCHG                    ; clamp: HL = maxtop
+HFD_SET:
+        MVI     A,BD_TOPLN
+        CALL    GBSTHW          ; BD_TOPLN = new top
+        JMP     PGSDLT          ; SCRDELTA from PGTOP (tail)
+VC_HFUP:
+        CALL    ABSTOP          ; HL = old top
+        SHLD    PGTOP
+        LDA     NEDIT
+        ORA     A
+        RAR                     ; A = NEDIT/2
+        STA     HFN
+        MOV     B,A
+        CALL    GBPGUP          ; cursor up a half page (clamped at the top)
+        ; new top = max(0, old top - NEDIT/2)
+        LHLD    PGTOP
+        LDA     HFN
+        MOV     C,A
+        MOV     A,L
+        SUB     C
+        MOV     L,A
+        MOV     A,H
+        SBI     0
+        MOV     H,A             ; HL = old top - NEDIT/2
+        JNC     HFU_SET
+        LXI     H,0             ; clamp to the first line
+HFU_SET:
+        MVI     A,BD_TOPLN
+        CALL    GBSTHW          ; BD_TOPLN = new top
+        JMP     PGSDLT          ; SCRDELTA from PGTOP (tail)
+
+VC_REDR:
+        JMP     SETDRTY
+
+;------------------------------------------------------------
+; w - move to the start of the next word.  Word = a run of non-blank bytes;
+; blanks (space/tab/CR/LF) separate.  Crosses line breaks (GBMVRT is atomic).
+;------------------------------------------------------------
+; --- word motions.  WBIG selects the boundary rule:
+;   WBIG=0 (w/b/e): a word is a run of [A-Za-z0-9_]; punctuation is its own
+;                   word; whitespace separates.  (CLS returns 0/1/2.)
+;   WBIG=1 (W/B/E): a WORD is any run of non-whitespace.  (CLS returns 0/1.)
+VC_W:   XRA     A
+        STA     WBIG
+        JMP     WMOT
+VCBIGW:MVI     A,1
+        STA     WBIG
+WMOT:   CALL    CNTGET
+        LXI     H,WSTEP
+        CALL    REPN
+        JMP     GCLR
+; WSTEP - to the start of the next word.
+WSTEP:
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        RZ
+        CALL    CLS
+        ORA     A
+        JZ      WS_BL           ; on blank -> just skip blanks
+        STA     WCLS            ; skip the current run of this class
+WS_R:
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        RZ
+        CALL    CLS
+        MOV     B,A
+        LDA     WCLS
+        CMP     B
+        JNZ     WS_BL           ; class changed -> next word (or blanks) ahead
+        CALL    GBMVRT
+        JMP     WS_R
+WS_BL:
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        RZ
+        CALL    CLS
+        ORA     A
+        RNZ                     ; non-blank -> at the next word start
+        CALL    GBMVRT
+        JMP     WS_BL
+
+;------------------------------------------------------------
+; b / B - back to the start of the current/previous word.
+;------------------------------------------------------------
+VC_B:   XRA     A
+        STA     WBIG
+        JMP     BMOT
+VCBIGB:MVI     A,1
+        STA     WBIG
+BMOT:   CALL    CNTGET
+        LXI     H,BSTEP
+        CALL    REPN
+        JMP     GCLR
+BSTEP:
+        CALL    GBPKLT
+        CPI     0FFH
+        RZ                      ; at start of buffer
+        CALL    GBMVLT          ; step left at least one
+BB_SB:                          ; skip blanks moving left
+        CALL    GBPKRT
+        CALL    CLS
+        ORA     A
+        JNZ     BB_WORD         ; on a non-blank
+        CALL    GBPKLT
+        CPI     0FFH
+        RZ
+        CALL    GBMVLT
+        JMP     BB_SB
+BB_WORD:                        ; back up while the prev char is the same class
+        STA     WCLS
+BB_R:
+        CALL    GBPKLT
+        CPI     0FFH
+        RZ
+        CALL    CLS
+        MOV     B,A
+        LDA     WCLS
+        CMP     B
+        RNZ                     ; prev is a different class -> at word start
+        CALL    GBMVLT
+        JMP     BB_R
+
+;------------------------------------------------------------
+; e / E - forward to the end of the current/next word.
+;------------------------------------------------------------
+VC_E:   XRA     A
+        STA     WBIG
+        JMP     EMOT
+VCBIGE:MVI     A,1
+        STA     WBIG
+EMOT:   CALL    CNTGET
+        LXI     H,ESTEP
+        CALL    REPN
+        JMP     GCLR
+ESTEP:
+        CALL    GBMVRT          ; step right at least one
+VE_SKB:                         ; skip blanks moving right
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        RZ
+        CALL    CLS
+        ORA     A
+        JNZ     VE_WORD
+        CALL    GBMVRT
+        JMP     VE_SKB
+VE_WORD:                        ; advance while the NEXT char is the same class
+        STA     WCLS
+VE_R:
+        CALL    PKRT2
+        CPI     0FFH
+        RZ
+        CALL    CLS
+        MOV     B,A
+        LDA     WCLS
+        CMP     B
+        RNZ                     ; next is a different class -> on the word end
+        CALL    GBMVRT
+        JMP     VE_R
+
+;------------------------------------------------------------
+; CLS - classify char A: 0 = blank (space/tab/CR/LF); else, when WBIG, 1 for
+; any non-blank; otherwise 1 = word char [A-Za-z0-9_], 2 = punctuation.
+; Preserves B,C,D,E,H,L.
+;------------------------------------------------------------
+CLS:
+        CPI     ' '
+        JZ      CLS_BL
+        CPI     TAB
+        JZ      CLS_BL
+        CPI     CR
+        JZ      CLS_BL
+        CPI     LF
+        JZ      CLS_BL
+        MOV     B,A             ; save char (LDA/ORA below would clobber A+flags)
+        LDA     WBIG
+        ORA     A
+        MOV     A,B             ; restore char (MOV does not affect flags)
+        JNZ     CLS_W           ; WORD mode: any non-blank = class 1
+        CPI     '0'
+        JC      CLS_P
+        CPI     '9'+1
+        JC      CLS_W
+        CPI     'A'
+        JC      CLS_P
+        CPI     'Z'+1
+        JC      CLS_W
+        CPI     '_'
+        JZ      CLS_W
+        CPI     'a'
+        JC      CLS_P
+        CPI     'z'+1
+        JC      CLS_W
+CLS_P:  MVI     A,2
+        RET
+CLS_W:  MVI     A,1
+        RET
+CLS_BL: XRA     A
+        RET
+
+;------------------------------------------------------------
+; HSTEP - move left one, but never off the start of the line (for `h`).
+;------------------------------------------------------------
+HSTEP:
+        CALL    GBPKLT
+        CPI     0FFH
+        RZ                      ; start of buffer
+        CPI     LF
+        RZ                      ; at start of line (prev char is the line break)
+        JMP     GBMVLT
+
+;------------------------------------------------------------
+; ~ - toggle the case of the char under the cursor, then advance.
+;------------------------------------------------------------
+VC_TILDE:
+        CALL    PKEOL           ; peek right; return if at line end
+        RZ
+        ; toggle alpha case
+        MOV     B,A
+        CPI     'a'
+        JC      VT_UP           ; < 'a'
+        CPI     'z'+1
+        JC      VT_TOL          ; 'a'..'z' -> upper
+VT_UP:
+        MOV     A,B
+        CPI     'A'
+        JC      VT_KEEP
+        CPI     'Z'+1
+        JNC     VT_KEEP
+        ADI     20H             ; 'A'..'Z' -> lower
+        JMP     VT_GO
+VT_TOL:
+        MOV     A,B
+        SUI     20H
+        JMP     VT_GO
+VT_KEEP:
+        MOV     A,B             ; non-alpha: unchanged
+VT_GO:
+        PUSH    PSW             ; save the toggled char
+        CALL    UBEGD           ; record as a change (delete old + insert new)
+        CALL    UDEL1           ; delete + record the original char
+        POP     PSW
+        CALL    UINS1           ; insert the toggled char (cursor advances past it)
+        JMP     SETLINE
+
+;------------------------------------------------------------
+; J - join the next line onto the current one (break -> single space).
+;   * On the LAST line (no line below at all) J does nothing -- even when the
+;     line carries a trailing CR,LF (that terminator is NOT a "next line").
+;   * When the line below is EMPTY (just CR,LF) J deletes that blank line; it
+;     does not append a joining space.
+; Detection: cross this line's break (GBMVRT is CR,LF-atomic) to the next line
+; and inspect its first byte -- EOB => last line; CR/LF => empty next line;
+; otherwise a real next line to join.
+;------------------------------------------------------------
+VC_JOIN:
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    VJSAV           ; original cursor (restore on a rejected join)
+        CALL    GBMLNE          ; cursor before this line's break
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        RZ                      ; no break -> last line, no terminator -> no-op
+        CALL    CURCOL          ; HL = current line length (cursor at its end)
+        SHLD    VJCUR
+        CALL    GBMVRT          ; cross the break -> start of next line (or EOB)
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      VJ_LAST         ; crossed the final terminator -> last line -> no-op
+        CPI     CR
+        JZ      VJ_DELE         ; next line empty (CR,LF) -> delete it (no space)
+        CPI     LF
+        JZ      VJ_DELE         ; next line empty (bare LF)
+        ; a real next line: reject if the joined line would exceed MAXCOLS.
+        ; joined length = current + next + 1 (the joining space).
+        CALL    CWSCAN          ; HL = next line content length (cursor at its start)
+        XCHG                    ; DE = next length
+        LHLD    VJCUR
+        DAD     D
+        INX     H               ; HL = current + next + 1
+        LXI     D,0-(MAXCOLS+1)
+        DAD     D               ; CY set iff joined >= MAXCOLS+1 (too long)
+        JNC     VJ_OK           ; joined <= MAXCOLS -> proceed
+        ; too long: restore the cursor, ring the bell, show a message
+        LHLD    VJSAV
+        CALL    GOTOPOS
+        MVI     A,BEL
+        CALL    OUTCHR
+        LXI     D,VJLONGM
+        JMP     STATMSG
+VJ_OK:
+        ; cross back and join in place with a space.
+        CALL    GBMVLT          ; back to before this line's break (the join point)
+        CALL    UBEGD           ; record: delete the break, insert a space
+        CALL    GBPKRT
+        CPI     CR
+        JZ      VJ_CR
+        JMP     VJ_LF
+VJ_LAST:
+        CALL    GBMVLT          ; restore cursor to the end of the line
+        RET
+VJ_DELE:                        ; cursor on the empty next line's break: delete it
+        CALL    UBEGD           ; record the deleted blank line (no space inserted)
+        CALL    GBPKRT
+        CPI     CR
+        JZ      VJDE_CR
+        CALL    UDEL1           ; bare LF
+        JMP     VJDE_DN
+VJDE_CR:
+        CALL    UDEL1           ; remove CR
+        CALL    GBPKRT
+        CPI     LF
+        JNZ     VJDE_DN
+        CALL    UDEL1           ; remove LF
+VJDE_DN:
+        CALL    GBMVLT          ; cross this line's break back -> end of line content
+        ; land ON the last character (not past it), unless the line is empty
+        CALL    GBPKLT
+        CPI     0FFH
+        JZ      VJ_RDRAW        ; buffer start -> line empty, leave cursor
+        CPI     LF
+        JZ      VJ_RDRAW        ; previous byte is a break -> line empty
+        CPI     CR
+        JZ      VJ_RDRAW
+        CALL    GBMVLT          ; step onto the last content char
+        JMP     VJ_RDRAW
+VJ_CR:
+        CALL    UDEL1           ; remove CR
+        CALL    GBPKRT
+        CPI     LF
+        JNZ     VJ_SP
+        CALL    UDEL1           ; remove LF
+        JMP     VJ_SP
+VJ_LF:
+        CALL    UDEL1
+VJ_SP:
+        MVI     A,' '
+        CALL    UINS1           ; insert the joining space (counts onto the record)
+        CALL    GBMVLT          ; leave cursor on the joining space
+VJ_RDRAW:
+        ; Redraw: if the cursor is on the bottom edit row, the line below was
+        ; off-screen, so only the (now changed) cursor line needs redraw.
+        ; Otherwise the line below disappears: LNOP=3 deletes its screen row and
+        ; pulls a fresh line into the bottom row.
+        MVI     A,BD_CSROW
+        CALL    BDFLD
+        MOV     A,M
+        MOV     B,A
+        LDA     NEDITM
+        CMP     B
+        JZ      SETLINE         ; CSROW == NEDITM (bottom row) -> line redraw
+        MVI     A,3
+        STA     LNOP
+        RET
+
+;------------------------------------------------------------
+; r{c} - replace the char under the cursor with the next key.
+;------------------------------------------------------------
+VC_RCH:
+        CALL    BCONIN          ; read the replacement char
+        PUSH    PSW
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      VRC_X
+        CPI     LF
+        JZ      VRC_X
+        CPI     CR
+        JZ      VRC_X
+        CALL    UBEGD           ; record as a change (delete old + insert new)
+        CALL    UDEL1           ; delete + record the old char
+        POP     PSW
+        CALL    UINS1           ; insert the replacement (counts onto the record)
+        CALL    GBMVLT          ; vi leaves the cursor on the replaced char
+        JMP     SETLINE
+VRC_X:
+        POP     PSW
+        RET
+
+;------------------------------------------------------------
+; ^G - file status on the status row, vi-style:
+;   "NAME.EXT" [readonly] line N of M col C
+; (No file-percent indicator.)  N/C are 1-based; M is the total line count
+; (always known now that editing is RAM-only).
+;------------------------------------------------------------
+VC_CTRLG:
+        CALL    STATHOME        ; clear status row, home cursor to it
+        MVI     A,'"'
+        CALL    OUTCHR
+        CALL    PRFNAM
+        MVI     A,'"'
+        CALL    OUTCHR
+        LDA     RDONLY
+        ORA     A
+        JZ      GCG_LN
+        LXI     D,GROMSG        ; " [readonly]"
+        CALL    OUTSTR
+GCG_LN:
+        LXI     D,GMSG          ; " line "
+        CALL    OUTSTR
+        CALL    CURLN           ; HL = 0-based line
+        INX     H               ; 1-based
+        CALL    OUTN16
+        CALL    GBNLNS          ; HL = total lines; CY set if unknown
+        JC      GCG_COL         ; unknown -> skip " of M"
+        PUSH    H
+        LXI     D,GOFMSG        ; " of "
+        CALL    OUTSTR
+        POP     H
+        CALL    OUTN16
+GCG_COL:
+        LXI     D,GCOLMSG       ; " col "
+        CALL    OUTSTR
+        CALL    CURCOL          ; HL = 0-based column
+        INX     H               ; 1-based
+        CALL    OUTN16
+        LXI     D,GSIZMSG       ; ", "
+        CALL    OUTSTR
+        MVI     A,BD_TXEND
+        CALL    GBLDHW          ; HL = logical text length (= file size in bytes)
+        CALL    OUTN16
+        MVI     A,'B'
+        CALL    OUTCHR
+        RET                     ; no redraw -> status persists
+
+;------------------------------------------------------------
+; R - enter replace (overwrite) mode.
+;------------------------------------------------------------
+VC_R:
+        CALL    UBEGD           ; one unified record: old chars deleted +
+                                ; typed chars inserted, accumulated L-to-R
+        MVI     A,EM_RPL
+        STA     EDMODE
+        LXI     D,REPMSG
+        CALL    SHOWMOD
+        RET
+
+;------------------------------------------------------------
+; gg / G.  'g' latches; second 'g' = go to first line.  'G' = last line.
+;------------------------------------------------------------
+VC_G:
+        LDA     GPEND
+        ORA     A
+        JNZ     VC_GG_TOP
+        MVI     A,1
+        STA     GPEND
+        RET
+
+;------------------------------------------------------------
+; ZZ - write the file and quit (= :wq).  First Z latches; second Z acts.
+;------------------------------------------------------------
+VC_Z:
+        LDA     ZPEND
+        ORA     A
+        JNZ     VC_ZZ
+        MVI     A,1
+        STA     ZPEND
+        RET
+VC_ZZ:
+        XRA     A
+        STA     ZPEND
+        CALL    DOSAVE          ; honors RDONLY; sets SVERR
+        LDA     SVERR
+        ORA     A
+        JZ      VIQUIT           ; saved OK -> quit to CP/M
+        RET                     ; save failed (read-only): stay; message shown
+VC_GG_TOP:
+        XRA     A
+        STA     GPEND
+        LXI     H,0
+        SHLD    CMDCNT          ; gg ignores any typed count
+        CALL    GBGOTOL
+        JMP     FNBLNK          ; vi: first non-blank; VADJ redraws only on scroll
+VC_GG:                          ; 'G' -> line RCNT (1-based), or last line if none
+        LHLD    RCNT
+        MOV     A,H
+        ORA     L
+        JZ      VGG_LAST
+        DCX     H               ; 1-based -> 0-based target
+        CALL    GBGOTOL
+        JMP     FNBLNK          ; vi: first non-blank; VADJ redraws only on scroll
+VGG_LAST:
+        LXI     H,0FFFFH        ; no count -> last line (huge target clamps)
+        CALL    GBGOTOL
+        JMP     FNBLNK          ; vi: first non-blank; VADJ redraws only on scroll
+
+;------------------------------------------------------------
+; FNBLNK - advance the cursor to the first non-blank on the current line.
+; Cursor must be at the line start (column 0).  Skips spaces/tabs only; stops
+; at the first non-blank, or at the line break (all-blank line -> no move past
+; the break).  CR and LF classify as blank in CLS, so the loop must test them
+; explicitly to avoid stepping over the line terminator.
+;------------------------------------------------------------
+FNBLNK:
+        CALL    GBPKRT          ; A = char at cursor
+        CPI     CR
+        RZ
+        CPI     LF
+        RZ
+        CPI     ' '
+        JZ      FNB_ADV
+        CPI     TAB
+        RNZ                     ; non-blank (incl 0FFh EOB) -> stop here
+FNB_ADV:
+        CALL    GBMVRT
+        JMP     FNBLNK
+
+;------------------------------------------------------------
+; ^ - first non-blank char of the current line.
+;------------------------------------------------------------
+VC_CARET:
+        CALL    GBMLNS
+        CALL    FNBLNK
+        JMP     GCLR
+
+;------------------------------------------------------------
+; H / M / L - move to the top / middle / bottom visible line (then first
+; non-blank).  H/L take a count (lines from the top/bottom edge).  The window
+; spans absolute lines [top .. bot], bot = min(top+NEDIT-1, last file line).
+;------------------------------------------------------------
+HMLSET:                         ; compute HMLTOP and HMLBOT (last visible line)
+        CALL    GBNLNS          ; HL = total lines (always known, RAM-only)
+        DCX     H               ; HL = last line index
+        SHLD    HMLLST          ; scratch: last line index
+        CALL    ABSTOP          ; HL = absolute top line
+        SHLD    HMLTOP
+        LDA     NEDIT
+        MOV     E,A
+        MVI     D,0
+        DAD     D               ; top + NEDIT
+        DCX     H               ; top + NEDIT - 1 = tentative bottom
+        XCHG                    ; DE = tentative bottom
+        LHLD    HMLLST          ; HL = last line index
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D               ; last - bottom : CY iff last < bottom
+        JC      HMLS_ST         ; last < bottom -> clamp to last (HL already = last)
+        XCHG                    ; last >= bottom -> bottom (DE) is valid -> HL = bottom
+HMLS_ST:
+        SHLD    HMLBOT
+        RET
+VC_HIGH:
+        CALL    HMLSET
+        CALL    CNTGET          ; B = count (>=1) lines down from the top
+        LHLD    HMLTOP
+HIGH_LP:
+        DCR     B
+        JZ      HML_GO
+        INX     H
+        JMP     HIGH_LP
+VC_MIDL:
+        CALL    HMLSET
+        LHLD    HMLTOP
+        XCHG
+        LHLD    HMLBOT
+        DAD     D               ; top + bot
+        ORA     A               ; clear carry for the >>1
+        MOV     A,H
+        RAR
+        MOV     H,A
+        MOV     A,L
+        RAR
+        MOV     L,A             ; HL = (top + bot) / 2
+        JMP     HML_GO
+VC_LOWL:
+        CALL    HMLSET
+        CALL    CNTGET          ; B = count (>=1) lines up from the bottom
+        LHLD    HMLBOT
+LOW_LP:
+        DCR     B
+        JZ      HML_GO          ; reached the target line
+        XCHG                    ; DE = current target
+        LHLD    HMLTOP          ; HL = top
+        MOV     A,E
+        SUB     L
+        MOV     C,A             ; low byte of (current - top)
+        MOV     A,D
+        SBB     H               ; high byte of (current - top)
+        ORA     C               ; Z iff current == top (16-bit zero test)
+        XCHG                    ; HL = current (DE = top); flags preserved
+        JZ      HML_GO          ; can't go above the top -> clamp here
+        DCX     H
+        JMP     LOW_LP
+HML_GO:
+        CALL    GBGOTOL         ; clamps to the last line if target overshoots
+        CALL    FNBLNK
+        JMP     GCLR
+
+;------------------------------------------------------------
+; x - delete char(s) at the cursor.
+;------------------------------------------------------------
+VC_X:
+        ; x deletes up to COUNT chars on the current line and yanks them
+        ; (charwise) into the unnamed register so a following `p` pastes them.
+        CALL    CNTGET          ; B = repeat count (>=1)
+        MOV     A,B
+        STA     XCNT
+        CALL    UBEGD
+        XRA     A
+        STA     YTYP            ; YT_CHAR
+        LXI     H,0
+        SHLD    YLEN
+        LHLD    YBUFP
+        SHLD    YWP
+VCX_LP:
+        LDA     XCNT
+        ORA     A
+        JZ      SETLINE
+        DCR     A
+        STA     XCNT
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      SETLINE
+        CPI     LF
+        JZ      SETLINE
+        CPI     CR
+        JZ      SETLINE         ; stop at the line break
+        PUSH    PSW
+        LHLD    YWP
+        POP     PSW
+        MOV     M,A
+        INX     H
+        SHLD    YWP
+        LHLD    YLEN
+        INX     H
+        SHLD    YLEN
+        CALL    UDEL1           ; record undo + delete
+        JMP     VCX_LP
+
+;------------------------------------------------------------
+; DDLINES - delete B lines (linewise) starting at the cursor's line.  Records
+; ONE unified undo record for all the lines and yanks the deleted block
+; (YT_LINE) so `p` restores them.  B >= 1; stops early at EOB.
+;------------------------------------------------------------
+DDLINES:
+        MOV     A,B
+        STA     DDLCNT
+        CALL    GBMLNS          ; to the start of the first line
+        CALL    UBEGD           ; one record for ALL the deleted lines
+DDL_LINE:
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      DDL_DONE        ; EOB -> fewer lines than requested
+        CPI     LF
+        JZ      DDL_LF
+        CALL    UDEL1           ; record + delete a content byte
+        JMP     DDL_LINE
+DDL_LF:
+        CALL    UDEL1           ; delete the terminating LF
+        LDA     DDLCNT
+        DCR     A
+        STA     DDLCNT
+        JNZ     DDL_LINE
+DDL_DONE:
+        JMP     UNDO2YANK       ; build the linewise yank from the undo buffer
+
+;------------------------------------------------------------
+; UNDO2YANK - copy the just-deleted bytes (UNDOBUF[0..UNDOLEN)) into YBUF as a
+; linewise yank, then YLINEFIX.
+;------------------------------------------------------------
+UNDO2YANK:
+        LHLD    UNDOLEN
+        SHLD    YLEN
+        MOV     B,H
+        MOV     C,L
+        LHLD    UNDOBP
+        PUSH    H
+        LHLD    YBUFP
+        XCHG
+        POP     H
+UY_LP:
+        MOV     A,B
+        ORA     C
+        JZ      YLINEFIX
+        MOV     A,M
+        STAX    D
+        INX     H
+        INX     D
+        DCX     B
+        JMP     UY_LP
+
+;------------------------------------------------------------
+; YLINEFIX - mark YBUF as YT_LINE and, if the yanked block does not end in LF
+; (a last-line delete/yank), append a synthetic CR,LF so `p` makes whole lines.
+;------------------------------------------------------------
+YLINEFIX:
+        MVI     A,1
+        STA     YTYP            ; YT_LINE
+        LHLD    YLEN
+        MOV     A,H
+        ORA     L
+        RZ                      ; nothing yanked
+        DCX     H
+        PUSH    H
+        LHLD    YBUFP
+        XCHG
+        POP     H
+        DAD     D               ; YBUF + YLEN - 1
+        MOV     A,M
+        CPI     LF
+        RZ                      ; already ends with LF
+        INX     H               ; YBUF + YLEN
+        MVI     M,CR
+        INX     H
+        MVI     M,LF
+        LHLD    YLEN
+        INX     H
+        INX     H
+        SHLD    YLEN
+        RET
+
+;------------------------------------------------------------
+; YANKLNS - yank B lines (linewise) into YBUF without deleting; cursor restored.
+; Reads the lines read-only from R2 (after seating the cursor at the line
+; start), so the buffer is never modified.  B >= 1.
+;------------------------------------------------------------
+YANKLNS:
+        MOV     A,B
+        STA     DDLCNT
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    YLNSAV          ; original cursor offset
+        CALL    GBMLNS          ; cursor to line start -> lines are all in R2
+        LHLD    YBUFP
+        SHLD    YWP
+        LXI     H,0
+        SHLD    YLEN
+        CALL    GBR2RG          ; HL = R2 head (line start), DE = R2 end
+        SHLD    YLNSCN
+        XCHG
+        SHLD    YLNEND
+YLNS_LP:
+        LHLD    YLNSCN
+        XCHG                    ; DE = scan ptr
+        LHLD    YLNEND
+        MOV     A,E
+        CMP     L
+        JNZ     YLNS_GO
+        MOV     A,D
+        CMP     H
+        JZ      YLNS_DN         ; scan == R2 end -> stop
+YLNS_GO:
+        LDAX    D
+        MOV     C,A             ; C = byte
+        LHLD    YLEN            ; append if YLEN < UBMAX
+        LXI     D,UBMAX
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JNC     YLNS_NOAP
+        LHLD    YWP
+        MOV     M,C
+        INX     H
+        SHLD    YWP
+        LHLD    YLEN
+        INX     H
+        SHLD    YLEN
+YLNS_NOAP:
+        LHLD    YLNSCN
+        INX     H
+        SHLD    YLNSCN
+        MOV     A,C
+        CPI     LF
+        JNZ     YLNS_LP
+        LDA     DDLCNT
+        DCR     A
+        STA     DDLCNT
+        JNZ     YLNS_LP
+YLNS_DN:
+        CALL    YLINEFIX
+        LHLD    YLNSAV
+        CALL    GOTOPOS         ; restore the cursor (yy leaves it unchanged)
+        RET
+
+;------------------------------------------------------------
+; DDLAST - A=1 if the cursor's line is the LAST line of the file (no LF after
+; it), else A=0.  Non-destructive: restores the cursor.
+;------------------------------------------------------------
+DDLAST:
+        CALL    GBCSOF          ; HL = cursor byte offset
+        PUSH    H               ; save cursor offset
+        CALL    GBMLNE          ; to just before this line's break
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        MVI     A,0
+        JNZ     DDL_NO
+        MVI     A,1
+DDL_NO:
+        POP     H               ; HL = saved offset
+        PUSH    PSW             ; save the result across the restore
+        CALL    GOTOPOS
+        POP     PSW
+        RET
+
+;------------------------------------------------------------
+; D - delete (and yank, characterwise) from the cursor to end of line.
+;------------------------------------------------------------
+VCBIGD:
+        CALL    DELEOL
+        JMP     SETLINE
+
+; DELEOL - delete (charwise-yank) from the cursor to the end of line.
+DELEOL:
+        CALL    UBEGD
+        XRA     A
+        STA     YTYP            ; YT_CHAR
+        LXI     H,0
+        SHLD    YLEN
+        LHLD    YBUFP
+        SHLD    YWP
+VBD_LP:
+        CALL    PKEOL           ; peek right; return if at line end
+        RZ
+        ; append to yank buffer
+        PUSH    PSW
+        LHLD    YWP
+        POP     PSW
+        MOV     M,A
+        INX     H
+        SHLD    YWP
+        LHLD    YLEN
+        INX     H
+        SHLD    YLEN
+        CALL    UDEL1           ; record undo + delete
+        JMP     VBD_LP
+
+;------------------------------------------------------------
+; C / cc(S) / s - the change family (delete, then enter insert mode).
+;   C : change to end of line   (= D + insert)
+;   S / cc : change whole line   (clear content, keep the line)
+;   s : substitute one char
+;------------------------------------------------------------
+VCBIGC:
+        CALL    DELEOL          ; records the deleted text (UBEGD/UDEL1)
+        CALL    SETLINE         ; insert mode counts insertions onto the record
+        JMP     ENTINS
+VCBIGS:                        ; S and cc
+        CALL    GBMLNS
+        CALL    DELEOL          ; records the deleted line content
+        CALL    SETLINE
+        JMP     ENTINS
+VC_S:
+        CALL    UBEGD           ; record the substituted char as a change
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      VS_INS
+        CPI     LF
+        JZ      VS_INS
+        CPI     CR
+        JZ      VS_INS
+        CALL    UDEL1           ; delete + record the char under the cursor
+VS_INS:
+        CALL    SETLINE
+        JMP     ENTINS
+        END

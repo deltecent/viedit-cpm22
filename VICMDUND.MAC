@@ -1,0 +1,774 @@
+;============================================================
+; FILE:    VICMDUND.MAC
+; PROJECT: VIEDIT (viedit/)
+; MODULE:  single-level undo (u) + repeat (.) + line shift (>> <<) + marks
+;------------------------------------------------------------
+; Split out of VICMD.MAC -- see DESIGN.md / build_vi.py link order.
+;============================================================
+        INCLUDE VI.INC
+        PUBLIC  CNTGET, GCLR, MKDEL, MKGET, MKIDXA, MKINS
+        PUBLIC  OPLSHL, OPLSHR, REPN, SETDRTY, SETGOAL, SETLINE
+        PUBLIC  UBEGD, UBEGI, UBS1, UDEL1, UINS1, URECPUT
+        PUBLIC  URESET, VADVG, VC_BTICK, VC_DOT, VC_MARK, VC_QUOTE
+        PUBLIC  VC_U
+        EXTRN   BCONIN, CHGD, CURDCO, CURLN, DIRTY, DRTLINE
+        EXTRN   EDMODE, EMKUNS, ENOUNDO, FNBLNK, GBADVN, GBCSOF
+        EXTRN   GBDELRT, GBDLFT, GBGOTOL, GBINSRT, GBLDHW, GBMLNS
+        EXTRN   GBNLNS, GBPKRT, GBR2RG, GETKEY, GOALCOL, GOTOPOS
+        EXTRN   MARKS, MKANY, MKDLT, MKSHT, MV1RT, PKRTF
+        EXTRN   RCNT, REDSAV, REPGO, REPMORE, SHCUR, SHHI
+        EXTRN   SHLO, SHN, SHRBEG, SHRLEN, SHTMP, SHUNDOK
+        EXTRN   STATMSG, UB, UINSCNT, UNDOBP, UNDOLEN, UNDOPOS
+        EXTRN   UNDOTYP, UWP, VADVCO, VADVN, VICMD, VIINS
+        EXTRN   VIRPL, YLEN
+        CSEG
+;============================================================
+; Single-level undo.  Records the last change so `u` can reverse it.
+;   UT_DEL : text was deleted   -> undo reinserts UNDOBUF[0..UNDOLEN) at UNDOPOS
+;   UT_INS : text was inserted  -> undo deletes UINSCNT bytes at UNDOPOS
+; Commands that don't (yet) record set UNDOTYP=UT_NONE (URESET) so `u` is a
+; safe no-op rather than replaying a stale record.  (Change/replace/r/~/J are
+; not yet undoable; multi-line ndd records only the last line.)
+;============================================================
+; UT_NONE / UT_INS / UT_DEL and UBMAX moved to VI.INC (shared constants).
+
+; Unified single-level undo: a record carries BOTH a deleted-text buffer
+; (UNDOBUF[0..UNDOLEN)) and an inserted-byte count (UINSCNT) at UNDOPOS, so it
+; reverses a pure delete, a pure insert, AND a change/replace (delete+insert):
+;   go to UNDOPOS; delete UINSCNT inserted bytes; reinsert the deleted bytes.
+VC_U:
+        LDA     UNDOTYP
+        ORA     A
+        JNZ     U_DO
+        LXI     D,ENOUNDO       ; nothing to undo
+        JMP     STATMSG
+U_DO:
+        CALL    GBNLNS          ; total lines before the undo (redraw choice)
+        SHLD    REDSAV
+        LHLD    UNDOPOS
+        CALL    GOTOPOS
+        ; 1) remove the inserted text (UINSCNT bytes forward from UNDOPOS)
+        LHLD    UINSCNT
+U_DLP:
+        MOV     A,H
+        ORA     L
+        JZ      U_REINS
+        DCX     H
+        PUSH    H
+        CALL    GBDELRT
+        POP     H
+        JMP     U_DLP
+U_REINS:
+        ; 2) reinsert the deleted text (UNDOBUF[0..UNDOLEN))
+        LHLD    UNDOLEN
+        MOV     B,H
+        MOV     C,L
+        LHLD    UNDOBP
+U_ILP:
+        MOV     A,B
+        ORA     C
+        JZ      U_FIN
+        MOV     A,M
+        PUSH    B
+        PUSH    H
+        CALL    GBINSRT
+        POP     H
+        POP     B
+        INX     H
+        DCX     B
+        JMP     U_ILP
+U_FIN:
+        LHLD    UNDOPOS
+        CALL    GOTOPOS         ; leave cursor at the restored position
+        MVI     A,UT_NONE
+        STA     UNDOTYP         ; single level: consume the record
+        JMP     REDLN           ; one-line undo -> DRTLINE; else full redraw
+
+; URESET - mark "no undo available".
+URESET:
+        MVI     A,UT_NONE
+        STA     UNDOTYP
+        RET
+
+; UBEGD - begin recording a delete at the cursor.
+UBEGD:
+        MVI     A,UT_DEL
+        STA     UNDOTYP
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    UNDOPOS
+        LXI     H,0
+        SHLD    UNDOLEN
+        SHLD    UINSCNT         ; unified record: no insertions (yet)
+        LHLD    UNDOBP
+        SHLD    UWP
+        RET
+
+; UDEL1 - record the byte at the cursor (if room) then delete it.
+UDEL1:
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        RZ
+        STA     UB              ; save the byte
+        MVI     A,1
+        STA     CHGD            ; this command modified the buffer (for `.`)
+        LHLD    UNDOLEN
+        LXI     D,UBMAX
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        JNC     UD_OVF          ; UNDOLEN >= UBMAX -> cannot record this byte
+        LHLD    UWP
+        LDA     UB
+        MOV     M,A
+        INX     H
+        SHLD    UWP
+        LHLD    UNDOLEN
+        INX     H
+        SHLD    UNDOLEN
+        JMP     GBDELRT
+UD_OVF:
+        MVI     A,UT_NONE       ; record overflowed -> disable undo (safe no-op)
+        STA     UNDOTYP
+        JMP     GBDELRT
+
+; UBEGI - begin recording a pure insert at the cursor.
+UBEGI:
+        MVI     A,UT_INS
+        STA     UNDOTYP
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    UNDOPOS
+        LXI     H,0
+        SHLD    UINSCNT
+        SHLD    UNDOLEN         ; unified record: no deleted text
+        LHLD    UNDOBP
+        SHLD    UWP
+        RET
+
+; UINS1 - insert byte A, counting it toward the undo record.
+UINS1:
+        PUSH    PSW
+        CALL    GBINSRT
+        ORA     A
+        JNZ     UI_X            ; gap full: not inserted
+        LHLD    UINSCNT
+        INX     H
+        SHLD    UINSCNT
+        MVI     A,1
+        STA     CHGD            ; modified the buffer (for `.`)
+UI_X:
+        POP     PSW
+        RET
+
+; UBS1 - backspace in insert mode: delete left, uncount.
+UBS1:
+        CALL    GBDLFT
+        LHLD    UINSCNT
+        MOV     A,H
+        ORA     L
+        RZ
+        DCX     H
+        SHLD    UINSCNT
+        RET
+
+; URECPUT - record a put (YLEN bytes inserted at the current cursor).
+URECPUT:
+        MVI     A,1
+        STA     CHGD            ; put modifies the buffer (for `.`)
+        MVI     A,UT_INS
+        STA     UNDOTYP
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    UNDOPOS
+        LXI     H,0
+        SHLD    UNDOLEN         ; unified record: nothing deleted by a put
+        LHLD    YLEN
+        SHLD    UINSCNT
+        RET
+
+;============================================================
+; . - repeat the last change by replaying its recorded keystrokes through the
+; normal dispatch.  BCONIN feeds bytes from RPLYBUF while REPACT is set.
+;============================================================
+VC_DOT:
+        CALL    GBNLNS          ; total lines before the repeat (redraw choice)
+        SHLD    REDSAV
+        CALL    REPGO           ; REPACT = 1, RPLYPOS = 0
+DOT_LP:
+        CALL    REPMORE         ; A = 1 while replay has bytes (clears REPACT at end)
+        ORA     A
+        JZ      DOT_DONE
+        CALL    GETKEY          ; reads from RPLYBUF via BCONIN
+        LDA     EDMODE
+        CPI     EM_INS
+        JZ      DOT_INS
+        CPI     EM_RPL
+        JZ      DOT_RPL
+        CALL    VICMD
+        JMP     DOT_LP
+DOT_INS:
+        CALL    VIINS
+        JMP     DOT_LP
+DOT_RPL:
+        CALL    VIRPL
+        JMP     DOT_LP
+DOT_DONE:
+        XRA     A
+        STA     CHGD            ; the `.` itself must not be re-committed
+        LDA     UNDOTYP         ; did the replayed change leave a usable record?
+        ORA     A
+        JZ      SETDRTY         ; UT_NONE -> can't characterize, full redraw
+        JMP     REDLN           ; one-line repeat -> DRTLINE; else full redraw
+
+
+;============================================================
+;============================================================
+; Marks: m{a-z} set; `{a-z} jump to the exact offset; '{a-z} jump to the
+; mark's line (first non-blank).  Marks store a logical cursor offset
+; (0FFFFH = unset) and also serve as operator motion targets (see OPMK_*).
+;============================================================
+VC_MARK:
+        CALL    MKIDX           ; HL = &MARKS[letter]; CY if not a..z
+        RC
+        PUSH    H
+        CALL    GBCSOF          ; HL = cursor offset
+        XCHG                    ; DE = offset
+        POP     H
+        MOV     M,E
+        INX     H
+        MOV     M,D             ; MARKS[letter] = offset
+        MVI     A,1
+        STA     MKANY
+        RET
+VC_BTICK:
+        CALL    MKGET           ; HL = mark offset; CY if invalid/unset
+        JC      MK_NOSET
+        JMP     GOTOPOS         ; exact-offset jump (VADJ does cheapest redraw)
+VC_QUOTE:
+        CALL    MKGET
+        JC      MK_NOSET
+        CALL    GOTOPOS
+        CALL    GBMLNS          ; line start
+        JMP     FNBLNK          ; first non-blank (tail)
+MK_NOSET:
+        LXI     D,EMKUNS
+        JMP     STATMSG
+; MKIDX - read a mark letter; HL = &MARKS[idx], CY clear.  CY set if not a..z.
+MKIDX:
+        CALL    BCONIN
+MKIDXA:                         ; A = letter (no console read)
+        CPI     'a'
+        JC      MKI_BAD
+        CPI     'z'+1
+        JNC     MKI_BAD
+        SUI     'a'
+        MOV     L,A
+        MVI     H,0
+        DAD     H               ; idx*2
+        LXI     D,MARKS
+        DAD     D
+        ORA     A               ; clear CY
+        RET
+MKI_BAD:
+        STC
+        RET
+; MKGET - read a mark letter; HL = stored offset, CY clear.  CY set if invalid
+; or unset (0FFFFH).
+MKGET:
+        CALL    MKIDX
+        RC
+        MOV     E,M
+        INX     H
+        MOV     D,M             ; DE = offset
+        MOV     A,D
+        ANA     E
+        INR     A               ; 0FFFFH (D&E=0FFH) -> 0 -> unset
+        JZ      MKG_BAD
+        XCHG                    ; HL = offset
+        ORA     A               ; clear CY
+        RET
+MKG_BAD:
+        STC
+        RET
+; MKINS / MKDEL - shift marks when text is inserted/deleted at the cursor so a
+; mark keeps pointing at the same character.  Called from VIBUF's gap mutators.
+; Fast-out (MKANY=0) makes the no-marks common case ~free on the edit hot path.
+MKINS:
+        LDA     MKANY
+        ORA     A
+        RZ
+        CALL    GBCSOF          ; HL = CSOFF (already past the inserted byte)
+        DCX     H               ; threshold = insert point
+        MVI     A,1             ; delta = +1
+        JMP     MKSH
+MKDEL:
+        LDA     MKANY
+        ORA     A
+        RZ
+        CALL    GBCSOF
+        INX     H               ; threshold = CSOFF+1 (covers fwd & back delete)
+        MVI     A,0FFH          ; delta = -1
+MKSH:
+        STA     MKDLT
+        SHLD    MKSHT           ; threshold
+        LXI     H,MARKS
+        MVI     B,26
+MKS_LP:
+        MOV     E,M
+        INX     H
+        MOV     D,M             ; DE = mark M (HL at high byte)
+        MOV     A,D
+        ANA     E
+        INR     A               ; 0FFFFH -> unset
+        JZ      MKS_NX
+        PUSH    H
+        LHLD    MKSHT           ; HL = threshold T
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H               ; M - T; CY if M < T
+        POP     H
+        JC      MKS_NX          ; M < T -> unchanged
+        LDA     MKDLT
+        CPI     1
+        JZ      MKS_INC
+        DCX     D
+        JMP     MKS_ST
+MKS_INC:
+        INX     D
+MKS_ST:
+        MOV     M,D
+        DCX     H
+        MOV     M,E
+        INX     H
+MKS_NX:
+        INX     H
+        DCR     B
+        JNZ     MKS_LP
+        RET
+
+; Line shift: >> / << (normal, count-aware).  Operate on the
+; inclusive 0-based line range [SHLO..SHHI].  Undoable via a whole-region snapshot
+; (SHREC0/SHREC1, see below).  > inserts one TAB at each non-blank line start;
+; < removes one leading TAB, or up to TABWID leading spaces.
+;============================================================
+; SHSETR - set SHLO/SHHI for normal >> / << : SHLO = current line, SHHI = SHLO +
+; (count-1), clamped to the last line so a count past EOF does not re-shift it.
+SHSETR:
+        CALL    CURLN
+        SHLD    SHLO
+        CALL    CNTGET          ; B = count (>= 1)
+        DCR     B               ; B = count - 1
+        LHLD    SHLO
+        MOV     A,L
+        ADD     B
+        MOV     L,A
+        MOV     A,H
+        ACI     0
+        MOV     H,A
+        SHLD    SHHI
+        CALL    GBNLNS          ; HL = total lines (RAM-only: always known)
+        DCX     H               ; HL = last line index
+        SHLD    SHTMP
+        LHLD    SHHI
+        XCHG                    ; DE = SHHI
+        LHLD    SHTMP           ; HL = last
+        MOV     A,L
+        SUB     E
+        MOV     A,H
+        SBB     D
+        RNC                     ; last >= SHHI -> no clamp
+        LHLD    SHTMP
+        SHLD    SHHI
+        RET
+
+; SHMORE - CY clear while SHCUR <= SHHI (more lines to do), CY set when past.
+SHMORE:
+        LHLD    SHHI
+        XCHG                    ; DE = SHHI
+        LHLD    SHCUR
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H               ; SHHI - SHCUR : CY set iff SHHI < SHCUR
+        RET
+
+; SHIFTR - insert one TAB at the start of each non-blank line in [SHLO..SHHI].
+SHIFTR:
+        CALL    SHREC0          ; snapshot the affected line range for undo
+        LHLD    SHLO
+        SHLD    SHCUR
+SHR_LP:
+        CALL    SHMORE
+        JC      SHR_DN
+        LHLD    SHCUR
+        CALL    GBGOTOL         ; cursor at the line start
+        CALL    GBPKRT          ; A = first byte of the line
+        CPI     CR
+        JZ      SHR_NX          ; blank line (CR LF) -> skip
+        CPI     LF
+        JZ      SHR_NX
+        CPI     0FFH
+        JZ      SHR_NX          ; empty last line -> skip
+        MVI     A,TAB
+        CALL    GBINSRT         ; one TAB of indent
+SHR_NX:
+        LHLD    SHCUR
+        INX     H
+        SHLD    SHCUR
+        JMP     SHR_LP
+SHR_DN:
+        CALL    SHREC1          ; finalise undo: UINSCNT = new region length
+        LHLD    SHLO
+        CALL    GBGOTOL         ; leave cursor on the first shifted line
+        RET
+
+; SHIFTL - remove leading indent (one TAB, or up to TABWID spaces) per line.
+SHIFTL:
+        CALL    SHREC0          ; snapshot the affected line range for undo
+        LHLD    SHLO
+        SHLD    SHCUR
+SHL_LP:
+        CALL    SHMORE
+        JC      SHL_DN
+        LHLD    SHCUR
+        CALL    GBGOTOL
+        CALL    GBPKRT          ; A = first byte
+        CPI     TAB
+        JNZ     SHL_SP
+        CALL    GBDELRT         ; drop the one leading TAB
+        JMP     SHL_NX
+SHL_SP:
+        MVI     A,TABWID
+        STA     SHN
+SHL_SPLP:
+        LDA     SHN
+        ORA     A
+        JZ      SHL_NX          ; removed TABWID spaces
+        CALL    GBPKRT
+        CPI     ' '
+        JNZ     SHL_NX          ; non-space -> stop
+        CALL    GBDELRT
+        LDA     SHN
+        DCR     A
+        STA     SHN
+        JMP     SHL_SPLP
+SHL_NX:
+        LHLD    SHCUR
+        INX     H
+        SHLD    SHCUR
+        JMP     SHL_LP
+SHL_DN:
+        CALL    SHREC1          ; finalise undo: UINSCNT = new region length
+        LHLD    SHLO
+        CALL    GBGOTOL
+        RET
+
+;------------------------------------------------------------
+; Shift-undo helpers.  A line shift edits many non-contiguous line starts, which
+; the single-span undo record can't track one-by-one -- so instead we snapshot
+; the WHOLE affected (contiguous) line region [start(SHLO) .. start(SHHI+1)) as
+; the "deleted" text before the shift, then after the shift set UINSCNT to the
+; region's new length.  `u` then deletes the new region and reinserts the old one.
+; Regions larger than UBMAX disable undo (URESET) -- safe.
+;------------------------------------------------------------
+; REGEND -> HL = end offset of the region = start of line SHHI+1, or BD_TXEND
+; when SHHI is the last line.  (Moves the cursor via GBGOTOL.)
+REGEND:
+        CALL    GBNLNS          ; HL = total lines
+        DCX     H               ; last line index
+        XCHG                    ; DE = last
+        LHLD    SHHI
+        MOV     A,L
+        SUB     E
+        MOV     C,A
+        MOV     A,H
+        SBB     D
+        ORA     C               ; (SHHI - last) ; Z iff SHHI == last
+        JZ      RE_TXE
+        LHLD    SHHI            ; SHHI < last -> start of the following line
+        INX     H
+        CALL    GBGOTOL
+        CALL    GBCSOF          ; HL = cursor byte offset
+        RET
+RE_TXE:
+        MVI     A,BD_TXEND
+        CALL    GBLDHW
+        RET
+
+; SHREC0 - snapshot [start(SHLO) .. REGEND) into the undo record (deleted text).
+; Sets SHUNDOK=1 when recording; 0 (and URESET) when the region is too big.
+SHREC0:
+        LHLD    SHLO
+        CALL    GBGOTOL
+        CALL    GBCSOF          ; HL = cursor byte offset
+        SHLD    SHRBEG          ; region start offset
+        CALL    REGEND          ; HL = region end offset
+        XCHG                    ; DE = end
+        LHLD    SHRBEG
+        MOV     A,E
+        SUB     L
+        MOV     L,A
+        MOV     A,D
+        SBB     H
+        MOV     H,A             ; HL = region length
+        SHLD    SHRLEN
+        XCHG                    ; DE = length
+        LXI     H,UBMAX
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H               ; length - UBMAX ; CY iff length < UBMAX (ok)
+        JNC     SHR0_NO         ; too big -> disable undo
+        MVI     A,UT_DEL
+        STA     UNDOTYP
+        LHLD    SHRBEG
+        SHLD    UNDOPOS
+        LXI     H,0
+        SHLD    UINSCNT
+        SHLD    UNDOLEN
+        LHLD    UNDOBP
+        SHLD    UWP
+        MVI     A,1
+        STA     CHGD            ; a shift modifies the buffer (for `.`)
+        STA     SHUNDOK
+        LHLD    SHRBEG
+        CALL    GOTOPOS         ; walk the region from its start
+SHR0_CP:
+        LHLD    SHRLEN
+        MOV     A,H
+        ORA     L
+        JZ      SHR0_DN
+        DCX     H
+        SHLD    SHRLEN
+        CALL    GBPKRT          ; A = byte at cursor
+        LHLD    UWP
+        MOV     M,A
+        INX     H
+        SHLD    UWP
+        LHLD    UNDOLEN
+        INX     H
+        SHLD    UNDOLEN
+        CALL    MV1RT           ; raw one-byte advance (NOT the CR,LF-atomic GBMVRT)
+        JMP     SHR0_CP
+SHR0_DN:
+        LHLD    SHRBEG
+        CALL    GOTOPOS         ; back to the region start for the shift loop
+        RET
+SHR0_NO:
+        XRA     A
+        STA     SHUNDOK
+        JMP     URESET
+
+; SHREC1 - after the shift, set UINSCNT = the region's new length so `u` removes
+; the new region before reinserting the old one.
+SHREC1:
+        LDA     SHUNDOK
+        ORA     A
+        RZ                      ; undo disabled for this shift
+        CALL    REGEND          ; HL = new region end
+        XCHG                    ; DE = new end
+        LHLD    SHRBEG
+        MOV     A,E
+        SUB     L
+        MOV     L,A
+        MOV     A,D
+        SBB     H
+        MOV     H,A             ; HL = new region length
+        SHLD    UINSCNT
+        RET
+
+; OPLSHR / OPLSHL - linewise >> / << reached from OP_LINE (doubled operator).
+OPLSHR:
+        CALL    SHSETR
+        CALL    SHIFTR
+        JMP     SETDRTY
+OPLSHL:
+        CALL    SHSETR
+        CALL    SHIFTL
+        JMP     SETDRTY
+
+
+;============================================================
+; Small helpers
+;============================================================
+; CNTGET - B = the repeat count for this command: RCNT clamped to 1..255
+; (0 -> 1).  RCNT is the raw count snapshotted at dispatch (0 = none typed).
+CNTGET:
+        LHLD    RCNT
+        MOV     A,H
+        ORA     A
+        JNZ     CG_MAX          ; > 255 -> clamp
+        MOV     A,L
+        ORA     A
+        JZ      CG_ONE          ; 0 -> 1
+        MOV     B,A
+        RET
+CG_MAX: MVI     B,255
+        RET
+CG_ONE: MVI     B,1
+        RET
+
+; REPN - call the subroutine at HL exactly B times (B >= 1).
+REPN:
+        MOV     A,B
+        ORA     A
+        RZ
+RN_LP:
+        PUSH    B
+        PUSH    H
+        CALL    RN_GO
+        POP     H
+        POP     B
+        DCR     B
+        JNZ     RN_LP
+        RET
+RN_GO:  PCHL                    ; call (HL)
+
+; The goal column for j/k is a DISPLAY column (tab-aware), so vertical moves
+; keep the cursor under the same screen column across tab-indented lines.
+
+; GCLR - reset the goal column to the current display column.
+GCLR:
+        CALL    CURDCO
+        MOV     A,L
+        STA     GOALCOL
+        RET
+
+; SETGOAL - grow the goal column to at least the current display column.
+SETGOAL:
+        CALL    CURDCO
+        MOV     A,L
+        MOV     C,A             ; C = current display column
+        LDA     GOALCOL
+        CMP     C               ; goal - col: carry if goal < col
+        RNC                     ; goal >= col: keep
+        MOV     A,C
+        STA     GOALCOL
+        RET
+
+; VADVG - after a vertical move (cursor at the start of a line), advance right
+; until the cursor's DISPLAY column reaches the goal, never crossing the line
+; break.  Tracks the display column in C incrementally (tab-aware): a tab steps
+; to the next TABWID stop.  If the goal falls inside a tab's cells, the cursor
+; stops ON the tab (its first cell), matching vim.  O(line), not O(line^2).
+; Bulk version: scan the line read-only (HL = scan ptr, DE = R2 end) computing
+; the number of bytes to advance (VADVN), then move the cursor there in ONE
+; block (GBADVN) instead of one GBMVRT per column.  Same tab/goal logic as the
+; old per-step loop; GBADVN(0) is a no-op so a zero goal is free.
+VADVG:
+        CALL    GBR2RG          ; HL = scan (cursor R2 head), DE = R2 end
+        XRA     A
+        STA     VADVCO          ; display column of the char under the (virtual) cursor
+        STA     VADVN           ; content bytes to advance so far
+VADVG_LP:
+        LDA     VADVCO
+        MOV     C,A
+        LDA     GOALCOL
+        CMP     C               ; goal - C
+        JC      VADVG_DN        ; goal < C  (defensive)
+        JZ      VADVG_DN        ; goal == C -> on the right char
+        ; current char: stop at end of buffer / line break
+        MOV     A,H
+        CMP     D
+        JNZ     VADVG_HV
+        MOV     A,L
+        CMP     E
+        JZ      VADVG_DN        ; end of buffer
+VADVG_HV:
+        MOV     A,M             ; current char
+        CPI     LF
+        JZ      VADVG_DN
+        CPI     CR
+        JZ      VADVG_DN
+        CPI     TAB
+        JZ      VADVG_TAB
+        MVI     B,1             ; ordinary char: 1 cell
+        JMP     VADVG_STEP
+VADVG_TAB:
+        LDA     VADVCO
+        ANI     TABWID-1        ; C mod TABWID
+        MOV     B,A
+        MVI     A,TABWID
+        SUB     B
+        MOV     B,A             ; B = TABWID - C%TABWID = tab cell width
+VADVG_STEP:
+        LDA     VADVCO
+        ADD     B               ; next char's start column
+        MOV     C,A
+        LDA     GOALCOL
+        CMP     C               ; goal - nextstart: carry if goal < nextstart
+        JC      VADVG_DN        ; goal inside the current char -> stop on it
+        MOV     A,C
+        STA     VADVCO          ; advance the accumulator
+        ; step past the current char, unless it is the last content char.
+        INX     H               ; peek scan+1
+        MOV     A,H
+        CMP     D
+        JNZ     VADVG_PK
+        MOV     A,L
+        CMP     E
+        JZ      VADVG_DN        ; scan+1 == end -> current is the last content char
+VADVG_PK:
+        MOV     A,M             ; byte at scan+1
+        CPI     LF
+        JZ      VADVG_DN        ; next is a break -> current is the last content char
+        CPI     CR
+        JZ      VADVG_DN
+        LDA     VADVN           ; real step: count the current char (HL = scan+1)
+        INR     A
+        STA     VADVN
+        JMP     VADVG_LP
+VADVG_DN:
+        LDA     VADVN
+        MOV     C,A
+        MVI     B,0
+        JMP     GBADVN          ; advance the cursor VADVN bytes in one block
+
+; SETLINE - flag a current-line redraw.
+SETLINE:
+        MVI     A,1
+        STA     DRTLINE
+        RET
+
+; SETDRTY - flag a full redraw.
+SETDRTY:
+        MVI     A,1
+        STA     DIRTY
+        RET
+
+;------------------------------------------------------------
+; REDLN - pick the cheapest redraw after an edit described by the undo record
+; (u and `.`).  The edit stayed within one screen line -- so a current-line
+; redraw (DRTLINE) suffices -- iff the total line count is unchanged from
+; REDSAV (captured before the edit) AND the recorded deleted text
+; UNDOBUF[0..UNDOLEN) carries no LF.  With the count unchanged, no LF among the
+; deleted bytes forces no LF on the inserted side too, so nothing below the
+; cursor line moved.  Anything else -> full redraw (DIRTY).  (VADJ still runs
+; in the main loop and can escalate DRTLINE to a scroll/full redraw if the
+; cursor itself moved off the page.)  Tail-calls SETLINE / SETDRTY.
+;------------------------------------------------------------
+REDLN:
+        CALL    GBNLNS          ; HL = line count now
+        XCHG                    ; DE = count now
+        LHLD    REDSAV          ; HL = count before the edit
+        MOV     A,L
+        CMP     E
+        JNZ     SETDRTY
+        MOV     A,H
+        CMP     D
+        JNZ     SETDRTY         ; line count changed -> full redraw
+        LHLD    UNDOLEN
+        MOV     B,H
+        MOV     C,L             ; BC = deleted-text length
+        LHLD    UNDOBP
+REDL_LP:
+        MOV     A,B
+        ORA     C
+        JZ      SETLINE         ; scanned all, no LF -> current-line redraw
+        MOV     A,M
+        CPI     LF
+        JZ      SETDRTY         ; deleted text spans a line break -> full redraw
+        INX     H
+        DCX     B
+        JMP     REDL_LP
+
+        END
