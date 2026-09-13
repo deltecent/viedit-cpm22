@@ -30,6 +30,7 @@
         PUBLIC  GBPGDN, GBPGUP, GBGOTOL, GBGOAB
         PUBLIC  GBNLNS, NLNVAL
         PUBLIC  NAVSAV          ; SPILLTOP/REWIND track it across a paging slide
+        PUBLIC  NAVRST          ; VI_CR restores the cursor after a line split
 
         CSEG
 

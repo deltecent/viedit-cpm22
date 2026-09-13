@@ -389,6 +389,12 @@ def main():
     e.key(':e\r')
     check(':e (no name) shows "No file name" when unnamed',
           'No file name' in e.screen().render())
+    # --- :w with no filename ever named -> "No file name", must not write garbage
+    e = Editor(b'', fname=None)
+    e.key(':w\r', idle=4000)
+    check(':w (no name) shows "No file name" when unnamed',
+          'No file name' in e.screen().render())
+    check(':w (no name) leaves the editor responsive', e.s.regs() is not None)
 
     # --- normal >> / << (count-aware) : line indent ---
     def _file(ed):
@@ -487,6 +493,20 @@ def main():
     check('insert before tab falls back (no ESC[@)', '\x1b[1@' not in eb.since(m))
     check('insert before tab result correct',
           eb.screen().render().splitlines()[0].startswith('Xab     cd'))
+
+    # Enter at end-of-buffer: typing text then Return in a fresh buffer must open
+    # a real new line below (cursor on line 2), not duplicate the line and stick
+    # the cursor on line 1.  (Split at true EOF: the new lower line is the empty
+    # final line, which the naive GBMVDN reposition refused to land on.)
+    ee = Editor(b'', fname='TEST.TXT')
+    ee.key('i'); ee.key('abcdefg'); ee.key('\r', idle=3000)
+    rr = ee.screen().render().splitlines()
+    check('Enter at EOF: line 1 keeps the text', rr[0].rstrip() == 'abcdefg')
+    check('Enter at EOF: line 2 is blank (not a duplicate)', rr[1].strip() == '')
+    check('Enter at EOF: cursor moves to line 2', ee.screen().row == 1)
+    ee.key('\x1b', idle=1500); ee.key(':w\r', idle=3000)
+    check('Enter at EOF: saves one terminated line',
+          bytes(ee.diskfile('TEST', 'TXT')).rstrip(b'\x1a') == b'abcdefg\r\n')
 
     # Bug 5: j/k track the DISPLAY column across tab-indented lines
     ej = Editor(b'abcdefghijk\r\n\tX\r\nZZZZZZZZZZ\r\n')

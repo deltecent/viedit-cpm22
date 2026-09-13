@@ -824,6 +824,15 @@ SBHLDE: MOV     A,L             ; HL = HL - DE  (flags = result, as the inline f
 ; Leaves SVERR = 0 ok / 1 failed.
 ;------------------------------------------------------------
 DOSAVE:
+        ; refuse to save the "current target" when no file has ever been named
+        ; (started with no filename, none given since).  Without this the stale
+        ; OUTFCB is written under a garbage name; match :e/:r -> "No file name".
+        ; (:w filename does not come through here -- it parses a fresh OUTFCB.)
+        MVI     A,BD_FNAME+1    ; first name char (0 = unnamed, as zeroed at start)
+        CALL    BDFLD
+        MOV     A,M
+        ORA     A
+        JZ      DS_NONM
         LDA     RDONLY
         ORA     A
         JNZ     DS_RO
@@ -847,6 +856,12 @@ DS_RO:
         MVI     A,1
         STA     SVERR
         LXI     D,ERDONLY
+        CALL    STATMSG
+        RET
+DS_NONM:
+        MVI     A,1
+        STA     SVERR
+        LXI     D,ENOFILE       ; 'No file name'
         CALL    STATMSG
         RET
 

@@ -128,4 +128,4 @@ smoke test's `_smoke_work/` scratch are regenerated each run.
 - **Build:** reproducible (VIEDIT.COM = 22784 bytes; KEYTST also builds).
   `SCRTST` is a stale Phase-2 stub: its `VISCREEN` references `MKDEL`/`MKINS`,
   which now exist only in the full VIEDIT link, so it fails to link.
-- **Smoke test:** 393 passed / 0 failed at `MAX_LIVE=20`.
+- **Smoke test:** 399 passed / 0 failed at `MAX_LIVE=20`.

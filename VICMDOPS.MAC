@@ -16,7 +16,7 @@
         EXTRN   GBDELRT, GBGOTOL, GBINSRT, GBLDHW, GBMLNE, GBMLNS
         EXTRN   GBMVDN, GBMVLT, GBMVRT, GBMVUP, GBPKRT, GBR2RG
         EXTRN   GPTGT, INSMSG, LNCREM, LNOP, MKGET, MKTMP
-        EXTRN   MKTMP2, MVRTIL, NEDIT, NPUTLN, OPB, OPCHAR
+        EXTRN   MKTMP2, MVRTIL, NAVRST, NEDIT, NPUTLN, OPB, OPCHAR
         EXTRN   OPEND, OPLO, OPLSHL, OPLSHR, OPN, OPSTART
         EXTRN   OUTINSLN, OUTN16, OUTSTR, PENDOP, PKRTF, PTOPSV
         EXTRN   PUTOFF, RCNT, SCREDAT, SCREDCL, SETDRTY, SETLINE
@@ -925,10 +925,17 @@ VI_CR:
         ; row, so the truncated upper half can be redrawn in place now; a later
         ; one-line viewport scroll (if the cursor was on the bottom row) shifts
         ; that freshly-drawn row along with the rest, so it stays correct.
-        CALL    UINSCL          ; record CR,LF into the undo buffer
-        CALL    GBMVUP          ; -> the upper half (still at BD_CSROW on screen)
+        CALL    UINSCL          ; record CR,LF into the undo buffer; cursor now at
+                                ; the START of the new lower line (may be at EOF)
+        CALL    GBMVUP          ; -> the upper half (still at BD_CSROW on screen);
+                                ; its entry saved NAVSAV = the lower-line start
         CALL    SCREDCL         ; erase + redraw the now-truncated upper line
-        CALL    GBMVDN          ; -> back to the start of the lower line
+        ; Return to the lower line via NAVSAV, NOT GBMVDN: when the split is at the
+        ; end of the file the new lower line is the empty final line, and GBMVDN
+        ; treats "terminator with nothing after it" as "no next line" -- it would
+        ; bounce the cursor back to the upper line (leaving G-style duplicate draw
+        ; and a stuck cursor).  NAVRST restores the exact saved offset regardless.
+        CALL    NAVRST
         MVI     A,1
         STA     LNOP            ; lower half: ESC[L insert-line fast path (like o)
         RET
