@@ -7,7 +7,7 @@
 ;============================================================
         INCLUDE VI.INC
         PUBLIC  EX_S, EX_SUB, ISRNGC
-        EXTRN   AUTOSCR, CURLN, EBADCMD, ELINE, EMKUNS, ESUBPAT
+        EXTRN   AUTOSCR, CURLN, CURWLN, EBADCMD, ELINE, EMKUNS, ESUBPAT
         EXTRN   ESUBRNG, EXBUF, EXKW, EXMSG, EX_FIN, EX_STAT
         EXTRN   GBCSOF, GBDELRT, GBGOTOL, GBINSRT, GBLDHW, GBNLNS
         EXTRN   GBPKRT, GOTOPOS, KWSTAT, MKIDXA, MKTMP, MKTMP2
@@ -66,8 +66,8 @@ EX_S:
         LXI     H,KWSTAT
         CALL    EXKW
         JZ      EX_STAT         ; ':stat' shares the 's' prefix
-        CALL    CURLN           ; HL = 0-based current line
-        INX     H               ; -> 1-based
+        CALL    CURWLN          ; HL = 0-based current line (window-relative:
+        INX     H               ; :s ranges feed GBGOTOL, still window-relative)
         SHLD    SLINE
         SHLD    ELINE
         LXI     H,EXBUF+1       ; body after the 's'
@@ -151,7 +151,7 @@ PADDR:
 PA_DOT:
         INX     H
         PUSH    H
-        CALL    CURLN           ; HL = 0-based
+        CALL    CURWLN          ; HL = 0-based (window-relative, matches GBGOTOL)
         INX     H               ; -> 1-based
         XCHG                    ; DE = value
         POP     H
@@ -181,7 +181,7 @@ PA_MARK:
         SHLD    MKTMP           ; save it
         XCHG                    ; HL = mark offset
         CALL    GOTOPOS
-        CALL    CURLN           ; HL = 0-based line of the mark
+        CALL    CURWLN          ; HL = 0-based line of the mark (window-relative)
         INX     H               ; 1-based
         PUSH    H
         LHLD    MKTMP

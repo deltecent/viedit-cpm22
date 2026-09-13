@@ -3,10 +3,13 @@
 ; PROJECT: VIEDIT (viedit/)
 ; MODULE:  Line-navigation primitives over the resident gap buffer (VIBUF).
 ;------------------------------------------------------------
-; RAM-ONLY: the whole file lives resident in the gap buffer (oversize files are
-; refused up front by VIFILEIO/FIOPEN).  There is no window, no slide, no scratch
-; file -- the cursor line within the screen window IS its absolute file line.
-; This module is pure in-RAM line moves and absolute-line positioning.
+; Line moves and cursor line/column over the resident window.  In RAM-only mode
+; the whole file is resident and the window line IS the absolute file line.  In
+; virtual mode (VIVM paging) the resident buffer is a sliding window: CURWLN is
+; the WINDOW line (LFs in R1), CURLN adds LINABOVE for the ABSOLUTE line, and
+; GBNLNS folds in LINABOVE/LINBELOW (approximate, CY set, while text lies below).
+; The line-navigation moves here stay window-relative; cross-boundary paging is
+; driven by the VIVM hooks in VIBUF/this module's GBMVDN.
 ;------------------------------------------------------------
 ; EXPORTS: WININIT; GBMVDN GBMVUP GBPGDN GBPGUP GBGOTOL (line navigation);
 ;          CURLN CURWLN CURCOL CURDCO (cursor line/column); GBNLNS (total
@@ -19,6 +22,8 @@
         EXTRN   GBMLNS, GBMLNE
         EXTRN   VMODE           ; VIVM: 0 = RAM-only, 1 = virtual (paging)
         EXTRN   FILLFWD         ; VIVM: bring the next record from below into R2
+        EXTRN   LINABOVE, LINBELOW  ; VIVM: lines above / below the window
+        EXTRN   TAILEOF, RIGHTREC   ; VIVM: below-window state (exact-total gate)
 
         PUBLIC  WININIT
         PUBLIC  GBMVDN, GBMVUP, CURLN, CURWLN, CURCOL, CURDCO
@@ -124,7 +129,10 @@ NR_RT:
         JMP     NAVRST
 
 ;============================================================
-; CURLN  -> HL = absolute current line (0-based) = LFs in R1 (base[0,GAPBG)).
+; CURWLN -> HL = WINDOW line of the cursor (0-based) = LFs in R1 (base[0,GAPBG)).
+; RAM-only this equals the absolute file line (nothing is spilled); in virtual
+; mode CURLN adds LINABOVE on top to get the absolute line.  VADJ/scroll want
+; this window-relative value; the ^G/status line wants absolute (CURLN).
 ;
 ; A full scan of base[0,GAPBG) is O(bytes-before-cursor), paid on EVERY call
 ; (VADJ calls it once per keystroke).  An incremental cache avoids it: keep
@@ -141,7 +149,7 @@ NR_RT:
 ; Windowed files always full-scan (a slide rewrites the buffer).  WININIT
 ; invalidates the cache (CLNVAL=0).
 ;============================================================
-CURLN:
+CURWLN:
         LDA     VMODE
         ORA     A
         JNZ     CLNFULL         ; virtual: a window slide rewrites the buffer, so
@@ -298,9 +306,14 @@ CLC_NX:
 ; the removed windowing engine and never occurs now.)
 ;============================================================
 GBNLNS:
+        LDA     VMODE
+        ORA     A
+        JNZ     GNL_CALC        ; virtual: the counters change on every page op, so
+                                ; never read or keep the RAM-only line cache
         LDA     NLNVAL
         ORA     A
         JNZ     GNL_HIT         ; cache still valid
+GNL_CALC:
         ; --- LFs in R1 = base[0, GAPBG) ---
         MVI     A,BD_BSTAR
         CALL    GBLDHW          ; HL = base
@@ -332,8 +345,42 @@ GBNLNS:
         POP     H               ; HL = R2 start
         CALL    CLNCNT          ; DE = LFs in R2
         LHLD    NLNCNT
-        DAD     D               ; HL = total LFs (R1 + R2)
+        DAD     D               ; HL = total LFs (R1 + R2) = window LFs
         SHLD    NLNCNT
+        ; --- virtual: fold in the lines above / below the window ---
+        LDA     VMODE
+        ORA     A
+        JZ      GNL_ADJ         ; RAM-only: the window holds the whole file
+        LHLD    NLNCNT
+        XCHG
+        LHLD    LINABOVE        ; + lines above the window
+        DAD     D
+        SHLD    NLNCNT
+        ; EXACT only when no real text lies below: the original tail is read to
+        ; EOF (TAILEOF) AND nothing sits in $$B (RIGHTREC==0).  Then the window
+        ; bottom is the true document end and the final-line adjustment applies.
+        ; (BYTBELOW keeps a ^Z-padding remainder even when drained, so it is not
+        ; the right test.)
+        LDA     TAILEOF
+        ORA     A
+        JZ      GNL_APX         ; tail not fully paged in yet
+        LDA     RIGHTREC
+        LXI     H,RIGHTREC+1
+        ORA     M
+        JZ      GNL_ADJ         ; tail drained and $$B empty -> exact
+GNL_APX:
+        ; text still lies below (unread original tail and/or $$B): the total is a
+        ; lower bound.  Report LINABOVE + windowLFs + LINBELOW with CY set so ^G
+        ; shows ">=N" and firms up once the cursor reaches the true end.
+        LHLD    NLNCNT
+        XCHG
+        LHLD    LINBELOW
+        DAD     D
+        SHLD    NLNCNT
+        LHLD    NLNCNT
+        STC
+        RET
+GNL_ADJ:
         ; --- final-line adjustment ---
         MVI     A,BD_TXEND
         CALL    GBLDHW          ; HL = TXEND
@@ -383,20 +430,30 @@ GNL_LB:
         INX     H               ; final unterminated line
         SHLD    NLNCNT
 GNL_SET:
+        LDA     VMODE
+        ORA     A
+        JNZ     GNL_HIT         ; virtual: do not cache (counters change on paging)
         MVI     A,1
         STA     NLNVAL
 GNL_HIT:
         LHLD    NLNCNT
-        ORA     A               ; clear carry: known
+        ORA     A               ; clear carry: known/exact
         RET
 
 ;============================================================
-; CURWLN -> HL = window line of the cursor.  RAM-only: nothing is spilled, so the
-; window line equals the absolute file line (CURLN).  Kept as a named entry for
-; VADJ and the page handlers.
+; CURLN  -> HL = ABSOLUTE current line (0-based).  RAM-only: == the window line
+; (CURWLN).  Virtual: LINABOVE (lines spilled above the window) + CURWLN.  Used
+; by ^G/status and by line-range commands; 16-bit like the rest of the editor.
 ;============================================================
-CURWLN:
-        JMP     CURLN
+CURLN:
+        CALL    CURWLN          ; HL = window line (LFs in R1)
+        LDA     VMODE
+        ORA     A
+        RZ                      ; RAM-only: absolute line == window line
+        XCHG                    ; DE = window line
+        LHLD    LINABOVE        ; HL = LINABOVE (low 16 bits)
+        DAD     D               ; HL = LINABOVE + window line = absolute line
+        RET
 
 ;============================================================
 ; CURCOL -> HL = column (content bytes on the current line before the cursor).

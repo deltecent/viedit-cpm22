@@ -11,7 +11,7 @@
         PUBLIC  UBEGD, UBEGI, UBS1, UDEL1, UINS1, URECPUT
         PUBLIC  URESET, VADVG, VC_BTICK, VC_DOT, VC_MARK, VC_QUOTE
         PUBLIC  VC_U
-        EXTRN   BCONIN, CHGD, CURDCO, CURLN, DIRTY, DRTLINE
+        EXTRN   BCONIN, CHGD, CURDCO, CURLN, CURWLN, DIRTY, DRTLINE
         EXTRN   EDMODE, EMKUNS, ENOUNDO, FNBLNK, GBADVN, GBCSOF
         EXTRN   GBDELRT, GBDLFT, GBGOTOL, GBINSRT, GBLDHW, GBMLNS
         EXTRN   GBNLNS, GBPKRT, GBR2RG, GETKEY, GOALCOL, GOTOPOS
@@ -353,7 +353,7 @@ MKS_NX:
 ; SHSETR - set SHLO/SHHI for normal >> / << : SHLO = current line, SHHI = SHLO +
 ; (count-1), clamped to the last line so a count past EOF does not re-shift it.
 SHSETR:
-        CALL    CURLN
+        CALL    CURWLN          ; window line: feeds GBGOTOL (window-relative)
         SHLD    SHLO
         CALL    CNTGET          ; B = count (>= 1)
         DCR     B               ; B = count - 1

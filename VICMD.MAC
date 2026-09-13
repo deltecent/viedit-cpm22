@@ -45,7 +45,7 @@
         EXTRN   LNOP            ; VI.MAC -- structural 1-line change flag
         EXTRN   HELPSC          ; VISCREEN -- full-screen help overlay
         EXTRN   ACTTAB, CMDTAB, CNTGET, CWSCAN, DDLCNT, DOSAVE
-        EXTRN   ENTINS, GBCSOF, GCLR, GCOLMSG, GMSG, GOFMSG
+        EXTRN   ENTINS, GBCSOF, GCLR, GAPXMSG, GCOLMSG, GMSG, GOFMSG
         EXTRN   GOTOPOS, GPEND, GROMSG, GSIZMSG, HFN, HMLBOT
         EXTRN   HMLLST, HMLTOP, ISEOL, OPHANDLE, OPSET, PGREQ
         EXTRN   PGSDLT, PGSVCO, PGSVLN, PGTOP, PKEOL, PKRTF
@@ -215,8 +215,12 @@ VC_K:   CALL    SETGOAL
 ; cursor's RESULTING line.  VADJ leaves TOPLN alone afterwards because the cursor
 ; is already on screen.
 VC_PGDN:
-        ; save the cursor (line+col) so we can undo the probe if we can't scroll
-        CALL    CURLN
+        ; save the cursor (line+col) so we can undo the probe if we can't scroll.
+        ; ^F/^B work in WINDOW lines: ABSTOP, GBGOTOL and TOPLN are all
+        ; window-relative here (until GBGOTOL gains paging), so use CURWLN, not
+        ; the absolute CURLN, or the compare below would mismatch once text has
+        ; spilled above the window (LINABOVE>0).
+        CALL    CURWLN
         SHLD    PGSVLN
         CALL    CURCOL
         MOV     A,L
@@ -230,7 +234,7 @@ VC_PGDN:
         DAD     D               ; HL = abs top + NEDIT
         SHLD    PGREQ
         CALL    GBGOTOL
-        CALL    CURLN           ; HL = line actually reached
+        CALL    CURWLN          ; HL = window line actually reached
         XCHG
         LHLD    PGREQ
         MOV     A,L
@@ -758,15 +762,23 @@ VC_CTRLG:
 GCG_LN:
         LXI     D,GMSG          ; " line "
         CALL    OUTSTR
-        CALL    CURLN           ; HL = 0-based line
+        CALL    CURLN           ; HL = 0-based ABSOLUTE line
         INX     H               ; 1-based
         CALL    OUTN16
-        CALL    GBNLNS          ; HL = total lines; CY set if unknown
-        JC      GCG_COL         ; unknown -> skip " of M"
+        CALL    GBNLNS          ; HL = total lines; CY set = lower bound (virtual,
+                                ; text still below) -> show " of >=N"
+        PUSH    PSW             ; remember whether the total is approximate
         PUSH    H
         LXI     D,GOFMSG        ; " of "
         CALL    OUTSTR
         POP     H
+        POP     PSW
+        JNC     GCG_TOT         ; exact total
+        PUSH    H
+        LXI     D,GAPXMSG       ; ">=" prefix (virtual, still text below)
+        CALL    OUTSTR
+        POP     H
+GCG_TOT:
         CALL    OUTN16
 GCG_COL:
         LXI     D,GCOLMSG       ; " col "

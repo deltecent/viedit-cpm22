@@ -1023,6 +1023,57 @@ def main():
     check('/W vs RAM: deep o-insert cursor matches', cv == cr)
     check('/W: inserted text is on screen', any('PHASE2 INSERT LINE' in r for r in gv))
 
+    # --- Phase 3 acceptance: ^G absolute line accounting vs a RAM-only reference ---
+    # ^G reports the ABSOLUTE line (CURLN = LINABOVE + LFs-in-R1) and an approximate
+    # total (">=N", CY set) while text still lies below.  The absolute line must
+    # equal a RAM-only editor's ^G line at the same logical position, no matter how
+    # much has paged above/below.  Parse the status row (index 23) after ^G (\x07).
+    def _gstat(ed):
+        ed.key('\x07')
+        st = ed.screen().render().split('\n')[23]
+        ln = re.search(r'line (\d+)', st)
+        cl = re.search(r'col (\d+)', st)
+        tot = re.search(r'of (>=)?(\d+)', st)
+        return (int(ln.group(1)) if ln else None,
+                int(cl.group(1)) if cl else None,
+                ((tot.group(1) or '') + tot.group(2)) if tot else '')
+    def _gpair(keys, idle=3500):
+        ev = Editor(vcontent, args=' /W2048'); er = Editor(vcontent)
+        try:
+            for k in keys:
+                ev.key(k, idle=idle); er.key(k, idle=idle)
+            return _gstat(ev), _gstat(er)
+        finally:
+            ev.close(); er.close()
+
+    gv, gr = _gpair(['j' * 30])
+    check('/W vs RAM: ^G line after 30x j matches (=31)', gv[0] == gr[0] == 31)
+    check('/W vs RAM: ^G col after 30x j matches', gv[1] == gr[1])
+
+    # 150x j pages text above the window; the ABSOLUTE line must still be exact.
+    gv, gr = _gpair(['j' * 150])
+    check('/W vs RAM: ^G absolute line after 150x j (paged) matches (=151)',
+          gv[0] == gr[0] == 151)
+
+    # descend deep, climb partway back: absolute line tracks through both directions.
+    gv, gr = _gpair(['j' * 150, 'k' * 77])
+    check('/W vs RAM: ^G line after j*150 then k*77 matches (=74)',
+          gv[0] == gr[0] == 74)
+
+    # near the top, text still lies below: virtual total is a lower bound (">=N"),
+    # RAM-only is the exact 200.  The lower bound must not exceed the true total.
+    gv, gr = _gpair(['j' * 5])
+    check('/W near top: ^G total is approximate (>=)', gv[2].startswith('>='))
+    check('RAM near top: ^G total is exact 200', gr[2] == '200')
+    check('/W approximate total is a valid lower bound', int(gv[2][2:]) <= 200)
+
+    # scroll to the last line: everything below drains into the window, so the
+    # total firms up to the exact count and equals the RAM-only reference.
+    gv, gr = _gpair(['j' * 199])
+    check('/W at last line: ^G line 200 matches RAM', gv[0] == gr[0] == 200)
+    check('/W at last line: total firms up to exact 200 (no >=)', gv[2] == '200')
+    check('RAM at last line: total 200', gr[2] == '200')
+
     # --- bugs.txt: word motions w/b/e vs W/B/E (punctuation boundaries) ---
     cp = b'foo.bar baz\r\nsecond line\r\n'   # f0 o1 o2 .3 b4 a5 r6 _7 b8 a9 z10
     e = Editor(cp); e.key('w')

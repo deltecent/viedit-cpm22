@@ -10,7 +10,7 @@
         PUBLIC  VCBIGI, VCBIGO, VCBIGP, VC_A, VC_I, VC_O
         PUBLIC  VC_P, VIINS, VIRPL
         EXTRN   BDFLD, BSTEP, CHGD, CLS, CMDCNT, CNTGET
-        EXTRN   CURLN, CWTAB, DDLAST, DDLINES, DIRTY, DRTLINE
+        EXTRN   CURLN, CURWLN, CWTAB, DDLAST, DDLINES, DIRTY, DRTLINE
         EXTRN   EDMODE, ERNGBIG, ESTEP, FASTCH, FASTN, FASTOP
         EXTRN   FDELOK, FMULTI, FNBLNK, GBADVN, GBBAKN, GBCSOF
         EXTRN   GBDELRT, GBGOTOL, GBINSRT, GBLDHW, GBMLNE, GBMLNS
@@ -116,11 +116,12 @@ OPMK_LINE:
         CALL    MKGET
         JC      OP_CANCEL
         PUSH    H
-        CALL    CURLN
-        SHLD    MKTMP           ; curline
+        CALL    CURWLN
+        SHLD    MKTMP           ; curline (window-relative; the range below is a
+                                ; difference, so LINABOVE cancels either way)
         POP     H
         CALL    GOTOPOS         ; cursor -> mark offset
-        CALL    CURLN
+        CALL    CURWLN
         SHLD    MKTMP2          ; markline
         LHLD    MKTMP
         XCHG                    ; DE = curline

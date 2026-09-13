@@ -52,6 +52,7 @@
 
         PUBLIC  VMODE, VMALLOW, WINCAP, GAPRSV
         PUBLIC  BYTABOVE, BYTBELOW, LINABOVE, LINBELOW, OUTREC, RIGHTREC
+        PUBLIC  TAILEOF
         PUBLIC  VMRSET, VMZERO, VMLDIN
         PUBLIC  SPILLTOP, SPILLBOT, FILLFWD, REWIND, SPILLOK
         PUBLIC  FLBRK, RWBRK, VMFILL
@@ -92,6 +93,8 @@ VMZ_L:
 VMLDIN:
         MVI     A,1
         STA     VMODE
+        XRA     A
+        STA     TAILEOF         ; the original tail is unread at a fresh load
         PUSH    D               ; save file records
         CALL    VMZERO
         ; caprec = (BSIZE - GAPRSV) >> 7
@@ -346,6 +349,13 @@ ST_CP:
         LXI     H,0              ; clamp
 ST_STT:
         SHLD    BDESC0+BD_TOPLN
+        ; LINABOVE += C  (C still = LFs in the spilled record; the TOPLN slide
+        ; above leaves the C register untouched).  A line left the window top for
+        ; the ABOVE stream, so it is now an above-window line.
+        MOV     E,C
+        MVI     D,0
+        LXI     H,LINABOVE
+        CALL    ADD24
 ST_DONE:
         ORA     A               ; CY clear = success
         RET
@@ -423,6 +433,18 @@ SB_CP:
         LXI     H,BYTBELOW
         LXI     D,128
         CALL    ADD24
+        ; LINBELOW += LFs in the spilled record (PGBUF still holds it -- SCRWR
+        ; and the R2 slide above do not disturb it).  A line left the window
+        ; bottom for the BELOW stream ($$B).
+        CALL    CNTLF128         ; C = LFs
+        MOV     A,C
+        ORA     A
+        JZ      SB_DN
+        MOV     E,C
+        MVI     D,0
+        LXI     H,LINBELOW
+        CALL    ADD24
+SB_DN:
         ORA     A
         RET
 SB_NO:
@@ -460,6 +482,18 @@ FF_GAP:
         LXI     H,BYTBELOW
         LXI     D,128
         CALL    SUB24
+        ; LINBELOW -= LFs in this $$B record (PGBUF holds it): those lines move
+        ; from the BELOW stream into the window, where they are counted live.
+        ; (The tail branch below reads original-file bytes never counted in
+        ; LINBELOW, so it makes no LINBELOW adjustment.)
+        CALL    CNTLF128         ; C = LFs
+        MOV     A,C
+        ORA     A
+        JZ      FF_PLACE
+        MOV     E,C
+        MVI     D,0
+        LXI     H,LINBELOW
+        CALL    SUB24
         JMP     FF_PLACE
 FF_TAIL:
         ; from the original tail: up to 128 bytes, stopping at ^Z / EOF
@@ -474,13 +508,18 @@ FF_RD:
         CALL    IRGETB
         POP     H
         POP     B
-        JC      FF_RDN          ; EOF
+        JC      FF_EOF          ; EOF          -> original tail exhausted
         CPI     CPMEOF
-        JZ      FF_RDN          ; ^Z end-of-text
+        JZ      FF_EOF          ; ^Z end-of-text -> original tail exhausted
         MOV     M,A
         INX     H
         INR     B
         JMP     FF_RD
+FF_EOF:
+        ; the original file has no more real bytes below: mark the tail exhausted
+        ; so GBNLNS knows the count is exact once nothing remains in $$B either.
+        MVI     A,1
+        STA     TAILEOF
 FF_RDN:
         MOV     A,B
         STA     VMK
@@ -626,6 +665,12 @@ RW_GAP:
         MVI     D,0
         DAD     D
         SHLD    BDESC0+BD_TOPLN
+        ; LINABOVE -= C  (C still = LFs in the rewound record): a line came back
+        ; from the ABOVE stream into the window top.
+        MOV     E,C
+        MVI     D,0
+        LXI     H,LINABOVE
+        CALL    SUB24
 RW_DONE:
         ORA     A
         RET
@@ -774,5 +819,8 @@ VMCEND:                         ; (end marker for VMZERO)
 VMT0:    DW     0
 VMT1:    DW     0
 VMK:     DB     0               ; FILLFWD: bytes brought in this fill (<=128)
+TAILEOF: DB     0               ; 1 once FILLFWD has read the original tail to
+                                ; EOF/^Z (no unread text remains below except
+                                ; whatever has since been spilled into $$B)
 
         END
