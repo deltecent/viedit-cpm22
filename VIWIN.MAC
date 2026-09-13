@@ -29,6 +29,7 @@
         PUBLIC  GBMVDN, GBMVUP, CURLN, CURWLN, CURCOL, CURDCO
         PUBLIC  GBPGDN, GBPGUP, GBGOTOL, GBGOAB
         PUBLIC  GBNLNS, NLNVAL
+        PUBLIC  NAVSAV          ; SPILLTOP/REWIND track it across a paging slide
 
         CSEG
 
@@ -611,12 +612,15 @@ GBGOAB:
         MOV     C,A
         MOV     A,H
         SBB     D
-        MOV     B,A             ; BC = target - current (signed 16-bit)
-        ORA     C
-        JZ      GOA_AT          ; already on the target line
+        MOV     B,A             ; BC = target - current (mod 2^16); CY = target<current
+        ; Decide direction on the UNSIGNED borrow, not the sign bit: bare G passes
+        ; target = 0FFFFH to mean "document end", which a signed test reads as a
+        ; negative delta and wrongly pages UP to line 0.  MOV does not touch flags,
+        ; so CY from SBB still stands here.
+        JC      GOA_UP          ; unsigned target < current -> move up
         MOV     A,B
-        ORA     A
-        JM      GOA_UP          ; target < current -> move up
+        ORA     C
+        JZ      GOA_AT          ; target == current -> already there
 ;--- move down BC lines (BC > 0) ---
 GOA_DL:
         PUSH    B

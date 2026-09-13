@@ -52,6 +52,7 @@
         EXTRN   CURWLN          ; VIWIN: window-relative line of the cursor
         EXTRN   URESET          ; VICMDUND: disable undo (page op invalidates it)
         EXTRN   MKPGTOP, MKPGBOT, MKPGRW ; VICMDUND: relocate marks on a page op
+        EXTRN   NAVSAV          ; VIWIN: GBMVDN/GBMVUP no-move restore target
 
         PUBLIC  VMODE, VMALLOW, WINCAP, GAPRSV
         PUBLIC  BYTABOVE, BYTBELOW, LINABOVE, LINBELOW, OUTREC, RIGHTREC
@@ -360,6 +361,15 @@ ST_STT:
         LXI     H,LINABOVE
         CALL    ADD24
 ST_DONE:
+        ; NAVSAV holds GBMVDN/GBMVUP's pending no-move restore target as a cursor
+        ; offset.  The slide shifted every offset down 128, so shift NAVSAV too --
+        ; otherwise a spill triggered mid-move (e.g. GBMLNE paging the last line's
+        ; end resident during a bare G) leaves NAVRST chasing a now-past-EOF offset
+        ; and it spins forever.  Dead outside a move; harmless to track always.
+        LHLD    NAVSAV
+        LXI     D,0-128
+        DAD     D
+        SHLD    NAVSAV
         CALL    URESET          ; page op: pending undo is no longer safe
         CALL    MKPGTOP         ; slide marks down 128 / drop the spilled ones
         ORA     A               ; CY clear = success
@@ -524,10 +534,25 @@ FF_RD:
         INR     B
         JMP     FF_RD
 FF_EOF:
-        ; the original file has no more real bytes below: mark the tail exhausted
-        ; so GBNLNS knows the count is exact once nothing remains in $$B either.
+        ; The original tail is exhausted (IRGETB hit ^Z / physical EOF).  Mark it
+        ; so GBNLNS can firm up the total -- and, crucially, make BYTBELOW EXACT
+        ; now that no unread original bytes remain: the only text still below the
+        ; window is the $$B records (RIGHTREC * 128).  VMLDIN seeded BYTBELOW from
+        ; a record count that rounded the final partial record UP to 128, so up to
+        ; 127 phantom padding bytes stayed counted as "below" -- bytes IRGETB will
+        ; never deliver.  Left in place, that phantom makes FILLFWD keep looking
+        ; below the true last line: bare G (0FFFFH target -> page down past EOF to
+        ; clamp) then walks the cursor PAST line 899 and the restore/redraw spins
+        ; chasing bytes that never arrive.  Recompute from $$B so it is precise.
         MVI     A,1
         STA     TAILEOF
+        MOV     A,B
+        STA     VMK             ; K = partial bytes read this fill (may be 0)
+        CALL    FFSETBEL        ; BYTBELOW = RIGHTREC*128 (excludes the K just read)
+        LDA     VMK
+        ORA     A
+        JZ      FF_NO           ; read nothing -> place nothing, nothing below
+        JMP     FF_PLACE        ; place the K partial bytes into the window
 FF_RDN:
         MOV     A,B
         STA     VMK
@@ -606,6 +631,32 @@ FF_NO:
         RET
 
 ;============================================================
+; FFSETBEL - BYTBELOW := RIGHTREC * 128, the exact byte count still below the
+; window once the original tail is exhausted (only whole $$B records remain).
+; RIGHTREC is a 16-bit record count; <<7 yields a 24-bit byte count.  Clobbers
+; A, B, HL.
+;============================================================
+FFSETBEL:
+        LHLD    RIGHTREC        ; HL = RIGHTREC (records)
+        SHLD    BYTBELOW        ; low, mid  (BYTBELOW is little-endian 24-bit)
+        XRA     A
+        STA     BYTBELOW+2      ; high = 0
+        MVI     B,7             ; * 128 == << 7
+FFSB_LP:
+        LDA     BYTBELOW
+        ADD     A               ; << 1 ; CY = old bit 7
+        STA     BYTBELOW
+        LDA     BYTBELOW+1
+        RAL                     ; << 1 through CY
+        STA     BYTBELOW+1
+        LDA     BYTBELOW+2
+        RAL
+        STA     BYTBELOW+2
+        DCR     B
+        JNZ     FFSB_LP
+        RET
+
+;============================================================
 ; REWIND - bring one above-record (top of name.$$$) back into the window top.
 ; Frees gap via SPILLBOT first if needed.  Above records are always full 128.
 ; Exit: CY clear on success; CY set if nothing is above.
@@ -681,6 +732,13 @@ RW_GAP:
         LXI     H,LINABOVE
         CALL    SUB24
 RW_DONE:
+        ; 128 bytes came back on the front, shifting every offset up 128.  Track
+        ; NAVSAV (GBMVDN/GBMVUP's no-move restore target) the same way, so a REWIND
+        ; fired mid-move cannot leave NAVRST chasing a stale offset.
+        LHLD    NAVSAV
+        LXI     D,128
+        DAD     D
+        SHLD    NAVSAV
         CALL    URESET          ; page op: pending undo is no longer safe
         CALL    MKPGRW          ; 128 bytes came back on the front: marks += 128
         ORA     A

@@ -953,6 +953,22 @@ def main():
     finally:
         eb.close()
 
+    # (c) bare G pages to the LAST line, not the first.  G passes the 0FFFFH
+    #     "document end" sentinel to GBGOAB; a signed direction test read that as
+    #     negative and paged UP to line 0 instead of down to the tail.  gg must
+    #     still reach the head.
+    eb = Editor(big)
+    try:
+        eb.key('G', idle=8000)
+        gl = _lines(eb)
+        check('oversize G reaches the last line (not the first)',
+              any('row 00899' in ln for ln in gl) and not gl[0].startswith('row 00000'))
+        eb.key('gg', idle=8000)
+        check('oversize gg returns to the first line',
+              _lines(eb)[0].startswith('row 00000'))
+    finally:
+        eb.close()
+
     # --- batch 8: configurable geometry (/Ln /Cn /R, VIEDIT.CFG) ---
     # /R : read-only -> :w refuses
     e = Editor(content, args=' /R')
