@@ -133,8 +133,9 @@ VM_CS:  MOV     A,M
         CALL    FILLFCB
         CALL    SETFNM           ; BD_FNAME = DFTFCB[0..11]
         CALL    FIOPEN
-        ; RAM-only: FIOPEN returns A=1 if the file is too large to hold resident
-        ; (paging to scratch is unusably slow on a real Altair).  Refuse it.
+        ; FIOPEN loads the file: fully resident when it fits, else virtual (a
+        ; window paged to scratch).  A=1 only for a file so large it exceeds the
+        ; 16M-record gate -- genuinely uneditable; refuse it.
         ORA     A
         JNZ     VM_TOOBIG
         CALL    WININIT          ; reset line caches
@@ -1283,7 +1284,7 @@ SCRL1:   DB     0               ; scroll pending: signed delta, +N down / -N up 
 LNOP:    DB     0               ; structural 1-line change: 1=ins(o/O) 2=del(dd) 3=join(J)
 
 NOMEM:   DB     'Not enough memory',CR,LF,NUL
-TOOBIGM: DB     'File too large to edit in available memory',CR,LF,NUL
+TOOBIGM: DB     'File too large to edit',CR,LF,NUL
 CLRHOME: DB     ESC,'[','2','J',ESC,'[','H',NUL
 
 BDESC0:  DS     BD_SIZE

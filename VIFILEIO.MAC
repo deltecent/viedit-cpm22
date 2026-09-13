@@ -24,7 +24,7 @@
         INCLUDE VI.INC
 
         EXTRN   BDFLD, GBLDHW, GBSTHW, GBMVTOP
-        EXTRN   VMODE, VMALLOW, GAPRSV, VMLDIN   ; VIVM: virtual-buffer engine
+        EXTRN   VMODE, GAPRSV, VMLDIN   ; VIVM: virtual-buffer engine
         EXTRN   OUTREC, RIGHTREC                 ; VIVM: scratch record counts
 
         PUBLIC  FIOPEN, FISAVE, INFCB, OUTFCB, IRGETB, INRDLN, IRINIT
@@ -244,15 +244,14 @@ FIO_NEW:
         RET
 
 ;------------------------------------------------------------
-; FIO_TOOBIG - the file does not fit resident.  Refuse (A=1, as before) unless
-; virtual mode is permitted (the /W switch set VMALLOW), in which case load a
-; partial window and page the rest to disk.
+; FIO_TOOBIG - the file does not fit resident, so run it virtual: load a partial
+; window and page the rest to disk.  The window is the full TPA for a real
+; oversize file, or the forced-tiny /W<n> window when that test knob is set
+; (VMWCAP already shrank the buffer at init in that case).  Genuinely absurd
+; files (>= 16M records) never reach here -- the size gate refuses those.
 ; Entry: DE = file size in 128-byte records (from the size gate).
 ;------------------------------------------------------------
 FIO_TOOBIG:
-        LDA     VMALLOW
-        ORA     A
-        JZ      FIO_BIG          ; virtual not permitted -> refuse
 FIO_VLOAD:
         CALL    VMLDIN           ; VMODE=1 + counters; HL = records to load
         MVI     B,7

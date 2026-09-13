@@ -15,9 +15,11 @@ This file is a high-level overview. The full end-user manual is
   (the default — keystrokes move and edit) and **insert mode** (keystrokes are
   text). `ESC` always returns to command mode. The status line shows
   `-- INSERT --` / `-- REPLACE --` when applicable.
-- **Edits entirely in RAM.** The whole file is held resident, so every
-  operation is fast (no paging to disk). The trade-off is a hard size ceiling
-  (see *Limitations*).
+- **Edits in RAM, pages when it must.** A file that fits the TPA is held
+  resident, so every operation is fast (no paging to disk). A file too large to
+  fit switches automatically to a paged **virtual mode** — a window slides over
+  the document while the rest lives in disk scratch — so size is no longer a hard
+  ceiling, at some cost in speed and a few restrictions (see *Limitations*).
 - **Byte-for-byte preservation.** What you open is what you save, apart from
   your edits — lone `CR`s, bare `LF`s, and a missing final newline are all kept.
   New files use standard CP/M `CR`,`LF` lines with a trailing `^Z` pad.
@@ -90,11 +92,17 @@ See [`VIEDIT.md`](VIEDIT.md) for full descriptions and examples.
 
 ## Limitations
 
-- **File size is bounded by available RAM.** VIEDIT loads the whole file into
-  the TPA. A file that will not fit is refused up front with
-  *"File too large to edit in available memory"* — it is never opened in a
-  degraded state. The exact ceiling scales with your TPA (roughly 24 KB on a
-  56K system).
+- **Large files edit in virtual mode, with restrictions.** A file that fits the
+  TPA (roughly 24 KB on a 56K system) is held fully resident and fast. A larger
+  file opens automatically in **virtual mode**, paging a sliding window to two
+  scratch files (`name.$$$`, `name.$$B`) beside it. Virtual mode is slower
+  (scrolling and searching far do disk I/O), limits **undo** to the current
+  window (`u` becomes a no-op once the window pages), **loses a mark that scrolls
+  out** of the window, makes a save **terminal** (you save and quit — the scratch
+  is consumed), and shows an **approximate** `^G` line total (`>=N`) until the
+  tail pages in. It needs free disk space for the scratch, cleaned up on quit.
+  Only a genuinely enormous file (beyond ~2 GB) is still refused, with *"File too
+  large to edit"*.
 - **Single-level undo.** `u` undoes only the most recent change (there is no
   redo, and no undo history). `.` repeats the last change.
 - **Bounded yank/undo range.** A single operation must fit the yank/undo

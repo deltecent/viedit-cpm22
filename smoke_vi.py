@@ -887,13 +887,29 @@ def main():
     check('search far off-page: full repaint',
           'omega' in e.screen().render() and '\x1b[H' in e.since(m))
 
-    # --- batch 7b: RAM-only -- a file too large for the buffer is rejected ---
-    # (Editing is RAM-only; paging to scratch is unusably slow on real hardware,
-    # so a file that won't fit is refused with a message instead.)
+    # --- batch 7b: an oversize file auto-activates virtual mode (no /W) -------
+    # A file too big to hold resident used to be refused; it now loads a partial
+    # window automatically and pages the rest to scratch, using the full TPA as
+    # the window (the /W<n> knob only forces a smaller test window).
     big = ('\r\n'.join('row %05d ' % i + '.' * 30 for i in range(900)) + '\r\n').encode()
     eb = Editor(big)
-    check('oversize file rejected with message',
-          'too large' in eb.screen().render().lower())
+    check('oversize file auto-loads (not refused)',
+          'too large' not in eb.screen().render().lower())
+    check('oversize file renders its head', _lines(eb)[0].startswith('row 00000'))
+    check('oversize file activates virtual mode', eb.s.mem(SYM['VMODE'], 1)[0] == 1)
+    _bb = eb.s.mem(SYM['BYTBEL'], 3)
+    check('oversize file pages the tail below the window',
+          (_bb[0] | (_bb[1] << 8) | (_bb[2] << 16)) > 0)
+    eb.close()
+    # and it saves byte-exact: a virtual :wq reconstructs the whole document from
+    # the resident window ++ the unread original tail (full-TPA window, not /W).
+    eb = Editor(big)
+    try:
+        eb.key(':wq\r', idle=5000)
+        check('oversize file round-trips byte-exact (auto virtual :wq)',
+              bytes(eb.diskfile('TEST', 'TXT')).rstrip(b'\x1a') == big)
+    finally:
+        eb.close()
 
     # --- batch 8: configurable geometry (/Ln /Cn /R, VIEDIT.CFG) ---
     # /R : read-only -> :w refuses

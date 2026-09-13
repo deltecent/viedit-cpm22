@@ -5,9 +5,9 @@ A **vi**-style full-screen text editor for CP/M 2.2.
 VIEDIT brings the modal editing model of Bill Joy's `vi` to an 8-bit CP/M
 system. It runs on any CP/M 2.2 machine with enough free TPA (Transient Program
 Area) — it is not tied to a particular memory size. It drives any
-VT100-compatible terminal, edits files entirely in RAM for speed, and preserves
-your file's exact byte layout (including stray carriage returns and missing
-final newlines) on save.
+VT100-compatible terminal, edits files that fit entirely in RAM for speed (and
+larger files by paging to disk — see §3.4), and preserves your file's exact byte
+layout (including stray carriage returns and missing final newlines) on save.
 
 ---
 
@@ -120,19 +120,39 @@ A terminal that does not support the query simply stays silent; VIEDIT waits
 briefly, then falls back to the 80×24 default (or whatever you set). The wait is
 short, so startup is never noticeably delayed.
 
-### 3.4 Memory limit
+### 3.4 File size — RAM and virtual mode
 
-VIEDIT edits entirely in RAM, which keeps every operation fast. The editable
-file size therefore depends on how much TPA your CP/M system provides: the
-larger the TPA, the larger the file you can open. A file that will not fit in
-the available buffer is refused up front with:
+A file that fits in the TPA is edited **entirely in RAM**, so every operation is
+fast. The larger the TPA, the larger the file that fits (roughly 24 KB on a 56K
+system). Nothing about this changes for files that fit — it is the same fast
+editor it has always been.
 
-```
-File too large to edit in available memory
-```
+A file that will **not** fit is not refused: VIEDIT switches automatically to
+**virtual mode**. It loads as much of the file as the buffer holds and slides
+that window over the document as you move, paging the rest to two scratch files
+next to the edited file — `name.$$$` (text scrolled off the top) and `name.$$B`
+(text scrolled off the bottom). You edit an arbitrarily large file with the same
+keys; only the parts near the cursor are resident. This needs free disk space on
+the edited file's drive for the scratch, which is removed when you quit.
 
-and you are returned to CP/M. This is deliberate: a file that does not fit is
-better refused than opened and left sluggish.
+Virtual mode trades some capability for the extra reach:
+
+- **It is slower.** Scrolling far, or a search that has to scan past the window,
+  reads and writes the disk as the window slides — there is no way to interrupt
+  a long search on real hardware.
+- **Undo is limited to the current window.** As soon as the window pages, `u`
+  becomes a safe no-op; it does not reach back across a page boundary.
+- **A mark that scrolls out of the window is lost.** A mark still inside the
+  window tracks its text as the window slides; jumping to one that has paged out
+  reports *"Mark not set"*.
+- **Saving is terminal.** A virtual `:w`/`:wq` reconstructs the whole document
+  from the window plus the scratch and the unread tail; it consumes the scratch,
+  so you save and quit — you cannot keep editing after a virtual save.
+- **`^G`'s total is approximate.** Until the tail has paged through, the line
+  count shows as `>=N`; it firms up as more of the file becomes resident.
+
+Only a genuinely enormous file (beyond roughly 2 GB) is still refused up front,
+with `File too large to edit`, returning you to CP/M.
 
 ---
 
