@@ -911,6 +911,48 @@ def main():
     finally:
         eb.close()
 
+    # --- batch 7c: virtual-mode paging stress (auto full-TPA window) ---------
+    # Sweep the cursor over the WHOLE document and back, then far-jump-edit at
+    # scattered depths.  This drives every paging primitive many times over on a
+    # real oversize file: FILLFWD + SPILLTOP descending, REWIND + SPILLBOT
+    # ascending, GBINSRT gap-full spill on the mid-document insert.  A RAM-only
+    # oracle is impossible (the file does not fit RAM), so the oracle is the same
+    # edit modelled in Python.
+    #
+    # (a) full down-then-up sweep with no edits must preserve the file byte-exact:
+    #     if any primitive dropped or duplicated a record while the window slid
+    #     across the entire document twice, the save would not match.
+    eb = Editor(big)
+    try:
+        eb.key(':900\r', idle=8000)      # to the last line: page fully forward
+        eb.key(':1\r',   idle=8000)      # back to the top:  page fully back
+        eb.key(':wq\r',  idle=8000)
+        check('oversize full down+up sweep preserves bytes (no edit)',
+              bytes(eb.diskfile('TEST', 'TXT')).rstrip(b'\x1a') == big)
+    finally:
+        eb.close()
+
+    # (b) far-jump edits at scattered depths, save-compared to a Python model of
+    #     the same three edits (delete deep line, insert near top, delete middle).
+    dl = [('row %05d ' % i).encode() + b'.' * 30 for i in range(900)]
+    del dl[849]                                  # :850 dd
+    dl.insert(20, b'INSERTED NEAR THE TOP')      # :20  o<text>ESC  (opens below 20)
+    del dl[429]                                  # :430 dd  (in the post-insert doc)
+    expected = b'\r\n'.join(dl) + b'\r\n'
+    eb = Editor(big)
+    try:
+        eb.key(':850\r', idle=8000)              # deep forward paging
+        eb.key('dd',     idle=4000)
+        eb.key(':20\r',  idle=8000)              # far back: reverse paging
+        eb.key('oINSERTED NEAR THE TOP\x1b', idle=4000)
+        eb.key(':430\r', idle=8000)              # forward again to the middle
+        eb.key('dd',     idle=4000)
+        eb.key(':wq\r',  idle=8000)
+        check('oversize far-jump edits round-trip byte-exact',
+              bytes(eb.diskfile('TEST', 'TXT')).rstrip(b'\x1a') == expected)
+    finally:
+        eb.close()
+
     # --- batch 8: configurable geometry (/Ln /Cn /R, VIEDIT.CFG) ---
     # /R : read-only -> :w refuses
     e = Editor(content, args=' /R')
