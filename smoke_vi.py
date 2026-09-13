@@ -1195,6 +1195,68 @@ def main():
           after[0] == before[0] == 100)
     check('/W search miss restores the cursor to the origin col', after[1] == before[1])
 
+    # --- Phase 6 acceptance: undo safe-no-op after a page; marks relocate ---
+    # Undo and marks are limited to the resident window.  Any page op (SPILLTOP/
+    # SPILLBOT/FILLFWD/REWIND) calls URESET, so `u` becomes a safe no-op once the
+    # window has slid; marks are logical window offsets that the page primitives
+    # relocate (-=128 on a top spill, +=128 on a rewind) or drop (a mark that
+    # pages off an edge is unset).  RAM-only never runs the primitives, so undo
+    # and marks there stay byte-for-byte as the earlier batches already checked.
+
+    # undo WITHIN the window still works in virtual mode (no page op fired).
+    e = Editor(vcontent, args=' /W2048')
+    try:
+        e.key('x')                              # delete '0' at row 0 col 0
+        r_after_x = e.screen().render().split('\n')[0]
+        e.key('u')                              # undo -> restored
+        r_after_u = e.screen().render().split('\n')[0]
+    finally:
+        e.close()
+    check('/W: in-window edit changes the line', r_after_x == '000 hello world')
+    check('/W: in-window undo restores the line', r_after_u == '0000 hello world')
+
+    # undo is a safe NO-OP after a page op.  Two virtual editors both edit at the
+    # top then page down and back; one also presses `u`.  If the page made `u` a
+    # no-op, the edit survives in BOTH and the renders are identical.
+    def _v6(keys):
+        ed = Editor(vcontent, args=' /W2048')
+        try:
+            for k in keys:
+                ed.key(k, idle=3500)
+            return ed.screen().render().split('\n')[:23]
+        finally:
+            ed.close()
+    noundo = _v6(['x', 'j' * 150, 'k' * 150])          # edit, page down+up
+    withu  = _v6(['x', 'j' * 150, 'k' * 150, 'u'])     # ... then u (should no-op)
+    check('/W: u after a page is a no-op (renders identical)', noundo == withu)
+    check('/W: the pre-page edit survives (u did not undo it)',
+          noundo[0] == '000 hello world')
+
+    # a mark that pages off the top is unset: set at line 1, then scroll past it.
+    e = Editor(vcontent, args=' /W2048')
+    try:
+        e.key('ma')                             # mark a at line 1 (top)
+        e.key('j' * 150, idle=3500)             # page down; line 1 evicted -> gone
+        e.key('`a')                             # jump to mark a
+        msg = e.screen().render()
+    finally:
+        e.close()
+    check('/W: a mark paged off the top is unset', 'Mark not set' in msg)
+
+    # a mark that STAYS resident relocates correctly across paging: set it deep,
+    # scroll further down (each SPILLTOP slides it -=128), then jump back to it.
+    e = Editor(vcontent, args=' /W2048')
+    try:
+        e.key('j' * 150, idle=3500)             # to line 151
+        e.key('ma')                             # mark a at line 151
+        e.key('j' * 20, idle=3500)              # page further; top spills, mark tracks
+        e.key('`a', idle=3500)                  # jump back to mark a
+        ln = _gstat(e)[0]
+    finally:
+        e.close()
+    check('/W: a resident mark relocates correctly across paging (line 151)',
+          ln == 151)
+
     # --- bugs.txt: word motions w/b/e vs W/B/E (punctuation boundaries) ---
     cp = b'foo.bar baz\r\nsecond line\r\n'   # f0 o1 o2 .3 b4 a5 r6 _7 b8 a9 z10
     e = Editor(cp); e.key('w')

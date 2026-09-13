@@ -50,6 +50,8 @@
         EXTRN   IRGETB          ; VIFILEIO: buffered original-tail byte reader
         EXTRN   NEDIT           ; VISCREEN: edit-area row count (VMFILL depth)
         EXTRN   CURWLN          ; VIWIN: window-relative line of the cursor
+        EXTRN   URESET          ; VICMDUND: disable undo (page op invalidates it)
+        EXTRN   MKPGTOP, MKPGBOT, MKPGRW ; VICMDUND: relocate marks on a page op
 
         PUBLIC  VMODE, VMALLOW, WINCAP, GAPRSV
         PUBLIC  BYTABOVE, BYTBELOW, LINABOVE, LINBELOW, OUTREC, RIGHTREC
@@ -358,6 +360,8 @@ ST_STT:
         LXI     H,LINABOVE
         CALL    ADD24
 ST_DONE:
+        CALL    URESET          ; page op: pending undo is no longer safe
+        CALL    MKPGTOP         ; slide marks down 128 / drop the spilled ones
         ORA     A               ; CY clear = success
         RET
 ST_NO:
@@ -446,6 +450,9 @@ SB_CP:
         LXI     H,LINBELOW
         CALL    ADD24
 SB_DN:
+        CALL    URESET          ; page op: pending undo is no longer safe
+        LHLD    BDESC0+BD_TXEND ; new window end
+        CALL    MKPGBOT         ; drop marks at/past the new end (they paged out)
         ORA     A
         RET
 SB_NO:
@@ -591,6 +598,7 @@ FF_PLACE:
         LHLD    BDESC0+BD_TXEND
         DAD     D
         SHLD    BDESC0+BD_TXEND
+        CALL    URESET          ; page op: pending undo is no longer safe
         ORA     A               ; CY clear
         RET
 FF_NO:
@@ -673,6 +681,8 @@ RW_GAP:
         LXI     H,LINABOVE
         CALL    SUB24
 RW_DONE:
+        CALL    URESET          ; page op: pending undo is no longer safe
+        CALL    MKPGRW          ; 128 bytes came back on the front: marks += 128
         ORA     A
         RET
 RW_NO:

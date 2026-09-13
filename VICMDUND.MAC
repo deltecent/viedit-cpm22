@@ -7,6 +7,7 @@
 ;============================================================
         INCLUDE VI.INC
         PUBLIC  CNTGET, GCLR, MKDEL, MKGET, MKIDXA, MKINS
+        PUBLIC  MKPGTOP, MKPGBOT, MKPGRW
         PUBLIC  OPLSHL, OPLSHR, REPN, SETDRTY, SETGOAL, SETLINE
         PUBLIC  UBEGD, UBEGI, UBS1, UDEL1, UINS1, URECPUT
         PUBLIC  URESET, VADVG, VC_BTICK, VC_DOT, VC_MARK, VC_QUOTE
@@ -343,6 +344,129 @@ MKS_NX:
         INX     H
         DCR     B
         JNZ     MKS_LP
+        RET
+
+;============================================================
+; MKPGTOP / MKPGBOT / MKPGRW - relocate marks when the virtual window slides a
+; 128-byte record on/off an edge.  Marks are logical (gap-free) offsets into the
+; window, so a page op changes them uniformly:
+;   MKPGTOP (SPILLTOP) - the front 128 logical bytes left the window: every mark
+;                        -= 128; a mark that was in that record (< 128) is gone
+;                        (it paged out to name.$$$) -> unset it.
+;   MKPGBOT (SPILLBOT) - the last 128 logical bytes left the window: a mark at or
+;                        past the new end (HL = new TXEND) paged out -> unset it;
+;                        the rest keep their offset (the front is unchanged).
+;   MKPGRW  (REWIND)   - 128 logical bytes came back onto the front: every mark
+;                        += 128 (the record that was rewound carried no marks --
+;                        MKPGTOP unset them when it spilled -- so nothing to add).
+; FILLFWD appends at the window end, so surviving marks are untouched (its inner
+; SPILLTOP, if any, already ran MKPGTOP).  MKANY fast-out keeps the no-marks case
+; free.  Called only from the virtual primitives (VMODE=1); RAM-only never runs
+; them, so marks there behave exactly as before.
+;============================================================
+MKPGTOP:
+        LDA     MKANY
+        ORA     A
+        RZ
+        LXI     H,MARKS
+        MVI     B,26
+MPT_LP:
+        MOV     E,M
+        INX     H
+        MOV     D,M             ; DE = mark, HL at high byte
+        MOV     A,D
+        ANA     E
+        INR     A
+        JZ      MPT_NX          ; 0FFFFH -> unset
+        MOV     A,D
+        ORA     A
+        JNZ     MPT_SUB         ; high byte set -> mark >= 256 -> safe to subtract
+        MOV     A,E
+        CPI     128
+        JC      MPT_INV         ; mark < 128 -> it paged out the top
+MPT_SUB:
+        MOV     A,E
+        SUI     128
+        MOV     E,A
+        MOV     A,D
+        SBI     0
+        MOV     D,A
+        JMP     MPT_ST
+MPT_INV:
+        LXI     D,0FFFFH
+MPT_ST:
+        MOV     M,D             ; HL at high byte
+        DCX     H
+        MOV     M,E
+        INX     H
+MPT_NX:
+        INX     H
+        DCR     B
+        JNZ     MPT_LP
+        RET
+
+MKPGRW:
+        LDA     MKANY
+        ORA     A
+        RZ
+        LXI     H,MARKS
+        MVI     B,26
+MPR_LP:
+        MOV     E,M
+        INX     H
+        MOV     D,M             ; DE = mark, HL at high byte
+        MOV     A,D
+        ANA     E
+        INR     A
+        JZ      MPR_NX          ; unset
+        MOV     A,E
+        ADI     128
+        MOV     E,A
+        MOV     A,D
+        ACI     0
+        MOV     D,A
+        MOV     M,D             ; HL at high byte
+        DCX     H
+        MOV     M,E
+        INX     H
+MPR_NX:
+        INX     H
+        DCR     B
+        JNZ     MPR_LP
+        RET
+
+; MKPGBOT - entry HL = new TXEND (threshold).  Unset marks >= threshold.
+MKPGBOT:
+        SHLD    MKSHT           ; threshold (page op never overlaps a range op)
+        LDA     MKANY
+        ORA     A
+        RZ
+        LXI     H,MARKS
+        MVI     B,26
+MPB_LP:
+        MOV     E,M
+        INX     H
+        MOV     D,M             ; DE = mark, HL at high byte
+        MOV     A,D
+        ANA     E
+        INR     A
+        JZ      MPB_NX          ; unset
+        PUSH    H
+        LHLD    MKSHT           ; HL = threshold
+        MOV     A,E
+        SUB     L
+        MOV     A,D
+        SBB     H               ; mark - threshold ; CY set iff mark < threshold
+        POP     H
+        JC      MPB_NX          ; mark < threshold -> keep
+        MVI     M,0FFH          ; HL at high byte
+        DCX     H
+        MVI     M,0FFH
+        INX     H
+MPB_NX:
+        INX     H
+        DCR     B
+        JNZ     MPB_LP
         RET
 
 ; Line shift: >> / << (normal, count-aware).  Operate on the
