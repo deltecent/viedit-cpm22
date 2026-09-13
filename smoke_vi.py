@@ -396,7 +396,10 @@ def main():
     e = Editor(b'one\r\ntwo\r\n')
     e.key('>>'); e.key(':w\r')
     check('>> inserts a leading tab', _file(e) == b'\tone\r\ntwo\r\n')
-    e.key('<<'); e.key(':w\r')
+    # _file() force-quits the editor (diskfile -> _ensure_ccp), so we cannot keep
+    # editing this same `e`.  Verify the >> then << round-trip in its own editor.
+    e = Editor(b'one\r\ntwo\r\n')
+    e.key('>>'); e.key('<<'); e.key(':w\r')
     check('<< removes the leading tab', _file(e) == b'one\r\ntwo\r\n')
     e = Editor(b'a\r\nb\r\nc\r\n')
     e.key('2>>'); e.key(':w\r')
