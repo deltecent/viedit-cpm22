@@ -238,14 +238,30 @@ OP_LINE:
 OPL_FULL:
         MVI     B,1
         CALL    DDLINES
+        CALL    DDCEOF          ; deleted the last line -> up to the new last line
         JMP     SETDRTY
 OPL_MULTI:
         CALL    DDLINES         ; B = count: delete N lines, one record + yank
+        CALL    DDCEOF          ; range ran to EOF -> up off the phantom last line
         JMP     SETDRTY
 OPL_YANK:
         CALL    CNTGET          ; B = count
         CALL    YANKLNS         ; yank N lines (cursor restored)
         JMP     YNKSTAT         ; 'N line(s) yanked' on the status row
+
+;------------------------------------------------------------
+; DDCEOF - after a dd/Ndd, if the deletion ran to end-of-buffer the cursor is
+; left on the phantom empty line PAST the last text line (offset == TXEND, so
+; R2 is empty).  vi moves the cursor UP to the new last line -- do that here.
+; A real line remaining at/below the cursor (R2 non-empty) is the ordinary case
+; and is left untouched.  When the buffer is now empty GBMVUP is a safe no-op
+; (it stays at beginning-of-buffer, row 0).
+;------------------------------------------------------------
+DDCEOF:
+        CALL    GBPKRT          ; A = byte at cursor; FF if R2 empty (at EOF)
+        CPI     0FFH
+        RNZ                     ; a real line remains -> leave the cursor
+        JMP     GBMVUP          ; on the phantom last line -> up to the new last
 
 ;------------------------------------------------------------
 ; YNKSTAT - status row 'N line(s) yanked'.  N = LF count in YBUF[0..YLEN)

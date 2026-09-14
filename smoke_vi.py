@@ -508,6 +508,27 @@ def main():
     check('Enter at EOF: saves one terminated line',
           bytes(ee.diskfile('TEST', 'TXT')).rstrip(b'\x1a') == b'abcdefg\r\n')
 
+    # Insert-mode TAB in a blank buffer: VIEDIT must draw the tab as EXPANDED
+    # SPACES and then position the cursor with an ABSOLUTE move to the tab stop
+    # -- it must NOT emit a raw 0x09 and lean on the terminal's own tab stops
+    # (which vary by terminal type; a mismatch strands the cursor while the text
+    # sits at the stop).  Assert the emitted stream: no literal tab, an explicit
+    # column-9 reposition (1-based col 9 == display col 8), and cursor at col 8.
+    et2 = Editor(b'', fname='TEST.TXT')
+    et2.key('i')
+    m = et2.mark(); et2.key('\t', idle=2500)
+    tout = et2.since(m)
+    check('insert tab emits no raw 0x09', '\t' not in tout)
+    check('insert tab repositions cursor to the tab stop (ESC[...;9H)',
+          '[1;9H' in tout)
+    check('insert tab: cursor at tab stop col 8', et2.screen().col == 8)
+    et2.key('X', idle=2500)
+    check('insert tab: typed char lands at the tab stop (col 8)',
+          et2.screen().render().splitlines()[0] == '        X')
+    et2.key('\x1b', idle=1500); et2.key(':w\r', idle=3000)
+    check('insert tab: saves a literal tab',
+          bytes(et2.diskfile('TEST', 'TXT')).rstrip(b'\x1a') == b'\tX')
+
     # Bug 5: j/k track the DISPLAY column across tab-indented lines
     ej = Editor(b'abcdefghijk\r\n\tX\r\nZZZZZZZZZZ\r\n')
     ej.key('0')
@@ -707,6 +728,38 @@ def main():
     e.key('D')
     r = rows(e)
     check('D clears line 1, keeps rest', r[0] == '' and r[1] == 'second line')
+
+    # dd cursor placement across the edges.  Deleting the LAST line must move the
+    # cursor UP to the new last line (vi), not strand it on the now-empty phantom
+    # row past EOF.  A file ending in a trailing newline still counts its last
+    # visible line as "last" (DDLAST crosses the terminator to check for content).
+    ed = Editor(b'one\r\ntwo\r\nthree\r\n', fname='TEST.TXT')
+    ed.key('G', idle=2500); ed.key('dd', idle=2500)
+    check('dd last line: cursor moves up to new last line (row 1)', ed.screen().row == 1)
+    check('dd last line: text is one/two', rows(ed)[:3] == ['one', 'two', '~'])
+    ed.key('\x1b', idle=1000); ed.key(':w\r', idle=3000)
+    check('dd last line: saved one/two',
+          bytes(ed.diskfile('TEST', 'TXT')).rstrip(b'\x1a') == b'one\r\ntwo\r\n')
+
+    ed = Editor(b'one\r\ntwo\r\n', fname='TEST.TXT')   # last line of a 2-line file
+    ed.key('G', idle=2500); ed.key('dd', idle=2500)
+    check('dd last of two: cursor up to row 0', ed.screen().row == 0)
+
+    ed = Editor(b'solo\r\n', fname='TEST.TXT')          # only line -> empty buffer
+    ed.key('dd', idle=2500)
+    check('dd only line: cursor stays row 0 (empty buffer)', ed.screen().row == 0)
+    check('dd only line: row 0 is the empty line, ~ below', rows(ed)[:2] == ['', '~'])
+    ed.key('\x1b', idle=1000); ed.key(':w\r', idle=3000)
+    check('dd only line: buffer emptied',
+          bytes(ed.diskfile('TEST', 'TXT')).rstrip(b'\x1a') == b'')
+
+    ed = Editor(b'one\r\ntwo\r\nthree\r\n', fname='TEST.TXT')  # 2dd running to EOF
+    ed.key('2G', idle=2500); ed.key('2dd', idle=2500)
+    check('2dd to EOF: cursor up off the phantom line (row 0)', ed.screen().row == 0)
+
+    ed = Editor(b'one\r\ntwo\r\nthree\r\n', fname='TEST.TXT')  # dd in the middle
+    ed.key('2G', idle=2500); ed.key('dd', idle=2500)
+    check('dd middle: cursor stays on the shifted-up line (row 1)', ed.screen().row == 1)
 
     # --- sub-batch 3: C / cc / S / s (change family) ---
     e = Editor(content)

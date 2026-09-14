@@ -1151,12 +1151,21 @@ YLNS_DN:
 DDLAST:
         CALL    GBCSOF          ; HL = cursor byte offset
         PUSH    H               ; save cursor offset
-        CALL    GBMLNE          ; to just before this line's break
+        CALL    GBMLNE          ; -> just before this line's terminator (or EOB)
         CALL    PKRTF           ; A = byte right of cursor; Z if EOF
-        MVI     A,0
-        JNZ     DDL_NO
+        JZ      DDL_YES         ; no terminator at all -> genuinely the last line
+        ; A terminator follows; cross it and see if any CONTENT remains.  A file
+        ; that ends in a trailing newline leaves the last VISIBLE line with a
+        ; terminator to its right but nothing after it -- that is still "last"
+        ; (deleting it must move the cursor UP, not scroll a line up from below).
+        CALL    GBMVRT          ; cross the CR,LF (or bare LF) as one unit
+        CALL    PKRTF           ; A = byte after the terminator; Z if EOF
+        JZ      DDL_YES         ; nothing follows -> last line
+        MVI     A,0             ; content follows -> not the last line
+        JMP     DDL_FIN
+DDL_YES:
         MVI     A,1
-DDL_NO:
+DDL_FIN:
         POP     H               ; HL = saved offset
         PUSH    PSW             ; save the result across the restore
         CALL    GOTOPOS
