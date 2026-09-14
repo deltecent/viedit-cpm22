@@ -143,6 +143,7 @@ command still fits CP/M's ~127-char console line.
 | `VIBUF` | gap-buffer text engine |
 | `VIWIN` | in-RAM line-navigation primitives |
 | `VIFILEIO` | file load / save |
+| `VIVM` | virtual buffering (paging text to disk) |
 | `VICMD` | command dispatch + motions |
 | `VICMDOPS` | operators `d`/`c`/`y` + insert/replace |
 | `VICMDEXC` | ex command line (`:`), `:r`/`:w`/`:e`/`:stat` |
@@ -158,7 +159,7 @@ timestamp.
 To rebuild on a CP/M system with M80 and L80 present, run `SUBMIT VIEDIT`: it
 assembles every module with M80 and links them with L80 into `VIEDIT.COM`.
 
-`VIEDIT.SUB` assumes all fourteen `.MAC` modules, `VI.INC`, and `VIBLD.INC` are
+`VIEDIT.SUB` assumes all fifteen `.MAC` modules, `VI.INC`, and `VIBLD.INC` are
 on the current drive. `VIBLD.INC` just defines the build-stamp string that
 `:stat` prints, so if you do not have one, a single line will do:
 
