@@ -68,17 +68,21 @@ def _quiet_for(idle):
 # reused N creations later while N others are made in between -- is 17.  A cap
 # strictly above that (e.g. 18-24) guarantees no editor is evicted before its
 # last use (verified: 322 passed / 3 failed at 24 -- the 3 are pre-existing).
-# _MAX_LIVE is set to 4 here to keep the host from being starved by ~20 live
-# simulators; at that setting the long-reach-back cases hit an evicted (quit)
-# editor and report spurious failures.  Raise it toward ~18-24 for a clean full
-# run; lower it to spare the machine.  WORK holds the per-instance scratch disks.
+# _MAX_LIVE caps how many simulators run at once, so the host is never starved
+# by a swarm of live sims.  Each test uses its editor(s) close to where it makes
+# them: no test reaches back to an editor created more than 3 editors earlier, so
+# the default cap of 4 (one held + three fresh) runs the whole suite cleanly.
+# Keep it that way -- if you add a test that holds an editor while creating
+# several others, make a fresh one instead of reaching back to the stale handle
+# (an evicted editor's sim is closed, and reusing it raises 'NoneType' on .send).
+# WORK holds the per-instance scratch disks.
 WORK = os.path.join(HERE, "_smoke_work")
 shutil.rmtree(WORK, ignore_errors=True)
 os.makedirs(WORK, exist_ok=True)
 _ids = itertools.count()
 _LIVE = []
-# Override with MAX_LIVE=N in the environment.  The body's deepest reach-back is
-# 17, so a cap of 18+ guarantees a clean run; the low default spares the host.
+# Override with MAX_LIVE=N in the environment (raise it for more parallelism on a
+# beefy host, lower it to spare a small one); the suite passes at the default 4.
 _MAX_LIVE = int(os.environ.get("MAX_LIVE", "4"))
 
 
@@ -459,6 +463,7 @@ def main():
     ee = Editor(b''); ee.key('\x07')
     check('^G of empty file is 1 of 1', 'line 1 of 1 col 1' in gstat(ee))
     # :stat diagnostics on the status row (RAM-only set: build stamp + buffer)
+    e = Editor(content)            # fresh: don't reach back to a possibly-evicted e
     e.key('gg')
     e.key(':stat\r')
     r = e.screen().render()
@@ -643,6 +648,7 @@ def main():
     check('^F (>256 lines) puts cursor on the top edit row', vf2.row == 0)
 
     # Bug 4: R overwrites in place ("first" -> "XYZst")
+    e = Editor(content)            # fresh: don't reach back to a possibly-evicted e
     e.key('0')
     e.key('R')
     v = e.screen()

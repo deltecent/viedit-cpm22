@@ -26,7 +26,7 @@ approach first so it can be corrected at the first wrong move.
 ```bash
 python3 build_vi.py          # build VIEDIT.COM (M80/L80)
 python3 build_vi.py KEYTST   # key-decoder test stub
-MAX_LIVE=20 python3 smoke_vi.py   # full-screen smoke test (see _MAX_LIVE below)
+python3 smoke_vi.py               # full-screen smoke test (see _MAX_LIVE below)
 ```
 
 `build_vi.py` produces `VIEDIT.COM` (22784 bytes) and `VIEDIT.SYM` here. The
@@ -91,9 +91,12 @@ rm VIEDIT.html
 
 - **One `altairsim --mcp` process per editor.** A concurrency cap
   (`_MAX_LIVE`, override with `MAX_LIVE=N`) evicts the oldest editor when
-  exceeded. The test body's deepest reach-back is **17**, so a cap of **18+**
-  gives a fully clean run; the default is **4** to spare the host (long
-  reach-back cases then hit an evicted editor and report spurious failures).
+  exceeded. No test reaches back to an editor created more than **3** editors
+  earlier, so the **default cap of 4** runs the whole suite cleanly (one held +
+  three fresh); raise it only for more parallelism on a beefy host. When adding
+  a test, use a **fresh** editor rather than reaching back to a stale handle
+  held across several other creations (an evicted editor's sim is closed, and
+  reusing it raises `'NoneType' object has no attribute 'send'`).
 - Each concurrent editor needs its **own** disk image (copied from
   `CPM22-8MB-56K-VIEDIT.DSK` into `_smoke_work/`): several sims are alive at
   once and each writes to its disk, so they cannot share one file.
@@ -128,4 +131,4 @@ smoke test's `_smoke_work/` scratch are regenerated each run.
 - **Build:** reproducible (VIEDIT.COM = 22784 bytes; KEYTST also builds).
   `SCRTST` is a stale Phase-2 stub: its `VISCREEN` references `MKDEL`/`MKINS`,
   which now exist only in the full VIEDIT link, so it fails to link.
-- **Smoke test:** 426 passed / 0 failed at `MAX_LIVE=20`.
+- **Smoke test:** 424 passed / 0 failed at the default `MAX_LIVE=4`.
