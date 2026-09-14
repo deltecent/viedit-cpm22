@@ -789,6 +789,28 @@ def main():
     r = rows(e)
     check('s substitutes one char', r[0] == 'Zirst line')
 
+    # ranged :s tolerates a space between the range and the command (issue #6):
+    # VIEDIT.md 9 documents ":'a,'b s/old/new/g" WITH a space, matching real vi.
+    es = Editor(b'aoa\r\nbob\r\ncoc\r\ndod\r\n')
+    es.key(':2,3 s/o/0/g\r', idle=3000)
+    check('ranged :s with a space before s substitutes',
+          rows(es)[:4] == ['aoa', 'b0b', 'c0c', 'dod'])
+
+    # the no-space form still works (regression guard)
+    es2 = Editor(b'aoa\r\nbob\r\ncoc\r\ndod\r\n')
+    es2.key(':1,4s/o/0/g\r', idle=3000)
+    check('ranged :s without a space still substitutes',
+          rows(es2)[:4] == ['a0a', 'b0b', 'c0c', 'd0d'])
+
+    # a mark range with a space, exactly as the manual's own example shows it
+    es3 = Editor(b'aoa\r\nbob\r\ncoc\r\ndod\r\n')
+    es3.key('j'); es3.key('ma')      # mark a on line 2
+    es3.key('jj'); es3.key('mb')     # mark b on line 4
+    es3.key("gg")
+    es3.key(":'a,'b s/o/0/g\r", idle=3000)
+    check("manual's :'a,'b s/.../ mark range with a space",
+          rows(es3)[:4] == ['aoa', 'b0b', 'c0c', 'd0d'])
+
     # --- sub-batch 4: count prefix (nG and repeats) ---
     e = Editor(content)            # 5 lines: first..fifth
     e.key('5G')

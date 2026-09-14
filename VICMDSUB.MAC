@@ -82,7 +82,13 @@ EX_SUB:
         LDA     RNGERR
         ORA     A
         JNZ     EXS_MERR        ; bad mark in the range
-        MOV     A,M
+EXS_SKSP:
+        MOV     A,M             ; classic vi tolerates spaces between the range
+        CPI     ' '             ; and the command (:'a,'b s/.../ -- VIEDIT.md 9)
+        JNZ     EXS_CMD
+        INX     H
+        JMP     EXS_SKSP
+EXS_CMD:
         ORA     A
         JZ      EX_GOTO         ; bare :N (or :M,N) with no command -> line goto
         CPI     's'
