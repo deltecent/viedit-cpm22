@@ -1070,6 +1070,26 @@ def main():
     finally:
         eb.close()
 
+    # --- issue #7: creating a NEW file with :wq must return to CP/M ------------
+    # The RAM-only save (FSV_PLAIN) ended by closing INFCB and RETurning with
+    # whatever BDOS FCLOSE left in A -- the file's directory code (0..3, or 0FFH
+    # if not found), NOT zero.  DOSAVE stores FISAVE's A in SVERR, and :wq only
+    # quits when SVERR==0, so a file whose directory entry did not happen to land
+    # in slot 0 wrote correctly ("...written") but never exited: the editor sat
+    # in command mode swallowing keys, looking hung (the Quick Start's own
+    # new-file scenario).  It reproduced "intermittently" only because the slot
+    # depends on the disk's directory layout.  A dummy file created first shifts
+    # the new file off slot 0, making the old bug deterministic here.
+    en = Editor(None, fname='NEW.TXT', extra={'DUM1.TXT': b'x\r\n'})
+    en.key('ihello world\x1b', idle=2000)
+    m = en.mark()
+    en.key(':wq\r', idle=3000)
+    check('issue #7: new-file :wq quits to CP/M (nonzero dir slot)',
+          'A0>' in en.since(m))
+    check('issue #7: new-file :wq saved the content',
+          bytes(en.diskfile('NEW', 'TXT')).rstrip(b'\x1a') == b'hello world')
+    en.close()
+
     # --- batch 8: configurable geometry (/Ln /Cn /R, VIEDIT.CFG) ---
     # /R : read-only -> :w refuses
     e = Editor(content, args=' /R')

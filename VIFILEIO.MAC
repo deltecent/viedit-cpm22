@@ -468,7 +468,12 @@ FSV_CL:
         LXI     D,INFCB
         MVI     C,BF_FCLOSE
         CALL    BDOS
-        RET
+        XRA     A               ; A = 0: saved OK.  (BDOS FCLOSE leaves the dir
+        RET                     ; code 0..3, or 0FFH, in A -- the caller stores it
+                                ; as SVERR and :wq only quits when SVERR=0, so a
+                                ; leaked nonzero code left the editor stuck after
+                                ; a successful write.  FSV_REN/FSV_RAMB already
+                                ; zero A here; this path must too.  (issue #7)
 
 ;============================================================
 ; FSV_REN - virtual-mode save (rename-based, terminal).  name.$$$ already holds
