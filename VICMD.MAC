@@ -1230,7 +1230,44 @@ VCBIGC:
         CALL    DELEOL          ; records the deleted text (UBEGD/UDEL1)
         CALL    SETLINE         ; insert mode counts insertions onto the record
         JMP     ENTINS
-VCBIGS:                        ; S and cc
+VCBIGS:                        ; S / cc / Ncc / c'a : change the line(s)
+        CALL    CNTGET          ; B = line count (RCNT clamped to 1..255)
+        MOV     A,B
+        CPI     1
+        JZ      VCBS1           ; the ordinary single-line change
+        ; Linewise change of B>1 lines (Ncc / c'a): fold the whole range into one
+        ; empty line, then insert -- the same range mechanism as d'a/y'a, which
+        ; VIEDIT.md 9 documents ("c'a -> change those lines").  Delete the content
+        ; and terminators of the first B-1 lines, then clear the last line's
+        ; content but KEEP its terminator, so a single empty line survives.
+        STA     DDLCNT          ; lines still to fold into the change
+        CALL    GBMLNS          ; -> start of the first changed line
+        CALL    UBEGD           ; ONE unified undo record for the whole change
+VCBS_J:
+        LDA     DDLCNT
+        DCR     A
+        STA     DDLCNT
+        JZ      VCBS_T          ; only the last line left -> clear it in place
+VCBS_JC:
+        CALL    PKRTF           ; A = byte at cursor; Z at end-of-buffer
+        JZ      VCBS_T          ; ran out of lines early (fewer than requested)
+        CPI     LF
+        JZ      VCBS_JL
+        CALL    UDEL1           ; delete a content byte (a CR is swallowed here too)
+        JMP     VCBS_JC
+VCBS_JL:
+        CALL    UDEL1           ; delete the terminating LF -> the next line joins
+        JMP     VCBS_J
+VCBS_T:
+        CALL    PKEOL           ; Z at end of line (CR / LF / EOF): keep the term.
+        JZ      VCBS_TX
+        CALL    UDEL1
+        JMP     VCBS_T
+VCBS_TX:
+        CALL    UNDO2YANK       ; linewise yank of the changed block (like dd), for p
+        CALL    SETDRTY         ; line count shrank -> full repaint
+        JMP     ENTINS
+VCBS1:                          ; single line: unchanged behavior
         CALL    GBMLNS
         CALL    DELEOL          ; records the deleted line content
         CALL    SETLINE

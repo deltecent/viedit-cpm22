@@ -1930,6 +1930,20 @@ def main():
     check('2yy/p copies 2 lines', mlines(['2yy', 'p'])[:5] == [b'L0 a', b'L0 a', b'L1 b', b'L1 b', b'L2 c'])
     check('3dd/p pastes block',   mlines(['3dd', 'p'])[:5] == [b'L3 d', b'L0 a', b'L1 b', b'L2 c', b'L4 e'])
 
+    # linewise change over a range (issue #5): c'a / Ncc apply to the whole
+    # range like d'a/y'a, collapsing it to one changed line -- VIEDIT.md 9
+    # documents "c'a -> change those lines".  (Was broken: acted like plain cc.)
+    check("c'a changes the mark range",
+          mlines(['j', 'ma', 'jj', "c'aX\x1b"])[:3] == [b'L0 a', b'X', b'L4 e'])
+    check("c'a + u restores the whole range",
+          mlines(['j', 'ma', 'jj', "c'aX\x1b", 'u'])[:5]
+          == [b'L0 a', b'L1 b', b'L2 c', b'L3 d', b'L4 e'])
+    check('3cc changes 3 lines into one',
+          mlines(['3ccX\x1b'])[:3] == [b'X', b'L3 d', b'L4 e'])
+    check("c'a yanks the changed block for p",
+          mlines(['j', 'ma', 'jj', "c'aX\x1b", 'jp'])[:6]
+          == [b'L0 a', b'X', b'L4 e', b'L1 b', b'L2 c', b'L3 d'])
+
     # nyy reports 'N lines yanked' on the status row (singular for one line).
     ey = Editor(five); ey.key('3yy')
     check('3yy reports lines yanked', '3 lines yanked' in ey.screen().render())
