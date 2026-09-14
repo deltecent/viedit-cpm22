@@ -1923,6 +1923,18 @@ def main():
     check('put: used ESC[L insert-line', '\x1b[L' in pout)
     check('put: edit area == full redraw', fast == full)
 
+    # I (issue #3): insert at the FIRST NON-BLANK of the line, not column 1.
+    # A leading-space line + I + typed text must land the text after the spaces
+    # (like ^ then i), not at column 1.  Regression: I used to behave like i.
+    eI = Editor(b'   indented line\r\nsecond\r\n', fname='TEST.TXT')
+    eI.key('I'); eI.key('Q'); eI.key('\x1b', idle=1500)
+    check('I inserts at first non-blank',
+          eI.screen().render().splitlines()[0].rstrip() == '   Qindented line')
+    eI.key(':w\r', idle=3000)
+    check('I first-non-blank round-trips to disk',
+          bytes(eI.diskfile('TEST', 'TXT')).rstrip(b'\x1a')
+          == b'   Qindented line\r\nsecond\r\n')
+
     # --- VT100 DSR terminal-size auto-detection -------------------------------
     small = b'one\r\ntwo\r\nthree\r\n'
     # default: a 24x80 terminal answers the probe -> 24x80 (unchanged baseline)

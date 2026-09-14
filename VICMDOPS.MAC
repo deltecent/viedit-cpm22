@@ -874,8 +874,9 @@ VCBIGA:                        ; append at end of line
         CALL    GBMLNE
         CALL    UBEGI
         JMP     ENTINS
-VCBIGI:                        ; insert at start of line
+VCBIGI:                        ; insert at first non-blank
         CALL    GBMLNS
+        CALL    FNBLNK          ; vi: I inserts at first non-blank, not col 1
         CALL    UBEGI
         JMP     ENTINS
 VC_O:                           ; open line below
