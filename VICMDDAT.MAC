@@ -18,7 +18,7 @@
         PUBLIC  NPUTLN, OLDLEN, OPB, OPCHAR, OPEND, OPLO
         PUBLIC  OPN, OPSTART, PDECC, PDEPTH, PDIR, PGREQ
         PUBLIC  PGSVCO, PGSVLN, PGTOP, PINCC, PSP, PTOPSV
-        PUBLIC  PUTOFF, RCNT, RDPCH, RDPOS, REDSAV, REPMSG
+        PUBLIC  PUTOFF, RCHCNT, RCHR, RCNT, RDPCH, RDPOS, REDSAV, REPMSG
         PUBLIC  RMODSV, RNEED, RNGERR, SCANP, SCBASE, SCGAPB
         PUBLIC  SCR1E, SCR2E, SCR2S, SCTXE, SHCUR, SHHI
         PUBLIC  SHLO, SHN, SHRBEG, SHRLEN, SHTMP, SHUNDOK
@@ -74,6 +74,8 @@ UWP:    DW      0               ; undo: UNDOBUF write pointer
 REDSAV: DW      0               ; u / . : total line count before the edit
 UB:     DB      0               ; undo: byte being recorded
 XCNT:   DB      0               ; x: remaining chars to delete this command
+RCHCNT: DB      0               ; r: remaining chars to replace this command
+RCHR:   DB      0               ; r: the replacement character
 DDLCNT: DB      0               ; linewise delete/yank: remaining line count
 NPUTLN: DB      0               ; linewise put: number of lines pasted
 PTOPSV: DW      0               ; linewise put: saved TOPLN (scroll detection)

@@ -1935,6 +1935,56 @@ def main():
           bytes(eI.diskfile('TEST', 'TXT')).rstrip(b'\x1a')
           == b'   Qindented line\r\nsecond\r\n')
 
+    # r{c} with a count (issue #4): Nr{c} replaces N chars with c, like N times
+    # of a one-char r (and, like x, stops at end-of-line rather than crossing it).
+    # Regression: the count prefix was ignored and 3rZ behaved like rZ.
+    eR = Editor(b'abcdefgh\r\nsecond\r\n', fname='TEST.TXT')
+    eR.key('3'); eR.key('r'); eR.key('Z')
+    check('3r replaces three chars',
+          eR.screen().render().splitlines()[0].rstrip() == 'ZZZdefgh')
+    # vi leaves the cursor ON the last replaced char: an immediate x deletes it.
+    eR.key('x')
+    check('3r leaves cursor on the last replaced char',
+          eR.screen().render().splitlines()[0].rstrip() == 'ZZdefgh')
+    eR.key(':w\r', idle=3000)
+    check('3r round-trips to disk',
+          bytes(eR.diskfile('TEST', 'TXT')).rstrip(b'\x1a')
+          == b'ZZdefgh\r\nsecond\r\n')
+
+    # A count larger than the chars left on the line stops at the line break and
+    # never eats the newline or the following line (matches x's leniency).
+    eR2 = Editor(b'abc\r\nsecond\r\n', fname='TEST.TXT')
+    eR2.key('9'); eR2.key('r'); eR2.key('Q')
+    check('Nr past end-of-line stops at the break',
+          eR2.screen().render().splitlines()[:2] == ['QQQ', 'second'])
+    eR2.key(':w\r', idle=3000)
+    check('Nr past end-of-line keeps the newline',
+          bytes(eR2.diskfile('TEST', 'TXT')).rstrip(b'\x1a')
+          == b'QQQ\r\nsecond\r\n')
+
+    # x also documents a count (VIEDIT.md 6.1: "3x deletes three characters").
+    # It was working but had no count-specific case -- the same coverage gap that
+    # hid the r bug (#4).  Like r, it stops at the line break, never crossing it.
+    eX = Editor(b'abcdefgh\r\nsecond\r\n', fname='TEST.TXT')
+    eX.key('3'); eX.key('x')
+    check('3x deletes three chars',
+          eX.screen().render().splitlines()[0].rstrip() == 'defgh')
+    eX2 = Editor(b'abc\r\nsecond\r\n', fname='TEST.TXT')
+    eX2.key('9'); eX2.key('x')
+    check('Nx past end-of-line stops at the break',
+          eX2.screen().render().splitlines()[:2] == ['', 'second'])
+    eX2.key(':w\r', idle=3000)
+    check('Nx past end-of-line keeps the newline',
+          bytes(eX2.diskfile('TEST', 'TXT')).rstrip(b'\x1a')
+          == b'\r\nsecond\r\n')
+
+    # `.` repeats a counted r verbatim, count and all.
+    eR3 = Editor(b'abcdefgh\r\nabcdefgh\r\n', fname='TEST.TXT')
+    eR3.key('2'); eR3.key('r'); eR3.key('X')       # XXcdefgh, cursor on 2nd X
+    eR3.key('j'); eR3.key('0'); eR3.key('.')       # repeat on line 2 from col 1
+    check('. repeats a counted r',
+          eR3.screen().render().splitlines()[:2] == ['XXcdefgh', 'XXcdefgh'])
+
     # --- VT100 DSR terminal-size auto-detection -------------------------------
     small = b'one\r\ntwo\r\nthree\r\n'
     # default: a 24x80 terminal answers the probe -> 24x80 (unchanged baseline)

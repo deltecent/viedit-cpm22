@@ -50,7 +50,7 @@
         EXTRN   GOTOPOS, GPEND, GROMSG, GSIZMSG, HFN, HMLBOT
         EXTRN   HMLLST, HMLTOP, ISEOL, OPHANDLE, OPSET, PGREQ
         EXTRN   PGSDLT, PGSVCO, PGSVLN, PGTOP, PKEOL, PKRTF
-        EXTRN   RCNT, REPMSG, REPN, SETDRTY, SETGOAL, SETLINE
+        EXTRN   RCHCNT, RCHR, RCNT, REPMSG, REPN, SETDRTY, SETGOAL, SETLINE
         EXTRN   STATHOME, SVERR, UBEGD, UDEL1, UINS1, UNDOBP
         EXTRN   UNDOLEN, VADVG, VJCUR, VJLONGM, VJSAV, VSCAN
         EXTRN   WBIG, WCLS, XCNT, YBUFP, YLEN, YLNEND
@@ -724,22 +724,38 @@ VJ_RDRAW:
 ; r{c} - replace the char under the cursor with the next key.
 ;------------------------------------------------------------
 VC_RCH:
+        CALL    CNTGET          ; B = repeat count (>=1): Nr replaces N chars
+        MOV     A,B
+        STA     RCHCNT
         CALL    BCONIN          ; read the replacement char
-        PUSH    PSW
-        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        STA     RCHR
+        CALL    PKRTF           ; nothing to replace at a line break / EOF -> no-op
         JZ      VRC_X
         CPI     LF
         JZ      VRC_X
         CPI     CR
         JZ      VRC_X
-        CALL    UBEGD           ; record as a change (delete old + insert new)
+        CALL    UBEGD           ; one change record: old chars deleted + new inserted
+VRC_LP:
+        LDA     RCHCNT
+        ORA     A
+        JZ      VRC_DONE
+        DCR     A
+        STA     RCHCNT
+        CALL    PKRTF           ; A = byte right of cursor; Z if EOF
+        JZ      VRC_DONE
+        CPI     LF
+        JZ      VRC_DONE
+        CPI     CR
+        JZ      VRC_DONE        ; stop at the line break (like x: replace up to EOL)
         CALL    UDEL1           ; delete + record the old char
-        POP     PSW
-        CALL    UINS1           ; insert the replacement (counts onto the record)
-        CALL    GBMVLT          ; vi leaves the cursor on the replaced char
+        LDA     RCHR
+        CALL    UINS1           ; insert the replacement (cursor advances past it)
+        JMP     VRC_LP
+VRC_DONE:
+        CALL    GBMVLT          ; vi leaves the cursor on the last replaced char
         JMP     SETLINE
 VRC_X:
-        POP     PSW
         RET
 
 ;------------------------------------------------------------
